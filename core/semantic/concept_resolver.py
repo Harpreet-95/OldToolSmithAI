@@ -64,6 +64,22 @@ _STOPWORDS = frozenset({
     # grammatical-filler/status/ranking/aggregation words above (each
     # verified redundant against the full backend suite, zero regressions),
     # calendar words keep their pre-Phase-6.4 behavior.
+    #
+    # 2026-08-09 stabilization — date-verb parity with data/
+    # query_planning_service.py's own _DATE_ORDER_HINT_ROOTS. "added" above
+    # was already excluded from term search, but its siblings there
+    # (created/started/joined/began/ended/registered/updated/modified/
+    # inserted/finished) were not, so each one survived extraction and was
+    # searched as a real business concept/measure term instead of being
+    # reserved purely as a date-verb hint — confirmed live against real
+    # CCPP: "How many enrollments were created this month?" leaked "created"
+    # in as a bogus concept competing with the real "enrollment" term.
+    # ("completed"/"active"/etc. status words above already cover the
+    # overlap with _DATE_ORDER_HINT_ROOTS' "completed"/"complete".)
+    "started", "start", "began", "begin", "joined", "join",
+    "created", "create", "registered", "inserted", "insert",
+    "ended", "end", "complete", "finished", "finish",
+    "updated", "update", "modified", "modify",
 })
 
 # A term counts as "ambiguous" when the top two distinct-table search results

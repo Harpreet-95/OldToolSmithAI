@@ -1740,18 +1740,31 @@ def _resolve_calendar_grain_dimension(
 
 
 # ---------------------------------------------------------------------------
-# Related-table attribute fallback ("names of the students")
+# Related-table attribute fallback ("names of the students", "student
+# emails", "students and their user accounts")
 #
-# A bare attribute term ("names") that names no column on the already-
-# resolved concept table itself may still name a real attribute of a table
-# the concept table has a declared, TRUSTED (AUTO/APPROVED) relationship to
-# (e.g. dbo.ADF_Student.StudentUserID -> dnnuser.Users.UserID). Never invents
-# a relationship or a column: reuses the same trusted-relationship discovery
-# join planning already uses (analyze_join_quality) and only auto-selects a
-# column whose own dictionary metadata confirms it is name-shaped.
+# A bare attribute term (e.g. "names", "email", "accounts") that names no
+# column on the already-resolved concept table itself may still name a real
+# attribute of a table the concept table has a declared, TRUSTED
+# (AUTO/APPROVED) relationship to (e.g. dbo.ADF_Student.StudentUserID ->
+# dnnuser.Users.UserID). Never invents a relationship or a column: reuses the
+# same trusted-relationship discovery join planning already uses
+# (analyze_join_quality) and only auto-selects a column whose own scored
+# match against the term clears the same _AUTO_SELECT_MIN_CONFIDENCE bar
+# every other term resolution in this module already requires.
+#
+# 2026-08-09 stabilization: this used to be gated to the literal terms
+# "name"/"names" only (_NAME_ATTRIBUTE_TERMS, now removed). That meant any
+# OTHER unresolved attribute term referring to a related entity — "email",
+# "instructor", "user accounts" — fell through to a plain global table/column
+# search instead of this trusted-relationship walk, either resolving
+# ambiguously against unrelated tables elsewhere in the schema or failing
+# outright ("No measure candidate found for 'user'"), confirmed live against
+# real CCPP. The term itself is no longer special-cased at all: the existing
+# scoring/threshold/ambiguity-margin machinery below is what decides whether
+# a term genuinely matches a related attribute, exactly as it already did
+# for "name"/"names" — this only widens which terms are allowed to try.
 # ---------------------------------------------------------------------------
-
-_NAME_ATTRIBUTE_TERMS = frozenset({"name", "names"})
 
 # Phase 1 Stabilization — entity-relative attribute resolution, Tier 3
 # ("semantic role compatibility"). A relationship whose FK column is itself
@@ -1775,22 +1788,22 @@ _ROLE_COMPATIBLE_BONUS = 0.5
 def _resolve_related_attribute_dimension(
     term: str, concept_table_fqn: str, source_id: int, user_id: str,
 ) -> list[dict] | None:
-    """Returns None (never a synthetic refusal entry) when the term isn't a
-    recognized attribute keyword, or the concept table has no context — the
-    caller keeps the original, ordinary _resolve_term result in that case.
+    """Returns None (never a synthetic refusal entry) when the concept table
+    has no context, or nothing on any of its trusted related tables scores
+    high enough to auto-select — the caller keeps the original, ordinary
+    _resolve_term result in that case.
 
-    Returns a LIST of resolved dimension entries, not a single one: several
-    near-tied name-like columns on the SAME related table (FirstName +
-    LastName) are complementary parts of "name", not competing alternatives
-    — every one of them is selected (capped at 3), each as its own entry, so
+    Returns a LIST of resolved entries, not a single one: several near-tied
+    name-like columns on the SAME related table (FirstName + LastName) are
+    complementary parts of "name", not competing alternatives — every one of
+    them is selected (capped at 3), each as its own entry, so
     sql_planning_service's ordinary one-entry-per-select-row contract needs
-    no changes. A tie ACROSS different tables, after weighting by semantic
-    role compatibility (see _IDENTITY_CARDINALITIES above), is genuine
-    ambiguity and stays unresolved (single entry, selected=None) rather than
-    guessing.
+    no changes (the same shape is reused for both measure and dimension
+    roles — see this function's own callers). A tie ACROSS different tables,
+    after weighting by semantic role compatibility (see
+    _IDENTITY_CARDINALITIES above), is genuine ambiguity and stays unresolved
+    (single entry, selected=None) rather than guessing.
     """
-    if term.lower() not in _NAME_ATTRIBUTE_TERMS:
-        return None
     ctx = get_table_business_context(source_id, user_id, concept_table_fqn)
     if not ctx:
         return None
@@ -1907,6 +1920,17 @@ _DATE_ORDER_HINT_ROOTS: dict[str, str] = {
     "added": "insert", "add": "insert", "created": "insert", "create": "insert",
     "inserted": "insert", "insert": "insert", "registered": "insert",
     "started": "start", "start": "start", "began": "start", "begin": "start",
+    # "joined"/"join" — 2026-08-09 stabilization: reported live failure
+    # ("How many students joined this week?") expects StudentSince/program-
+    # start semantics, the same business date as "started" — e.g.
+    # dbo.ADF_Student.StartDate. Deliberately mapped to the same "start"
+    # root rather than a new one: no CCPP table in this schema distinguishes
+    # "the date they joined" from "the date their enrollment/program
+    # started". "join"/"joined" is otherwise unused as a hint-root word (the
+    # unrelated RELATIONSHIP-intent collision on the same substring is a
+    # separate, intent-routing-layer defect — see core/orchestrator/
+    # intent_resolver.py).
+    "joined": "start", "join": "start",
     "ended": "end", "end": "end", "completed": "end", "complete": "end",
     "finished": "end", "finish": "end",
     "updated": "update", "update": "update", "modified": "update", "modify": "update",
@@ -2728,6 +2752,30 @@ def _is_incidental_measure_match(selected_measure: dict, resolved_concepts: list
     return selected_measure.get("table_fqn") not in concept_tables
 
 
+def _is_related_table_attribute_term(
+    term: str, measures: list[dict], dimensions: list[dict], resolved_concepts: list[dict] | None,
+) -> bool:
+    """True when `term` independently resolved (as a measure or dimension)
+    to a DIFFERENT table than any grounded concept's own table — the general,
+    word-list-free structural signature of a _resolve_related_attribute_
+    dimension match ("student emails", "names of the students", "students
+    and their user accounts"): the term names a real attribute, but one that
+    lives on a table the concept was JOINED to, not the concept's own table.
+    Same concept_tables comparison _is_incidental_measure_match already uses,
+    just applied to any matching-term entry instead of one specific measure.
+    """
+    concept_tables = {
+        c["selected"]["table_fqn"] for c in (resolved_concepts or []) if c.get("selected")
+    }
+    if not concept_tables:
+        return False
+    for entry in (measures or []) + (dimensions or []):
+        if (entry.get("term") or "").lower() == term and entry.get("selected"):
+            if entry["selected"].get("table_fqn") not in concept_tables:
+                return True
+    return False
+
+
 def _entity_first_effective_measures(
     measures: list[dict], query_intent: dict, resolved_concepts: list[dict] | None,
 ) -> list[dict]:
@@ -2758,12 +2806,16 @@ def _build_intent(
         # while its only dimension ("names") resolved on a JOINED table via
         # _resolve_related_attribute_dimension. extract_terms() puts the
         # attribute word into `concepts` too (mirroring the "by"-clause
-        # contract), so attribute-keyword entries are excluded before
-        # counting — the same single-real-concept discipline list_entities
-        # below already applies, just attribute-aware.
+        # contract), so attribute entries are excluded before counting — the
+        # same single-real-concept discipline list_entities below already
+        # applies. 2026-08-09: generalized from a "name"/"names" word list to
+        # the structural signal itself (see _is_related_table_attribute_term)
+        # now that the fallback resolves any attribute term, not just names.
         non_attribute_concepts = [
             c for c in (resolved_concepts or [])
-            if (c.get("term") or "").lower() not in _NAME_ATTRIBUTE_TERMS
+            if not _is_related_table_attribute_term(
+                (c.get("term") or "").lower(), measures, dimensions, resolved_concepts,
+            )
         ]
         resolved = [c for c in non_attribute_concepts if c.get("selected")]
         qtype = (
@@ -4017,11 +4069,97 @@ def _plan_business_query_impl(source_id: int, user_id: str, request: dict, *, se
         or next((c["selected"]["table_fqn"] for c in resolved_concepts if c.get("selected")), None)
     )
     if _primary_table_hint:
+        # 2026-08-09 stabilization — anchor-table-name guard. A term that
+        # itself lexically NAMES the anchor table ("student" when
+        # _primary_table_hint is dbo.ADF_Student) must never be tried against
+        # the anchor's OWN related tables below: confirmed live against real
+        # CCPP that without this guard, "student" (left unresolved by
+        # ordinary measure-column search, since it names the whole entity,
+        # not a column) fell into the fallback and matched
+        # ADF_ClassSignups.StudentID on an unrelated table — pulling a
+        # second, disconnected table into the join graph that has no direct
+        # trusted path to the table the REAL attribute term ("emails")
+        # correctly resolved to (dnnuser.Users), so the otherwise-correct
+        # email resolution below still refused at SQL-generation time for an
+        # unrelated join reason.
+        #
+        # Deliberately checked against the anchor table's own name/business
+        # name via the same _score_term_match scoring every other resolution
+        # in this module already trusts — NOT against resolved_concepts'
+        # term string, because compound-phrase resolution
+        # (generate_compound_phrase_candidates) can merge adjacent words into
+        # ONE concept entry whose term is the whole phrase ("student emails"
+        # resolving as a single concept to dbo.ADF_Student, confirmed live),
+        # which would make an exact-string comparison miss "student"
+        # entirely while ALSO wrongly excluding "emails" if compared by mere
+        # word-membership in that same phrase.
+        _anchor_table_name_texts = [_primary_table_hint.split(".")[-1]] + [
+            c["selected"].get("business_name")
+            for c in resolved_concepts
+            if c.get("selected") and c["selected"].get("table_fqn") == _primary_table_hint
+            and c["selected"].get("business_name")
+        ]
+
+        def _names_anchor_table(term: str) -> bool:
+            return _score_term_match(term, *_anchor_table_name_texts) >= _AUTO_SELECT_MIN_CONFIDENCE
+
+        # Related-table-attribute fallback for unresolved MEASURES too, not
+        # just dimensions. extract_terms() puts every bare content word into
+        # `measures` when the question has no "by"-clause ("Show students
+        # and their user accounts" -> measures=[user, accounts],
+        # dimensions=[]), so a fallback wired only into dimensions never even
+        # ran for this shape — confirmed live against real CCPP ("No measure
+        # candidate found for 'user'/'accounts'", full refusal). Same
+        # trusted-relationship walk, same auto-select threshold, no
+        # calendar-grain branch (bare calendar words reach this module via
+        # dimensions, not measures — see _CALENDAR_GRAIN_TERMS' own
+        # dimensions-only usage below).
+        # A term that names the anchor table itself and still failed ordinary
+        # column resolution is a redundant restatement of the already-
+        # grounded entity ("student" once dbo.ADF_Student is already the
+        # anchor) — dropped outright rather than kept as a dangling
+        # unresolved entry, the same "don't linger as a separate unresolved
+        # measure/dimension" outcome the pre-existing Day 2E consumption
+        # filter above already intends, reached here via the anchor-table-
+        # name signal instead of semantic-contract grounding data (which is
+        # not always populated — confirmed live: without this, "student"
+        # blocked SQL generation outright with "Term(s) could not be matched
+        # to any field", even though the real attribute term resolved fine).
+        _fallback_measures: list[dict] = []
+        for m in measures:
+            if m.get("selected"):
+                _fallback_measures.append(m)
+            elif _names_anchor_table(m["term"]):
+                continue
+            else:
+                _related = _resolve_related_attribute_dimension(m["term"], _primary_table_hint, source_id, user_id)
+                _fallback_measures.extend(_related if _related else [m])
+        measures = _fallback_measures
+
         _grain_hint_terms = [t for t in (concepts + measure_terms) if t not in _CALENDAR_GRAIN_TERMS]
+        # 2026-08-09 stabilization: this list's OTHER source (concepts +
+        # measure_terms) is post-stopword-filtering, so today's date-verb
+        # stopword additions (started/created/joined/...) — needed so those
+        # verbs stop leaking in as bogus concept/measure terms (see
+        # concept_resolver._STOPWORDS' own note) — silently starved THIS
+        # grain-dimension hint of the exact same verb it needs to
+        # disambiguate StartDate/EndDate/InsertDate for a "by year"/"each
+        # year" GROUP BY (caught by test_grouped_time_series_groups_by_year:
+        # "How many students started each year?" regressed from StartDate to
+        # EndDate the moment "started" stopped surviving into measure_terms).
+        # Restored via the SAME raw-question-text hint root the date-range
+        # filter path above already uses, independent of stopwords by
+        # construction — one shared date-verb signal, two call sites, same
+        # discipline _date_order_hint_root's own docstring already commits to.
+        _raw_date_hint_root = _date_order_hint_root(question)
+        if _raw_date_hint_root and _raw_date_hint_root not in _grain_hint_terms:
+            _grain_hint_terms.append(_raw_date_hint_root)
         _fallback_dimensions: list[dict] = []
         for d in dimensions:
             if d.get("selected"):
                 _fallback_dimensions.append(d)
+            elif _names_anchor_table(d["term"]):
+                continue
             elif d["term"] in _CALENDAR_GRAIN_TERMS and _primary_table_hint in table_contexts:
                 _fallback_dimensions.append(
                     _resolve_calendar_grain_dimension(
@@ -4032,6 +4170,24 @@ def _plan_business_query_impl(source_id: int, user_id: str, request: dict, *, se
                 _related = _resolve_related_attribute_dimension(d["term"], _primary_table_hint, source_id, user_id)
                 _fallback_dimensions.extend(_related if _related else [d])
         dimensions = _fallback_dimensions
+
+        # The related-attribute fallback above may have resolved a term onto
+        # a table that was never part of the broadly-retrieved candidate
+        # pool (table_contexts) — e.g. dnnuser.Users for "student emails",
+        # discovered only via the concept table's own trusted relationships.
+        # query_plan["columns"] (build_sql_plan's all_columns_exist check)
+        # and join planning are both derived from table_contexts, so that
+        # newly-resolved table must be merged in — confirmed live: without
+        # this, a correctly-resolved column ("emails" -> dnnuser.Users.Email)
+        # still blocked SQL generation with "Column(s) not found in query
+        # plan". Purely additive: never overwrites an existing entry.
+        for _entry in measures + dimensions:
+            _sel = _entry.get("selected")
+            _fqn = _sel.get("table_fqn") if _sel else None
+            if _fqn and _fqn not in table_contexts:
+                _related_ctx = get_table_business_context(source_id, user_id, _fqn)
+                if _related_ctx:
+                    table_contexts[_fqn] = _related_ctx
 
     # Enterprise Phase 4 — pure explainability, mirrors remembered_terminology's
     # own dedup-by-pair pattern (_merge_remembered_terminology): one record per
@@ -4179,8 +4335,24 @@ def _plan_business_query_impl(source_id: int, user_id: str, request: dict, *, se
     # Date-intelligence filter (today/this month/last quarter/between X and Y/...)
     # — only added when a real date column was discovered, and only when the
     # caller didn't already supply an explicit filter on that same column.
+    #
+    # 2026-08-09 stabilization: this used to call the hint-BLIND
+    # _find_date_column, which just takes the first is_date column in
+    # whatever order table_contexts happens to list them — while the
+    # ORDER BY / "most recently added" path a few dozen lines below already
+    # uses the hint-aware _find_date_column_with_hint + _date_order_hint_root
+    # to disambiguate StartDate/EndDate/InsertDate by the question's own verb
+    # ("started"/"ended"/"created"/...). Confirmed live against real CCPP
+    # (dbo.ADF_Student has all three): "How many students started last
+    # year?" picked EndDate and silently returned 0, because ctx["columns"]
+    # lists them alphabetically (EndDate < InsertDate < StartDate), not by
+    # schema order — the exact same disambiguation the ORDER BY path already
+    # solves, just never reused here. No new logic: reuses the identical
+    # hint function, only at a second call site.
     if query_intent["date_range"] and graph_table_contexts:
-        date_col = _find_date_column(graph_table_contexts, primary_table)
+        date_col = _find_date_column_with_hint(
+            graph_table_contexts, primary_table, _date_order_hint_root(question),
+        )
         if date_col:
             fqn, col_name = date_col
             if col_name not in explicit_filter_columns:

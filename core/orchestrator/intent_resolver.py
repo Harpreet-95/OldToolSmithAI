@@ -305,6 +305,34 @@ def _normalize(query: str) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
+# 2026-08-09 stabilization — confirmed live failure: RELATIONSHIP's own
+# primary keyword "join" (see _SIGNALS below) matched via plain substring
+# containment inside "joined" ("How many students joined this week?"),
+# tying RELATIONSHIP's score against SQL_REQUEST's own "how many"/"this
+# week" secondary hits; both intents also tie at the same _SPECIFICITY
+# weight, and max()'s first-seen tie-break then favored RELATIONSHIP purely
+# because it's declared earlier in the _SIGNALS dict — routing an ordinary
+# business question to the catalog/relationship-inventory intent.
+#
+# Deliberately a narrow, explicit word-boundary exception for this ONE
+# keyword rather than switching every keyword in this file to regex
+# matching: dozens of the phrases below already use a lighter-weight
+# trailing-space technique ("top ", "sort ", "between ", "percent ") to get
+# the same effect, each verified against this file's own extensive
+# collision-analysis comments — a blanket regex switch would re-litigate
+# all of that already-tuned, already-tested behavior at once for a
+# collision that, so far, is confirmed only for "join". Multi-word phrases
+# containing "join" elsewhere in _SIGNALS (e.g. SQL_REQUEST's "join query")
+# are untouched — they are separate dict entries, matched exactly as before.
+_WORD_BOUNDARY_KEYWORDS = frozenset({"join"})
+
+
+def _keyword_matches(kw: str, normalized: str) -> bool:
+    if kw in _WORD_BOUNDARY_KEYWORDS:
+        return re.search(rf"\b{re.escape(kw)}\b", normalized) is not None
+    return kw in normalized
+
+
 class IntentResolver(IIntentResolver):
     """
     Keyword-based enterprise intent resolution. No AI or LLM involved.
@@ -321,8 +349,8 @@ class IntentResolver(IIntentResolver):
         matched_by: Dict[IntentType, List[str]] = {}
 
         for intent_type, (primary, secondary) in _SIGNALS.items():
-            p_hits = [kw for kw in primary if kw in normalized]
-            s_hits = [kw for kw in secondary if kw in normalized]
+            p_hits = [kw for kw in primary if _keyword_matches(kw, normalized)]
+            s_hits = [kw for kw in secondary if _keyword_matches(kw, normalized)]
 
             # Each primary match = 0.4; each secondary = 0.2; capped at 1.0
             score = min(len(p_hits) * 0.4 + len(s_hits) * 0.2, 1.0)
