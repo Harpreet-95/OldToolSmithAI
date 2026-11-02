@@ -61,6 +61,13 @@ export async function getMyData(token) {
   return parseResponse(res);
 }
 
+export async function getExecutionHistory(token, limit = 500) {
+  const res = await fetch(`/v1/me/history?limit=${encodeURIComponent(limit)}`, {
+    headers: AUTH_HEADERS(token),
+  });
+  return parseResponse(res);
+}
+
 export async function getUsage(token) {
   const res = await fetch('/v1/usage', {
     headers: AUTH_HEADERS(token),
@@ -398,6 +405,14 @@ export async function emailReport(reportId, recipientEmail, token) {
   return parseResponse(res);
 }
 
+export async function generateExecutiveReport(sourceId, token) {
+  const res = await fetch(`/v1/sources/${sourceId}/executive-report`, {
+    method: 'POST',
+    headers: AUTH_HEADERS(token),
+  });
+  return parseResponse(res);
+}
+
 export async function getNotifications(token) {
   const res = await fetch('/v1/notifications', {
     headers: AUTH_HEADERS(token),
@@ -652,6 +667,37 @@ export async function deleteDataSource(id, token) {
   const res = await fetch(`/v1/sources/${id}`, {
     method: 'DELETE',
     headers: AUTH_HEADERS(token),
+  })
+  return parseResponse(res)
+}
+
+// Phase 7, Step 6H1, Part 6 — explicit, reversible lifecycle actions,
+// distinct from deleteDataSource above (permanent, destructive, cascades
+// every piece of metadata).
+
+export async function disconnectDataSource(id, reason, token) {
+  const res = await fetch(`/v1/sources/${id}/disconnect`, {
+    method: 'POST',
+    headers: AUTH_HEADERS(token),
+    body: JSON.stringify({ reason: reason ?? null }),
+  })
+  return parseResponse(res)
+}
+
+export async function removeDataSourceCredentials(id, reason, token) {
+  const res = await fetch(`/v1/sources/${id}/remove-credentials`, {
+    method: 'POST',
+    headers: AUTH_HEADERS(token),
+    body: JSON.stringify({ reason: reason ?? null }),
+  })
+  return parseResponse(res)
+}
+
+export async function reconnectDataSource(payload, token) {
+  const res = await fetch('/v1/sources/reconnect', {
+    method: 'POST',
+    headers: AUTH_HEADERS(token),
+    body: JSON.stringify(payload),
   })
   return parseResponse(res)
 }
@@ -988,39 +1034,6 @@ export async function cancelBatchProfile(sourceId, snapshotId, token) {
 }
 
 // ---------------------------------------------------------------------------
-// Enterprise Metadata Search
-// ---------------------------------------------------------------------------
-
-export async function searchMetadata(q, token, params = {}) {
-  const qs = new URLSearchParams({ q })
-  if (params.limit             != null) qs.set('limit',             params.limit)
-  if (params.offset            != null) qs.set('offset',            params.offset)
-  if (params.source_id         != null) qs.set('source_id',         params.source_id)
-  if (params.asset_type)                qs.set('asset_type',        params.asset_type)
-  if (params.schema)                    qs.set('schema',            params.schema)
-  if (params.domain)                    qs.set('domain',            params.domain)
-  if (params.entity)                    qs.set('entity',            params.entity)
-  if (params.semantic_type)             qs.set('semantic_type',     params.semantic_type)
-  if (params.pii === true)              qs.set('pii',               'true')
-  if (params.dictionary_status)         qs.set('dictionary_status', params.dictionary_status)
-  if (params.classification)            qs.set('classification',    params.classification)
-  if (params.profile_status)            qs.set('profile_status',    params.profile_status)
-  const res = await fetch(`/v1/search?${qs}`, { headers: AUTH_HEADERS(token) })
-  return parseResponse(res)
-}
-
-export async function getSearchFilters(token) {
-  const res = await fetch('/v1/search/filters', { headers: AUTH_HEADERS(token) })
-  return parseResponse(res)
-}
-
-export async function getSearchSuggestions(q, token, limit = 8) {
-  const qs = new URLSearchParams({ q, limit })
-  const res = await fetch(`/v1/search/suggestions?${qs}`, { headers: AUTH_HEADERS(token) })
-  return parseResponse(res)
-}
-
-// ---------------------------------------------------------------------------
 // Business Knowledge Graph
 // ---------------------------------------------------------------------------
 
@@ -1189,6 +1202,45 @@ export async function executeDataSourceQuery(sourceId, question, token) {
     headers: AUTH_HEADERS(token),
     body: JSON.stringify({ question }),
   })
+  return parseResponse(res)
+}
+
+// Phase 2, Step 7b — records a resolved clarification pick (concept_term ->
+// table_fqn/column_name) as an approved concept_table_mappings row, so
+// future questions using the same term on this source resolve directly
+// without asking again. See data/concept_mapping_service.py::
+// promote_clarification_selection / api/v1/routes.py::promote_concept_mapping_route.
+// Phase 3, Step 3 — canonicalTerm/confirmReplace are optional: omitting
+// canonicalTerm keeps this call byte-for-byte identical to before (plain
+// concept-mapping write, no synonym write attempted). A 409 conflict
+// response (reason: 'remembered_term_conflict') is returned as data rather
+// than thrown, so callers can branch on it without a try/catch — every
+// other non-2xx status still throws via parseResponse, unchanged.
+export async function promoteConceptMapping(
+  sourceId, { conceptTerm, tableFqn, columnName, canonicalTerm, confirmReplace = false }, token,
+) {
+  const res = await fetch(`/v1/sources/${sourceId}/concept-mappings`, {
+    method: 'POST',
+    headers: AUTH_HEADERS(token),
+    body: JSON.stringify({
+      concept_term: conceptTerm,
+      table_fqn: tableFqn,
+      column_name: columnName ?? null,
+      canonical_term: canonicalTerm ?? null,
+      confirm_replace: confirmReplace,
+    }),
+  })
+  if (res.status === 409) {
+    const text = await res.text()
+    let data = null
+    try { data = JSON.parse(text) } catch { /* not JSON — fall through */ }
+    if (data?.reason === 'remembered_term_conflict') return data
+    if (!res.ok) {
+      const message = data?.message || data?.detail || text || `HTTP ${res.status}`
+      throw new Error(`${res.status}: ${message}`)
+    }
+    return data
+  }
   return parseResponse(res)
 }
 

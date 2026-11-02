@@ -1,31 +1,39 @@
 ﻿import { useState, useEffect, useRef, lazy, Suspense, Fragment } from 'react'
-import { interpretTask, registerUser, loginUser, verifyEmail, registerAdmin, changePassword, getUsage, getMyData, uploadDataset, getDatasets, getDatasetById, deleteDataset, renameDataset, reprofileDataset, createScheduledWorkflow, getScheduledWorkflows, deleteScheduledWorkflow, pauseScheduledWorkflow, resumeScheduledWorkflow, getWorkflows, saveWorkflow, deleteWorkflow, getRecommendations, getInsights, retryExecution, rerunExecution, getScheduleHealth, getWorkflowTemplates, explainContext, createMultiStepWorkflow, runWorkflowById, getReports, getReportById, deleteReport, exportReport, emailReport, getNotifications, markNotificationRead, deleteNotification, getScheduleRuns, getScheduleRunHistory, runScheduleNow, composeIntent, getWorkspaces, attachWorkspaceExecution, saveWorkspaceById, createWorkflowDraftFromWorkspace,
-  createDataSource, listDataSources, testDataSource, searchMetadata } from './api/client'
+import { registerUser, loginUser, verifyEmail, registerAdmin, changePassword, getUsage, getExecutionHistory, uploadDataset, getDatasets, getDatasetById, deleteDataset, renameDataset, reprofileDataset, createScheduledWorkflow, getScheduledWorkflows, deleteScheduledWorkflow, pauseScheduledWorkflow, resumeScheduledWorkflow, getWorkflows, saveWorkflow, deleteWorkflow, getRecommendations, getInsights, retryExecution, rerunExecution, getScheduleHealth, getWorkflowTemplates, explainContext, createMultiStepWorkflow, runWorkflowById, getReports, getReportById, deleteReport, exportReport, getNotifications, markNotificationRead, deleteNotification, getScheduleRuns, getScheduleRunHistory, runScheduleNow, getWorkspaces,
+  listDataSources, generateExecutiveReport, emailReport } from './api/client'
 import ErrorBoundary from './components/ErrorBoundary'
 import ChartSection from './components/ChartSection'
 import { ProfilingJobProvider } from './context/ProfilingJobContext'
+import { resolveReportContentView } from './utils/reportContent'
 
 const ProfilingJobCenter = lazy(() => import('./components/ProfilingJobCenter'))
 
 const ReportWorkspace    = lazy(() => import('./components/ReportWorkspace'))
+const ExecutiveReportView = lazy(() => import('./components/ExecutiveReportView'))
+const ExecutiveReportContent = lazy(() => import('./components/ExecutiveReportView').then(m => ({ default: m.ExecutiveReportContent })))
 const WorkflowResult     = lazy(() => import('./components/WorkflowResult'))
 const DynamicToolComposer = lazy(() => import('./components/DynamicToolComposer'))
-const ProposalPreview    = lazy(() => import('./components/ProposalPreview'))
 const DatasetIntelligence = lazy(() => import('./components/DatasetIntelligence'))
 const WorkspaceHistory    = lazy(() => import('./components/WorkspaceHistory'))
 const OperationsCenter   = lazy(() => import('./components/OperationsCenter'))
 const AdminDashboard     = lazy(() => import('./components/AdminDashboard'))
 const AIWorkspace        = lazy(() => import('./components/AIWorkspace'))
-const EngineWorkspace    = lazy(() => import('./components/EngineWorkspace'))
 const DataSourceManager  = lazy(() => import('./components/DataSourceManager'))
-const DictionaryReview   = lazy(() => import('./components/DictionaryReview'))
-const EnterpriseSearch   = lazy(() => import('./components/EnterpriseSearch'))
 
 // ─── Lazy-load fallback ────────────────────────────────────────────────────────
 function LazyFallback() {
   return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 0', color: '#40475e', fontSize: '0.8rem' }}>
       Loading…
+    </div>
+  )
+}
+
+function AiDashboardCell({ label, color, children, C }) {
+  return (
+    <div style={{ background: `${color}0c`, border: `1px solid ${color}28`, borderRadius: '9px', padding: '10px 13px' }}>
+      <div style={{ fontSize: '0.58rem', fontWeight: '700', color, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '5px' }}>{label}</div>
+      <div style={{ fontSize: '0.76rem', color: C.text, lineHeight: 1.6 }}>{children}</div>
     </div>
   )
 }
@@ -76,6 +84,7 @@ const FONT      = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 const MONO      = "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace"
 const SIDEBAR_W = 216
 const HEADER_H  = 56
+const SHOW_LEGACY_DATASET_SUMMARY = false
 
 function _relTime(iso) {
   if (!iso) return ''
@@ -183,9 +192,6 @@ function makeS(C) {
   }
 }
 
-// LoginView always uses dark; DashboardView shadows this with the resolved theme
-const S = makeS(C_DARK)
-
 // ─── Dataset helpers ──────────────────────────────────────────────────────────
 function getFileType(filename) {
   const ext = (filename || '').split('.').pop().toLowerCase()
@@ -226,29 +232,6 @@ function fmtHistorySummary(row) {
   if (label) return label
   if (intent) return intent.length > 52 ? intent.slice(0, 52) + '…' : intent
   return row.summary || '—'
-}
-
-function fmtHistorySubtitle(row) {
-  const tt = (row.task_type || '').toLowerCase()
-  const intent = (row.intent || '').trim()
-  const typed = new Set(['generate_dataset_report','email_dataset_report','send_email','generate_report','set_reminder'])
-  if (typed.has(tt) && intent) return intent.length > 58 ? intent.slice(0, 58) + '…' : intent
-  return null
-}
-
-function fmtSrcLabel(row) {
-  const raw = row.source_label || row.trigger_source || ''
-  const map = {
-    Manual:       'User Triggered',
-    Scheduler:    'Scheduled',
-    Workflow:     'Workflow Run',
-    Composer:     'AI Generated',
-    interpreter:  'User Triggered',
-    scheduler:    'Scheduled',
-    workflow_api: 'Workflow Run',
-    composer:     'AI Generated',
-  }
-  return map[raw] || raw || '—'
 }
 
 function fmtHistoryDuration(row) {
@@ -307,10 +290,7 @@ const NAV_ITEMS = [
   { id: 'ai-workspace', label: 'AI Workspace', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 L14 10 L22 12 L14 14 L12 22 L10 14 L2 12 L10 10 Z"/></svg> },
   { id: 'overview',  label: 'Overview',     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg> },
   { id: 'workflows', label: 'Workflows',    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg> },
-  { id: 'datasets',  label: 'Datasets',     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg> },
   { id: 'data-sources', label: 'Data Sources', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> },
-  { id: 'dictionary',   label: 'Dictionary',  icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="13" y2="12"/></svg> },
-  { id: 'enterprise-search', label: 'Search', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> },
   { id: 'scheduled',      label: 'Scheduled',       icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> },
   { id: 'sched-activity', label: 'Sched. Activity', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> },
   { id: 'history',        label: 'History',         icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> },
@@ -318,18 +298,10 @@ const NAV_ITEMS = [
   { id: 'workspaces', label: 'Workspaces',   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg> },
   { id: 'reports',   label: 'Reports',      icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> },
   { id: 'usage',     label: 'Usage',        icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> },
-  { id: 'engine',    label: 'AI Tools',     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> },
   { id: 'settings',  label: 'Settings',     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> },
 ]
 
 const USER_HIDDEN_TABS = new Set(['sched-activity', 'operations', 'usage', 'workspaces'])
-
-// Quick-start icon components (module-level so JSX is stable — avoids [object Object])
-const QSIconReport    = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-const QSIconAnalyze   = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-const QSIconWorkflow  = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-const QSIconSchedule  = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-const QSIconEmail     = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
 
 const FEATURES = [
   { title: 'AI-Powered',       sub: 'Smart intent interpretation', icon: 'brain'   },
@@ -1391,7 +1363,7 @@ function LoginView({ onSignIn, sessionExpired }) {
 }
 
 // ─── Confirm modal ─────────────────────────────────────────────────────────────
-function ConfirmModal({ title, body, confirmLabel, onConfirm, onCancel, C, S }) {
+function ConfirmModal({ title, body, confirmLabel, onConfirm, onCancel, C }) {
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 200,
@@ -1739,7 +1711,7 @@ function ReportSection({ section, C }) {
                           )}
                         </div>
                       )
-                    } catch (_) { return null }
+                    } catch { return null }
                   })}
                 </div>
               </div>
@@ -1806,7 +1778,7 @@ function ReportSection({ section, C }) {
                           <div style={{ textAlign: 'right', fontSize: '0.74rem', fontWeight: '600', color: sevColor, alignSelf: 'center' }}>{fmtChg(c.change)}</div>
                         </div>
                       )
-                    } catch (_) { return null }
+                    } catch { return null }
                   })}
                 </div>
               </div>
@@ -1868,7 +1840,7 @@ function ReportSection({ section, C }) {
                             )}
                           </div>
                         )
-                      } catch (_) { return null }
+                      } catch { return null }
                     })}
                   </div>
                 )}
@@ -1944,7 +1916,7 @@ function ReportSection({ section, C }) {
                         )}
                       </div>
                     )
-                  } catch (_) {
+                  } catch {
                     return null
                   }
                 })}
@@ -1995,7 +1967,7 @@ function ReportSection({ section, C }) {
                         )}
                       </div>
                     )
-                  } catch (_) {
+                  } catch {
                     return null
                   }
                 })}
@@ -2005,22 +1977,16 @@ function ReportSection({ section, C }) {
           case 'executive_intelligence':
           case 'ai_dashboard': {
             const { most_important_insight, highest_risk, recommended_action, watchlist } = section
-            const Cell = ({ label, color, children }) => (
-              <div style={{ background: `${color}0c`, border: `1px solid ${color}28`, borderRadius: '9px', padding: '10px 13px' }}>
-                <div style={{ fontSize: '0.58rem', fontWeight: '700', color, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '5px' }}>{label}</div>
-                <div style={{ fontSize: '0.76rem', color: C.text, lineHeight: 1.6 }}>{children}</div>
-              </div>
-            )
             return (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                 {most_important_insight && (
-                  <Cell label="Most Important Insight" color={C.accent}>{most_important_insight}</Cell>
+                  <AiDashboardCell label="Most Important Insight" color={C.accent} C={C}>{most_important_insight}</AiDashboardCell>
                 )}
                 {highest_risk && (
-                  <Cell label="Highest Risk" color={C.danger}>{highest_risk}</Cell>
+                  <AiDashboardCell label="Highest Risk" color={C.danger} C={C}>{highest_risk}</AiDashboardCell>
                 )}
                 {recommended_action && (
-                  <Cell label="Recommended Action" color={C.success}>{recommended_action}</Cell>
+                  <AiDashboardCell label="Recommended Action" color={C.success} C={C}>{recommended_action}</AiDashboardCell>
                 )}
                 {(watchlist || []).length > 0 && (
                   <div style={{ background: `${C.warn}0c`, border: `1px solid ${C.warn}28`, borderRadius: '9px', padding: '10px 13px' }}>
@@ -2253,10 +2219,26 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const C = resolvedTheme === 'light' ? C_LIGHT : C_DARK
   const S = makeS(C)
 
-  const [activeNav,       setActiveNav]       = useState(() => localStorage.getItem('ts_active_nav') ?? 'ai-workspace')
-  const [dsSelectedSourceId, setDsSelectedSourceId] = useState(() => { const v = localStorage.getItem('ts_ds_source'); return v ? Number(v) : null })
-  const [dsActiveTab,        setDsActiveTab]        = useState(() => localStorage.getItem('ts_ds_tab') ?? 'overview')
-  const [dsSourceName,       setDsSourceName]       = useState(null)
+  const [activeNav, setActiveNav] = useState(() => {
+    const savedNav = localStorage.getItem('ts_active_nav')
+    if (savedNav === 'datasets') return 'data-sources'
+    return NAV_ITEMS.some(item => item.id === savedNav) ? savedNav : 'ai-workspace'
+  })
+  const [dataSourceView, setDataSourceView] = useState(() => localStorage.getItem('ts_active_nav') === 'datasets' ? 'datasets' : 'landing')
+
+  function navigateTo(section) {
+    if (section === 'datasets') {
+      setDataSourceView('datasets')
+      setActiveNav('data-sources')
+      return
+    }
+    if (section === 'data-sources') {
+      setDataSourceView('landing')
+      setActiveNav('data-sources')
+      return
+    }
+    setActiveNav(section)
+  }
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [cpCurrent,   setCpCurrent]   = useState('')
   const [cpNew,       setCpNew]       = useState('')
@@ -2281,7 +2263,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const [scheduledList,       setScheduledList]       = useState([])
   const [scheduledLoading,    setScheduledLoading]    = useState(false)
   const [scheduleInput,          setScheduleInput]          = useState('')
-  const [scheduleFreq,           setScheduleFreq]           = useState('daily')
   const [scheduleCreating,       setScheduleCreating]       = useState(false)
   const [scheduleError,          setScheduleError]          = useState(null)
   const [scheduleSuccess,        setScheduleSuccess]        = useState(null)
@@ -2295,7 +2276,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const [schedRunHistLoading,   setSchedRunHistLoading]   = useState(new Set())
   const [schedRunNowLoading,    setSchedRunNowLoading]    = useState(new Set())
   const [scheduleHealth,       setScheduleHealth]       = useState([])
-  const [scheduleHealthLoading, setScheduleHealthLoading] = useState(false)
+  const [, setScheduleHealthLoading] = useState(false)
   const [workflowList,        setWorkflowList]        = useState([])
   const [workflowListLoading, setWorkflowListLoading] = useState(false)
   const [wfNameColW,          setWfNameColW]          = useState(220)
@@ -2317,7 +2298,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const [historyMsg,          setHistoryMsg]          = useState(null)
   const [historyMsgType,      setHistoryMsgType]      = useState('success')
   const [hoveredHistRow,      setHoveredHistRow]      = useState(null)
-  const [historySearch,       setHistorySearch]       = useState('')
+  const [historySearch] = useState('')
   const [explainLoading,      setExplainLoading]      = useState(new Set())
   const [explainData,         setExplainData]         = useState({})
   const [builderSteps,        setBuilderSteps]        = useState([])
@@ -2329,7 +2310,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const [activeWorkspaceId,    setActiveWorkspaceId]    = useState(null)
   const [workspaceList,        setWorkspaceList]        = useState([])
   const [workspaceListLoading, setWorkspaceListLoading] = useState(false)
-  const [workspaceRunning,     setWorkspaceRunning]     = useState(false)
+  const [workspaceRunning] = useState(false)
   const [dsModal,             setDsModal]             = useState(null)
   const [dsRenaming,          setDsRenaming]          = useState(null)
   const [dsRenameVal,         setDsRenameVal]         = useState('')
@@ -2340,7 +2321,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const [dsSortBy,     setDsSortBy]     = useState('newest')
   const [dsOpenMenu,    setDsOpenMenu]    = useState(null)
   const [dsReprofiling, setDsReprofiling] = useState(null)
-  const [dsPickerOpen,  setDsPickerOpen]  = useState(false)
   const [dsDragOver,   setDsDragOver]   = useState(false)
   const [reportList,            setReportList]            = useState([])
   const [reportListLoading,     setReportListLoading]     = useState(false)
@@ -2349,9 +2329,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   const [selectedReportData,    setSelectedReportData]    = useState(null)
   const [selectedReportLoading, setSelectedReportLoading] = useState(false)
   const [reportViewMode,        setReportViewMode]        = useState('list')
-  const [reportEmailInput,      setReportEmailInput]      = useState('')
-  const [reportEmailStatus,     setReportEmailStatus]     = useState(null)
-  const [reportEmailSending,    setReportEmailSending]    = useState(false)
+  const [showExecReport,        setShowExecReport]        = useState(false)
   const [notifications,  setNotifications]  = useState([])
   const [notifOpen,      setNotifOpen]      = useState(false)
   const [notifLoading,   setNotifLoading]   = useState(false)
@@ -2377,7 +2355,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   // display it in the summary panel. Skips the fetch if the summary is already
   // for the correct dataset (e.g. freshly uploaded — preserves sample_rows).
   useEffect(() => {
-    if (!selectedDatasetId) { setDatasetSummary(null); setReport(null); return }
+    if (!selectedDatasetId) { queueMicrotask(() => { setDatasetSummary(null); setReport(null) }); return }
     if (prevSummaryIdRef.current === selectedDatasetId) return
     getDatasetById(selectedDatasetId, token)
       .then(data => { setDatasetSummary(data.data); setReport(null) })
@@ -2385,16 +2363,16 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   }, [selectedDatasetId, token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    setUsageLoading(true)
+    queueMicrotask(() => setUsageLoading(true))
     getUsage(token)
       .then(data => setUsage(data))
       .catch(err => { if (is401(err)) onSessionExpired() })
       .finally(() => setUsageLoading(false))
-  }, [token])
+  }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshHistory() {
     setHistoryLoading(true)
-    getMyData(token)
+    getExecutionHistory(token)
       .then(data => setHistory(data?.data?.execution_history ?? []))
       .catch(err => { if (is401(err)) onSessionExpired() })
       .finally(() => setHistoryLoading(false))
@@ -2409,27 +2387,9 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
   }
 
   useEffect(() => { localStorage.setItem('ts_active_nav', activeNav) }, [activeNav])
-  useEffect(() => {
-    if (dsSelectedSourceId == null) localStorage.removeItem('ts_ds_source')
-    else localStorage.setItem('ts_ds_source', String(dsSelectedSourceId))
-  }, [dsSelectedSourceId])
-  useEffect(() => { localStorage.setItem('ts_ds_tab', dsActiveTab) }, [dsActiveTab])
-  useEffect(() => {
-    if (activeNav !== 'data-sources') {
-      setDsSelectedSourceId(null)
-      setDsActiveTab('overview')
-      setDsSourceName(null)
-    }
-  }, [activeNav]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  function openSource(id, tab = 'overview') {
-    setDsSelectedSourceId(id)
-    setDsActiveTab(tab)
-    setActiveNav('data-sources')
-  }
-
-  useEffect(() => { refreshHistory() }, [token])
-  useEffect(() => { if (activeNav === 'history') refreshHistory() }, [activeNav]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { queueMicrotask(refreshHistory) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (activeNav === 'history') queueMicrotask(refreshHistory) }, [activeNav]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const statValues = {
     'Tasks Run':            usage?.data?.total_events                ?? '—',
@@ -2445,14 +2405,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setWorkflowListLoading(false))
   }
 
-  useEffect(() => { refreshWorkflows() }, [token])
-
-  async function handleSaveDraft() {
-    if (!activeWorkspaceId) throw new Error('No active workspace to save as draft.')
-    const result = await createWorkflowDraftFromWorkspace(activeWorkspaceId, token)
-    refreshWorkflows()
-    return result
-  }
+  useEffect(() => { queueMicrotask(refreshWorkflows) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleSaveMultiStepWorkflow() {
     if (!builderName.trim()) { setBuilderError('Enter a workflow name.'); return }
@@ -2500,8 +2453,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       setWfRunError('Cannot run workflow: workflow ID is missing.')
       return
     }
-    const isMultiStep = Array.isArray(wf.definition?.workflow_steps)
-    const intent = wf.definition?.intent || wf.name
     setWfRunningId(wf.id)
     setWfRunError(null)
     setWfRunResult(null)
@@ -2509,7 +2460,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       const data = await runWorkflowById(wf.id, token)
       setWfRunResult(data.data)
       getUsage(token).then(d => setUsage(d)).catch(() => {})
-      getMyData(token).then(d => setHistory(d?.data?.execution_history ?? [])).catch(() => {})
+      getExecutionHistory(token).then(d => setHistory(d?.data?.execution_history ?? [])).catch(() => {})
     } catch (err) {
       if (is401(err)) { onSessionExpired(); return }
       setWfRunError(err.message.replace(/^\d+:\s*/, ''))
@@ -2546,8 +2497,8 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setScheduledLoading(false))
   }
 
-  useEffect(() => { refreshScheduled() }, [token])
-  useEffect(() => { if (activeNav === 'scheduled') refreshScheduled() }, [activeNav]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { queueMicrotask(refreshScheduled) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (activeNav === 'scheduled') queueMicrotask(refreshScheduled) }, [activeNav]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshScheduleHealth() {
     setScheduleHealthLoading(true)
@@ -2557,7 +2508,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setScheduleHealthLoading(false))
   }
 
-  useEffect(() => { refreshScheduleHealth() }, [token])
+  useEffect(() => { queueMicrotask(refreshScheduleHealth) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshTemplates() {
     setTemplatesLoading(true)
@@ -2567,7 +2518,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setTemplatesLoading(false))
   }
 
-  useEffect(() => { refreshTemplates() }, [token])
+  useEffect(() => { queueMicrotask(refreshTemplates) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleUseTemplate() {
     setActiveNav('ai-workspace')
@@ -2665,7 +2616,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setSchedRunsLoading(false))
   }
 
-  useEffect(() => { if (activeNav === 'sched-activity') refreshSchedRuns() }, [activeNav, token]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (activeNav === 'sched-activity') queueMicrotask(refreshSchedRuns) }, [activeNav, token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshRecommendations() {
     setRecLoading(true)
@@ -2675,7 +2626,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setRecLoading(false))
   }
 
-  useEffect(() => { refreshRecommendations() }, [token])
+  useEffect(() => { queueMicrotask(refreshRecommendations) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshInsights() {
     setInsightsLoading(true)
@@ -2685,7 +2636,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setInsightsLoading(false))
   }
 
-  useEffect(() => { refreshInsights() }, [token])
+  useEffect(() => { queueMicrotask(refreshInsights) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleRetry(id) {
     setExecActionLoading(s => new Set(s).add(id))
@@ -2738,20 +2689,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
     }
   }
 
-  async function handleRecSave(rec) {
-    try {
-      await saveWorkflow(rec.intent.slice(0, 60).trim(), rec.intent, token)
-      refreshWorkflows()
-    } catch (err) {
-      if (is401(err)) onSessionExpired()
-    }
-  }
-
-  function handleRecSchedule(rec) {
-    setScheduleInput(rec.intent)
-    setActiveNav('scheduled')
-  }
-
   function refreshDatasets() {
     setDatasetListLoading(true)
     getDatasets(token)
@@ -2763,7 +2700,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setDatasetListLoading(false))
   }
 
-  useEffect(() => { refreshDatasets() }, [token])
+  useEffect(() => { queueMicrotask(refreshDatasets) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshReports() {
     setReportListLoading(true)
@@ -2781,9 +2718,9 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setReportListLoading(false))
   }
 
-  useEffect(() => { if (activeNav === 'reports' || activeNav === 'operations' || activeNav === 'overview') refreshReports() }, [activeNav, token]) // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (activeNav !== 'reports') setReportViewMode('list') }, [activeNav]) // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (activeNav === 'workspaces') refreshWorkspaces() }, [activeNav, token]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (activeNav === 'reports' || activeNav === 'operations' || activeNav === 'overview') queueMicrotask(refreshReports) }, [activeNav, token]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (activeNav !== 'reports') queueMicrotask(() => setReportViewMode('list')) }, [activeNav])
+  useEffect(() => { if (activeNav === 'workspaces') queueMicrotask(refreshWorkspaces) }, [activeNav, token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function refreshNotifications() {
     setNotifLoading(true)
@@ -2794,7 +2731,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       .finally(() => setNotifLoading(false))
   }
 
-  useEffect(() => { refreshNotifications() }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { queueMicrotask(refreshNotifications) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleMarkNotifRead(id) {
     try {
@@ -2818,7 +2755,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
     setSelectedReportId(id)
     setSelectedReportData(null)
     setSelectedReportLoading(true)
-    setReportEmailInput(''); setReportEmailStatus(null); setReportEmailSending(false)
     setReportViewMode('detail')
     try {
       const d = await getReportById(id, token)
@@ -2827,22 +2763,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
       if (is401(err)) onSessionExpired()
     } finally {
       setSelectedReportLoading(false)
-    }
-  }
-
-  async function handleEmailReport(reportId) {
-    const to = reportEmailInput.trim()
-    if (!to) { setReportEmailStatus({ ok: false, msg: 'Please enter a recipient email address.' }); return }
-    setReportEmailSending(true)
-    setReportEmailStatus(null)
-    try {
-      const d = await emailReport(reportId, to, token)
-      setReportEmailStatus({ ok: true, msg: d.data.message })
-    } catch (err) {
-      if (is401(err)) { onSessionExpired(); return }
-      setReportEmailStatus({ ok: false, msg: err.message.replace(/^\d+:\s*/, '') })
-    } finally {
-      setReportEmailSending(false)
     }
   }
 
@@ -3037,7 +2957,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
           {NAV_ITEMS.filter(({ id }) => user?.role === 'admin' || !USER_HIDDEN_TABS.has(id)).map(({ id, label, icon }) => {
             const active = activeNav === id
             return (
-              <button key={id} onClick={() => setActiveNav(id)} style={{
+              <button key={id} onClick={() => navigateTo(id)} style={{
                 display: 'flex', alignItems: 'center', gap: '10px',
                 width: '100%', textAlign: 'left',
                 padding: '9px 12px', borderRadius: '8px', border: 'none',
@@ -3075,7 +2995,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
         </div>
       </aside>
 
-      <div style={{ marginLeft: `${SIDEBAR_W}px`, flex: 1, display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+      <div style={{ marginLeft: `${SIDEBAR_W}px`, flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
 
         <header style={{
           position: 'sticky', top: 0, height: `${HEADER_H}px`,
@@ -3084,22 +3004,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
           padding: '0 28px', zIndex: 50, flexShrink: 0,
         }}>
           {/* Left header slot — breadcrumbs / back buttons */}
-          {activeNav === 'data-sources' && dsSelectedSourceId != null ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.74rem', fontFamily: FONT }}>
-              <button
-                onClick={() => { setDsSelectedSourceId(null); setDsSourceName(null); setDsActiveTab('overview') }}
-                style={{ background: 'none', border: 'none', color: C.textMuted, cursor: 'pointer', fontFamily: FONT, fontSize: '0.74rem', padding: 0 }}
-                onMouseEnter={e => { e.currentTarget.style.color = C.accent }}
-                onMouseLeave={e => { e.currentTarget.style.color = C.textMuted }}
-              >
-                Data Sources
-              </button>
-              <span style={{ color: C.textMuted }}>›</span>
-              <span style={{ color: C.textMuted }}>{dsSourceName ?? `Source #${dsSelectedSourceId}`}</span>
-              <span style={{ color: C.textMuted }}>›</span>
-              <span style={{ color: C.textSec, textTransform: 'capitalize' }}>{dsActiveTab}</span>
-            </div>
-          ) : activeNav === 'reports' && reportViewMode === 'detail' ? (
+          {activeNav === 'reports' && reportViewMode === 'detail' ? (
             <button
               onClick={() => { setReportViewMode('list'); setSelectedReportId(null); setSelectedReportData(null) }}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', color: C.textSec, cursor: 'pointer', fontFamily: FONT, fontSize: '0.76rem', fontWeight: '500', padding: '0', letterSpacing: '0.01em' }}
@@ -3165,16 +3070,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
                   )}
                 </div>
               )}
-            </div>
-            {/* Help */}
-            <div style={{ width: '36px', height: '36px', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: C.textSec }}
-              onMouseEnter={e => e.currentTarget.style.background = C.borderAlt}
-              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10"/>
-                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
-                <circle cx="12" cy="17" r="0.5" fill="currentColor"/>
-              </svg>
             </div>
             {/* Theme toggle */}
             <div
@@ -3293,7 +3188,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
                     setSelectedDatasetId={setSelectedDatasetId}
                     datasetExplicit={datasetExplicit}
                     setDatasetExplicit={setDatasetExplicit}
-                    setActiveNav={setActiveNav}
+                    setActiveNav={navigateTo}
                     onOpenReport={handleOpenSavedReport}
                     onExportReport={(id, fmt) => exportReport(id, token, fmt).catch(() => {})}
                     onUploadDataset={handleComposerAttach}
@@ -3320,38 +3215,49 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
               </ErrorBoundary>
             )}
 
-            {/* ── AI Tools ─────────────────────────────────────────── */}
-            {activeNav === 'engine' && (
-              <ErrorBoundary C={C}>
-                <Suspense fallback={<LazyFallback />}>
-                  <EngineWorkspace C={C} token={token} />
-                </Suspense>
-              </ErrorBoundary>
-            )}
-
             {/* ── Data Sources ──────────────────────────────────────── */}
-            {activeNav === 'data-sources' && (
-              <ErrorBoundary C={C}>
-                <Suspense fallback={<LazyFallback />}>
-                  <DataSourceManager C={C} token={token} setActiveNav={setActiveNav} openSource={openSource} dsSelectedSourceId={dsSelectedSourceId} dsActiveTab={dsActiveTab} setDsSelectedSourceId={setDsSelectedSourceId} setDsActiveTab={setDsActiveTab} setDsSourceName={setDsSourceName} />
-                </Suspense>
-              </ErrorBoundary>
+            {activeNav === 'data-sources' && dataSourceView === 'landing' && (
+              <section aria-labelledby="data-sources-heading">
+                <div style={{ marginBottom: '24px' }}>
+                  <h2 id="data-sources-heading" style={{ margin: '0 0 6px', fontSize: '1.55rem', fontWeight: 750, color: C.text, letterSpacing: '-0.5px' }}>Data Sources</h2>
+                  <p style={{ margin: 0, color: C.textMuted, fontSize: '0.82rem' }}>Choose the type of data you want to manage.</p>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '18px', maxWidth: '900px' }}>
+                  {[
+                    {
+                      id: 'datasets',
+                      title: 'Uploaded Datasets',
+                      description: 'Upload and manage CSV, Excel, JSON, and SQL files.',
+                      detail: `${datasetList.length} uploaded ${datasetList.length === 1 ? 'file' : 'files'}`,
+                      color: '#10b981',
+                      icon: <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>,
+                    },
+                    {
+                      id: 'databases',
+                      title: 'Database Connections',
+                      description: 'Connect, test, disconnect, and manage SQL databases.',
+                      detail: 'SQL Server and connection management',
+                      color: '#6366f1',
+                      icon: <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>,
+                    },
+                  ].map(option => (
+                    <button key={option.id} type="button" onClick={() => setDataSourceView(option.id)} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', padding: '24px', color: C.text, textAlign: 'left', cursor: 'pointer', fontFamily: FONT, minHeight: '190px', transition: 'transform .15s, border-color .15s, box-shadow .15s' }}
+                      onMouseEnter={event => { event.currentTarget.style.transform = 'translateY(-2px)'; event.currentTarget.style.borderColor = option.color; event.currentTarget.style.boxShadow = `0 14px 34px ${option.color}18` }}
+                      onMouseLeave={event => { event.currentTarget.style.transform = 'none'; event.currentTarget.style.borderColor = C.border; event.currentTarget.style.boxShadow = 'none' }}>
+                      <span style={{ display: 'grid', placeItems: 'center', width: 52, height: 52, borderRadius: 14, marginBottom: 20, color: option.color, background: `${option.color}18`, border: `1px solid ${option.color}35` }}>{option.icon}</span>
+                      <strong style={{ display: 'block', marginBottom: 8, fontSize: '1.05rem' }}>{option.title}</strong>
+                      <span style={{ display: 'block', minHeight: 38, marginBottom: 16, color: C.textMuted, fontSize: '0.78rem', lineHeight: 1.5 }}>{option.description}</span>
+                      <span style={{ color: option.color, fontSize: '0.72rem', fontWeight: 700 }}>{option.detail} &nbsp;→</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
             )}
 
-            {/* ── Dictionary ────────────────────────────────────────── */}
-            {activeNav === 'dictionary' && (
+            {activeNav === 'data-sources' && dataSourceView === 'databases' && (
               <ErrorBoundary C={C}>
                 <Suspense fallback={<LazyFallback />}>
-                  <DictionaryReview C={C} token={token} />
-                </Suspense>
-              </ErrorBoundary>
-            )}
-
-            {/* ── Enterprise Search ─────────────────────────────────── */}
-            {activeNav === 'enterprise-search' && (
-              <ErrorBoundary C={C}>
-                <Suspense fallback={<LazyFallback />}>
-                  <EnterpriseSearch C={C} token={token} setActiveNav={setActiveNav} openSource={openSource} />
+                  <DataSourceManager C={C} token={token} onBack={() => setDataSourceView('landing')} />
                 </Suspense>
               </ErrorBoundary>
             )}
@@ -3363,20 +3269,6 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
               const unreadAlerts     = notifications.filter(n => !n.read)
               const failedExecs      = history.filter(h => h.status === 'failed' || h.status === 'error')
 
-              const nextScheduled = scheduledList
-                .filter(s => s.enabled && s.next_run_at)
-                .sort((a, b) => new Date(a.next_run_at) - new Date(b.next_run_at))[0]
-
-              function fmtNextRun(ts) {
-                if (!ts) return 'None'
-                const diff = new Date(ts) - Date.now()
-                if (diff < 0) return 'Overdue'
-                const h = Math.floor(diff / 3600000)
-                if (h < 1) return '< 1h'
-                if (h < 24) return `${h}h`
-                return `${Math.floor(h / 24)}d`
-              }
-
               const KPI_CARDS = [
                 { label: 'Active Workflows',    value: activeWfCount,           sub: 'saved',       color: '#a78bfa', action: () => setActiveNav('workflows') },
                 { label: 'Scheduled Runs',      value: schedActiveCount,        sub: 'enabled',     color: '#38bdf8', action: () => setActiveNav('scheduled') },
@@ -3387,7 +3279,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
               ]
 
               const QUICK_ACTIONS = [
-                { label: 'Upload Dataset',  color: '#10b981', action: () => setActiveNav('datasets'),    icon: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> },
+                { label: 'Upload Dataset',  color: '#10b981', action: () => navigateTo('datasets'),    icon: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> },
                 { label: 'Create Workflow', color: '#8b5cf6', action: () => setActiveNav('ai-workspace'), icon: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg> },
                 { label: 'Generate Report', color: '#6366f1', action: () => setActiveNav('ai-workspace'), icon: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> },
                 { label: 'Monitor KPI',    color: '#f59e0b', action: () => setActiveNav('operations'),   icon: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> },
@@ -3786,7 +3678,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
             </>}
 
             {/* ── Datasets ─────────────────────────────────────────── */}
-            {activeNav === 'datasets' && (() => {
+            {activeNav === 'data-sources' && dataSourceView === 'datasets' && (() => {
               const dsTypeStyle = (type) => DS_TYPE_STYLE[type] || { color: C.textSec, bg: C.borderAlt }
 
               const filteredDs = datasetList
@@ -3815,7 +3707,8 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
                 {/* Page header */}
                 <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '12px' }}>
                   <div>
-                    <h2 style={{ margin: '0 0 4px', fontSize: '1.4rem', fontWeight: '700', color: C.text, letterSpacing: '-0.4px' }}>Datasets</h2>
+                    <button type="button" onClick={() => setDataSourceView('landing')} style={{ padding: 0, margin: '0 0 12px', border: 0, background: 'transparent', color: C.accent, fontFamily: FONT, fontSize: '0.74rem', fontWeight: 650, cursor: 'pointer' }}>← All data sources</button>
+                    <h2 style={{ margin: '0 0 4px', fontSize: '1.4rem', fontWeight: '700', color: C.text, letterSpacing: '-0.4px' }}>Uploaded Datasets</h2>
                     <p style={{ margin: 0, color: C.textMuted, fontSize: '0.75rem' }}>Upload, inspect, and manage your data sources.</p>
                   </div>
                   <div style={{ display: 'flex', gap: '10px', alignItems: 'center', paddingTop: '4px', flexShrink: 0 }}>
@@ -4119,7 +4012,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
                     </div>
 
                     {/* LEGACY BLOCK — kept for reference, unreachable when datasetSummary is set */}
-                    {false && datasetSummary && <>
+                    {SHOW_LEGACY_DATASET_SUMMARY && datasetSummary && <>
                       <div style={{ ...S.card, border: `1px solid ${C.accent}22` }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
                           <h3 style={{ margin: 0, fontSize: '0.92rem', fontWeight: '600' }}>Dataset Summary</h3>
@@ -4866,27 +4759,43 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
 
             {/* ── Reports ──────────────────────────────────────────── */}
             {activeNav === 'reports' && (() => {
-              const typeLabel = t => t === 'email_dataset_report' ? 'Emailed Report' : 'Dataset Report'
-              const typeColor = t => t === 'email_dataset_report' ? '#06b6d4' : C.accent
+              const typeLabel = t => t === 'email_dataset_report' ? 'Emailed Report' : t === 'generate_executive_report' ? 'Executive Report' : t === 'business_analysis' ? 'Business Analysis' : 'Dataset Report'
+              const typeColor = t => t === 'email_dataset_report' ? '#06b6d4' : (t === 'generate_executive_report' || t === 'business_analysis') ? '#6366f1' : C.accent
 
               if (reportViewMode === 'detail') {
                 const r = reportList.find(x => x.id === selectedReportId)
+                const view = resolveReportContentView(selectedReportData?.content)
+                const backToList = () => { setReportViewMode('list'); setSelectedReportId(null); setSelectedReportData(null) }
                 return <>
                   {selectedReportLoading ? (
                     <div style={{ padding: '48px 32px', textAlign: 'center', color: C.textMuted, fontSize: '0.82rem' }}>Loading report…</div>
-                  ) : selectedReportData?.content?.sections?.length > 0 ? (
+                  ) : view.kind === 'executive' ? (
+                    <ErrorBoundary C={C}>
+                      <Suspense fallback={<LazyFallback />}>
+                        <div style={{ padding: '20px 24px' }}>
+                          <button
+                            onClick={backToList}
+                            style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: '8px', padding: '6px 12px', fontSize: '0.72rem', fontWeight: '600', color: C.textSec, cursor: 'pointer', fontFamily: FONT, marginBottom: '16px' }}
+                          >
+                            ← Back to Reports
+                          </button>
+                          <ExecutiveReportContent report={view.report} C={C} />
+                        </div>
+                      </Suspense>
+                    </ErrorBoundary>
+                  ) : view.kind === 'legacy' ? (
                     <ErrorBoundary C={C}>
                       <Suspense fallback={<LazyFallback />}>
                         <ReportWorkspace
-                          sections={selectedReportData.content.sections}
+                          sections={view.sections}
                           reportMeta={r}
                           C={C}
                           onExport={fmt => exportReport(selectedReportId, token, fmt)}
                           onEmail={to => emailReport(selectedReportId, to, token)}
                           SectionRenderer={ReportSection}
                           token={token}
-                          reportPlan={selectedReportData.content?.report_plan ?? null}
-                          onBack={() => { setReportViewMode('list'); setSelectedReportId(null); setSelectedReportData(null) }}
+                          reportPlan={view.reportPlan}
+                          onBack={backToList}
                         />
                       </Suspense>
                     </ErrorBoundary>
@@ -4896,15 +4805,36 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
                 </>
               }
 
+              if (showExecReport) {
+                return (
+                  <ErrorBoundary C={C}>
+                    <Suspense fallback={<LazyFallback />}>
+                      <ExecutiveReportView
+                        C={C}
+                        token={token}
+                        listDataSources={listDataSources}
+                        generateExecutiveReport={generateExecutiveReport}
+                        onBack={() => setShowExecReport(false)}
+                      />
+                    </Suspense>
+                  </ErrorBoundary>
+                )
+              }
+
               return <>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
                   <div>
                     <h2 style={{ margin: '0 0 4px', fontSize: '1.4rem', fontWeight: '700', color: C.text, letterSpacing: '-0.4px' }}>Reports</h2>
                     <p style={{ margin: 0, color: C.textMuted, fontSize: '0.75rem' }}>Reports saved automatically after every dataset analysis or email workflow.</p>
                   </div>
-                  <button onClick={refreshReports} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '0.68rem', fontWeight: '400', cursor: 'pointer', fontFamily: FONT, display: 'flex', alignItems: 'center', gap: '5px' }}>
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>Refresh
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                    <button onClick={() => setShowExecReport(true)} style={{ background: C.accent, border: 'none', borderRadius: '7px', padding: '7px 14px', color: '#fff', fontSize: '0.72rem', fontWeight: '600', cursor: 'pointer', fontFamily: FONT }}>
+                      Generate Executive Report
+                    </button>
+                    <button onClick={refreshReports} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '0.68rem', fontWeight: '400', cursor: 'pointer', fontFamily: FONT, display: 'flex', alignItems: 'center', gap: '5px' }}>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>Refresh
+                    </button>
+                  </div>
                 </div>
 
                 <div style={S.card}>
@@ -5245,7 +5175,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
                   onRetry={handleRetry}
                   onRerun={handleRerun}
                   onRunNow={handleRunNow}
-                  onNavigate={setActiveNav}
+                  onNavigate={navigateTo}
                   C={C}
                 />
               </Suspense>
@@ -5257,7 +5187,7 @@ function DashboardView({ token, user, onLogout, onSessionExpired, theme, setThem
 
       {/* ── Global Profiling Job Center — always visible while a job exists ── */}
       <Suspense fallback={null}>
-        <ProfilingJobCenter C={C} onNavigate={setActiveNav} onSetTab={setDsActiveTab} />
+        <ProfilingJobCenter C={C} onNavigate={navigateTo} />
       </Suspense>
 
     </div>
@@ -5278,8 +5208,10 @@ function VerifyEmail() {
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('token')
     if (!token) {
-      setStatus('error')
-      setErrMsg('No verification token found in the link.')
+      queueMicrotask(() => {
+        setStatus('error')
+        setErrMsg('No verification token found in the link.')
+      })
       return
     }
     if (_tokensAttempted.has(token)) return

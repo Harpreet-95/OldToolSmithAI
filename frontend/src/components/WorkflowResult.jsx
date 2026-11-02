@@ -1,16 +1,6 @@
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 const MONO = "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace"
 
-const TASK_TYPE_LABELS = {
-  generate_dataset_report: 'Intelligence Report',
-  email_dataset_report:    'Report Delivery',
-  analyze_dataset:         'Dataset Analysis',
-  send_notification:       'Notification',
-  set_reminder:            'Reminder Notification',
-  multi_step:              'Multi-Step Workflow',
-  workflow:                'Workflow',
-}
-
 // ─── Multi-step workflow result ───────────────────────────────────────────────
 function MultiStepResult({ result, C, S }) {
   const statusColor = (s) => s === 'completed' ? C.success : s === 'failed' ? C.danger : s === 'running' ? C.warn : C.textMuted
@@ -30,7 +20,7 @@ function MultiStepResult({ result, C, S }) {
         </span>
       </div>
 
-      {(result.workflow_steps || []).map((step, i) => (
+      {(result.workflow_steps || []).map((step) => (
         <div key={step.step_id} style={{
           background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px',
           padding: '10px 14px',

@@ -28,7 +28,7 @@ function lastActivity(ws) {
   return ws.saved_at || ws.executed_at || ws.proposed_at || ws.created_at
 }
 
-function StatusBadge({ status, C }) {
+function StatusBadge({ status }) {
   const s = STATUS[status] || STATUS.draft
   return (
     <span style={{

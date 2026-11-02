@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { ComposerResultPanel } from './AIWorkspace'
 import { vi } from 'vitest'
 
@@ -90,7 +91,7 @@ describe('EnterpriseAnswerBlock — Milestone M-25 value rendering', () => {
     expect(screen.getByText('Technical details')).toBeInTheDocument()
   })
 
-  it('does not render a Technical details section when no source tables/columns are present', () => {
+  it('does not render a Source Data subsection when no source tables/columns are present, though Technical details itself (confidence, context) still does', () => {
     renderPanel({
       answer: 'No matching clients were found.', summary: 'No clients found.',
       answer_type: 'live_query', confidence: 95,
@@ -100,7 +101,11 @@ describe('EnterpriseAnswerBlock — Milestone M-25 value rendering', () => {
       limitations: [], next_actions: [], citations: [],
     })
     expect(screen.getByText('No matching clients were found.')).toBeInTheDocument()
-    expect(screen.queryByText('Technical details')).not.toBeInTheDocument()
+    // The overall demo-cleanup "Technical details" disclosure always renders
+    // (it also holds Confidence/Answer Context/Services/Evidence), but the
+    // Source Data subsection inside it is conditional on actual identifiers.
+    expect(screen.getByText('Technical details')).toBeInTheDocument()
+    expect(screen.queryByText('Source Data')).not.toBeInTheDocument()
   })
 
   it('renders the live-query execution-failure state, not a zero-result answer', () => {
@@ -153,6 +158,64 @@ describe('EnterpriseAnswerBlock — Milestone M-25 value rendering', () => {
       limitations: ['Results were truncated.'], next_actions: [], citations: [],
     })
     expect(screen.getByText(/Only the first 10 row\(s\) are shown/)).toBeInTheDocument()
+  })
+
+  it('paginates result_preview beyond the first page and lets Next/Previous move between pages', async () => {
+    const rows = Array.from({ length: 62 }, (_, i) => ({ Name: `Row ${i + 1}`, Value: i }))
+    renderPanel({
+      answer: '62 students matched. Showing the first 62.', summary: '62 students.',
+      answer_type: 'live_query', confidence: 95,
+      actual_value: null, business_entity: 'students', measure: null, aggregation: null,
+      applied_filters: [], date_context: null, result_preview: rows,
+      source_tables: ['dbo.Students'], source_columns: [],
+      limitations: [], next_actions: [], citations: [],
+    })
+    // Page 1 of 3 (25 rows/page over 62 rows) — first row visible, third-page-only row not yet.
+    expect(screen.getByText('Row 1')).toBeInTheDocument()
+    expect(screen.queryByText('Row 62')).not.toBeInTheDocument()
+    expect(screen.getByText('Page 1 of 3')).toBeInTheDocument()
+
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('Page 2 of 3')).toBeInTheDocument()
+    expect(screen.queryByText('Row 1')).not.toBeInTheDocument()
+    expect(screen.getByText('Row 26')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Previous' }))
+    expect(screen.getByText('Page 1 of 3')).toBeInTheDocument()
+    expect(screen.getByText('Row 1')).toBeInTheDocument()
+  })
+
+  it('renders every column of a wide (20+ column) result and does not hide any of them', () => {
+    const columns = Array.from({ length: 24 }, (_, i) => `Col${i + 1}`)
+    const row = Object.fromEntries(columns.map(c => [c, `${c}-val`]))
+    renderPanel({
+      answer: '1 record are shown below.', summary: '1 record.',
+      answer_type: 'live_query', confidence: 95,
+      actual_value: null, business_entity: 'record(s)', measure: null, aggregation: null,
+      applied_filters: [], date_context: null, result_preview: [row],
+      source_tables: ['dbo.Wide'], source_columns: [],
+      limitations: [], next_actions: [], citations: [],
+    })
+    for (const col of columns) {
+      expect(screen.getByText(col)).toBeInTheDocument()
+      expect(screen.getByText(`${col}-val`)).toBeInTheDocument()
+    }
+  })
+
+  it('renders a small (under 10 row) result preview without pagination controls', () => {
+    const rows = Array.from({ length: 4 }, (_, i) => ({ Name: `Client ${i + 1}` }))
+    renderPanel({
+      answer: '4 clients are shown below.', summary: '4 clients.',
+      answer_type: 'live_query', confidence: 95,
+      actual_value: null, business_entity: 'clients', measure: null, aggregation: null,
+      applied_filters: [], date_context: null, result_preview: rows,
+      source_tables: ['dbo.Client'], source_columns: [],
+      limitations: [], next_actions: [], citations: [],
+    })
+    expect(screen.getByText('Client 1')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Next' })).not.toBeInTheDocument()
+    expect(screen.getByText('4 results • Showing 1–4')).toBeInTheDocument()
   })
 
   it('renders a clarification-resumed final answer through the same EnterpriseAnswerBlock, not a special UI', () => {

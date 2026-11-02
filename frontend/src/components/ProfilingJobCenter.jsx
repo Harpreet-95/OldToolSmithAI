@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useProfilingJob } from '../context/ProfilingJobContext'
+import { useProfilingJob } from '../context/profilingJobState'
 
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 const STORAGE_KEY = 'toolsmith.profilingJobCenter.position'
@@ -89,11 +89,17 @@ function loadPosition() {
       const p = JSON.parse(raw)
       if (typeof p.x === 'number' && typeof p.y === 'number') return p
     }
-  } catch {}
+  } catch {
+    // Ignore malformed local UI state and use the default position.
+  }
   return null
 }
 function savePosition(pos) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(pos)) } catch {}
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(pos))
+  } catch {
+    // Storage may be unavailable; the panel still works without persistence.
+  }
 }
 
 // ─── Sub-components ──────────────────────────────────────────────────────────────

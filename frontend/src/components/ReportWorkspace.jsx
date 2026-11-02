@@ -53,14 +53,6 @@ const TABS = [
   { key: 'ask',      label: 'Ask AI'   },
 ]
 
-// Derived owner from action_type — frontend only, no backend field needed
-const ACTION_OWNER = {
-  clean_data: 'Data Team',
-  schedule:   'Analytics Team',
-  review:     'Analyst',
-  segment:    'Growth Team',
-}
-
 // ── Section routing ────────────────────────────────────────────────────────────
 // type:'kpi'          → g.metaKpi (dataset metadata, Data tab only)
 // type:'business_kpis'→ g.kpi    (business KPIs, Overview only)
@@ -85,15 +77,6 @@ function groupSections(sections) {
     else                                                                       g.data.push(sec)
   }
   return g
-}
-
-// ── Shared label style ────────────────────────────────────────────────────────
-function SectionLabel({ text, C }) {
-  return (
-    <div style={{ fontSize: '0.68rem', fontWeight: '700', color: C.textSec, textTransform: 'uppercase', letterSpacing: '0.09em', marginBottom: '12px' }}>
-      {text}
-    </div>
-  )
 }
 
 // ── ExecutiveKpiGrid ──────────────────────────────────────────────────────────
@@ -178,54 +161,6 @@ function ExecutiveIntelligencePanel({ sections, recSections = [], C }) {
           </div>
         </div>
       ))}
-    </div>
-  )
-}
-
-// ── ExecutiveRecommendationList ───────────────────────────────────────────────
-// Renders recommendations with:
-//   title, priority badge, confidence badge,
-//   business_impact (= rec.reason), owner (derived from action_type)
-function ExecutiveRecommendationList({ sections, C }) {
-  const recs = sections.flatMap(s => s.recommendations || [])
-  if (!recs.length) return null
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-      {recs.map((rec, i) => {
-        const priorityColor   = { high: C.danger, medium: C.warn, low: C.success }[rec.priority] || C.textMuted
-        const confidenceColor = { high: C.success, medium: C.warn }[rec.confidence] || C.textMuted
-
-        return (
-          <div key={i} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '10px', padding: '16px 20px' }}>
-
-            {/* Title + badges */}
-            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px', marginBottom: rec.reason ? '10px' : '10px' }}>
-              <span style={{ fontSize: '0.84rem', fontWeight: '700', color: C.text, lineHeight: 1.4, flex: 1 }}>
-                {rec.title}
-              </span>
-              <div style={{ display: 'flex', gap: '5px', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                <span style={{ background: `${priorityColor}15`, color: priorityColor, border: `1px solid ${priorityColor}30`, borderRadius: '4px', padding: '2px 7px', fontSize: '0.6rem', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.07em' }}>
-                  {rec.priority}
-                </span>
-                {rec.confidence && (
-                  <span style={{ background: `${confidenceColor}12`, color: confidenceColor, border: `1px solid ${confidenceColor}25`, borderRadius: '4px', padding: '2px 7px', fontSize: '0.6rem', fontWeight: '600', letterSpacing: '0.04em' }}>
-                    {rec.confidence} conf
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {/* Reason */}
-            {rec.reason && (
-              <div style={{ fontSize: '0.78rem', color: C.textSec, lineHeight: 1.6 }}>
-                {rec.reason}
-              </div>
-            )}
-
-          </div>
-        )
-      })}
     </div>
   )
 }
@@ -337,7 +272,7 @@ function InsightCard({ sec, C, SectionRenderer }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function ReportWorkspace({ sections, reportMeta, C, onExport, onEmail, SectionRenderer, token, reportPlan, onBack }) {
+export default function ReportWorkspace({ sections, reportMeta, C, onExport, onEmail, SectionRenderer, token, reportPlan }) {
   const [activeTab,    setActiveTab]    = useState('overview')
   const [emailInput,   setEmailInput]   = useState('')
   const [emailSending, setEmailSending] = useState(false)

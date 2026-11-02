@@ -1,4 +1,5 @@
-import { createContext, useContext, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
+import { ProfilingJobContext } from './profilingJobState'
 import {
   startBatchProfile,
   continueBatchProfile,
@@ -6,8 +7,6 @@ import {
   getActiveBatchProfile,
   getProfileReviewTasks,
 } from '../api/client'
-
-const ProfilingJobContext = createContext(null)
 
 // ─── Provider ─────────────────────────────────────────────────────────────────
 // Owns the entire lifecycle of a profiling job:
@@ -30,7 +29,7 @@ export function ProfilingJobProvider({ token, children }) {
 
   const [jobCenterOpen, setJobCenterOpen] = useState(true)
 
-  // Incremented on each completion — triggers ColumnProfileExplorer refresh
+  // Incremented on each completion so any active profiling consumers can refresh.
   const [profileRefreshKey, setProfileRefreshKey] = useState({})
 
   // Mutable flags — same pattern as the original DataSourceManager refs
@@ -66,11 +65,9 @@ export function ProfilingJobProvider({ token, children }) {
     let lastStructural  = 0
 
     while (!isComplete && !cancelRequestedRef.current[id]) {
-      // eslint-disable-next-line no-await-in-loop
       await new Promise(r => setTimeout(r, 50))
       if (cancelRequestedRef.current[id]) break
 
-      // eslint-disable-next-line no-await-in-loop
       const contResp = await continueBatchProfile(id, snapshotId, token)
       const cont = contResp?.data
       isComplete      = cont?.is_complete ?? false
@@ -141,7 +138,7 @@ export function ProfilingJobProvider({ token, children }) {
       // Handle degenerate case where total === 0 or already complete
       const alreadyDone = total === 0 || (snap?.next_table_index != null && snap.next_table_index >= total)
 
-      const { outcome, lastProgress = 0, lastStatistical = 0, lastStructural = 0 } =
+      const { outcome, lastStatistical = 0, lastStructural = 0 } =
         alreadyDone
           ? { outcome: 'complete', lastProgress: total, lastStatistical: 0, lastStructural: 0 }
           : await _runPollingLoop(id, snapshotId, 0, total)
@@ -218,7 +215,7 @@ export function ProfilingJobProvider({ token, children }) {
         },
       }))
 
-      const { outcome, lastProgress = 0, lastStatistical = 0, lastStructural = 0 } =
+      const { outcome, lastStatistical = 0, lastStructural = 0 } =
         await _runPollingLoop(id, snapshotId, active.completed_tables ?? 0, total)
 
       if (outcome === 'cancelled') return
@@ -308,10 +305,4 @@ export function ProfilingJobProvider({ token, children }) {
       {children}
     </ProfilingJobContext.Provider>
   )
-}
-
-export function useProfilingJob() {
-  const ctx = useContext(ProfilingJobContext)
-  if (!ctx) throw new Error('useProfilingJob must be used inside ProfilingJobProvider')
-  return ctx
 }

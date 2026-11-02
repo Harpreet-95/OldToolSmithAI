@@ -121,7 +121,7 @@ function SectionHeading({ C, title, subtitle }) {
 }
 
 // ─── Admin overview panel ─────────────────────────────────────────────────────
-function AdminOverviewPanel({ C, user, history, scheduledList, workflowList, toolList, usage, notifications }) {
+function AdminOverviewPanel({ C, user, history, scheduledList, workflowList, toolList, notifications }) {
   const hour = new Date().getHours()
   const greeting =
     hour >= 5  && hour < 12 ? 'Good Morning' :
@@ -181,7 +181,7 @@ function AdminOverviewPanel({ C, user, history, scheduledList, workflowList, too
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: '12px' }}>
-        {stats.map(({ label, value, color, bg }) => (
+        {stats.map(({ label, value, color }) => (
           <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '10px', padding: '16px 18px' }}>
             <div style={{ fontSize: '0.65rem', fontWeight: '700', color: C.textMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '8px' }}>{label}</div>
             <div style={{ fontSize: '1.6rem', fontWeight: '700', color, letterSpacing: '-0.5px' }}>{value}</div>
@@ -382,7 +382,7 @@ function AuditGovernancePanel({ C, history, toolList, reportList }) {
           { label: 'Pending Approval', value: pending.length, color: C.warn, bg: C.warnSoft },
           { label: 'Approval Rate', value: approvalRate !== null ? `${approvalRate}%` : '—', color: C.accent, bg: C.accentSoft },
           { label: 'Report Completion', value: complianceRate !== null ? `${complianceRate}%` : '—', color: '#8b5cf6', bg: '#8b5cf61a' },
-        ].map(({ label, value, color, bg }) => (
+        ].map(({ label, value, color }) => (
           <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '10px', padding: '14px 16px' }}>
             <div style={{ fontSize: '0.64rem', fontWeight: '700', color: C.textMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '7px' }}>{label}</div>
             <div style={{ fontSize: '1.45rem', fontWeight: '700', color, letterSpacing: '-0.4px' }}>{value}</div>
@@ -461,6 +461,7 @@ function AuditGovernancePanel({ C, history, toolList, reportList }) {
 
 // ─── System Health panel ──────────────────────────────────────────────────────
 function SystemHealthPanel({ C, history, scheduledList, reportList }) {
+  const [now] = useState(() => Date.now())
   const total       = history.length
   const successCount = history.filter(h => h.status === 'success').length
   const failedCount  = history.filter(h => h.status !== 'success').length
@@ -470,7 +471,7 @@ function SystemHealthPanel({ C, history, scheduledList, reportList }) {
   const totalSchedules  = scheduledList.length
 
   const staleMs    = 7 * 24 * 60 * 60 * 1000
-  const staleCount = reportList.filter(r => r.created_at && (Date.now() - new Date(r.created_at).getTime()) > staleMs).length
+  const staleCount = reportList.filter(r => r.created_at && (now - new Date(r.created_at).getTime()) > staleMs).length
 
   const metrics = [
     {
@@ -611,8 +612,14 @@ function ExportActivityPanel({ C, token, onSessionExpired }) {
   useEffect(() => {
     let cancelled = false
 
-    setSummaryLoading(true)
-    setSummaryErr(null)
+    queueMicrotask(() => {
+      if (!cancelled) {
+        setSummaryLoading(true)
+        setSummaryErr(null)
+        setLogsLoading(true)
+        setLogsErr(null)
+      }
+    })
     getAdminExportLogSummary(token)
       .then(res => { if (!cancelled) setSummary(res?.data ?? null) })
       .catch(err => {
@@ -621,8 +628,6 @@ function ExportActivityPanel({ C, token, onSessionExpired }) {
       })
       .finally(() => { if (!cancelled) setSummaryLoading(false) })
 
-    setLogsLoading(true)
-    setLogsErr(null)
     const params = { limit: PAGE_SIZE, offset: page * PAGE_SIZE }
     if (filterFormat) params.export_format = filterFormat
     if (filterStatus) params.status = filterStatus
@@ -830,8 +835,14 @@ function EmailActivityPanel({ C, token, onSessionExpired }) {
   useEffect(() => {
     let cancelled = false
 
-    setSummaryLoading(true)
-    setSummaryErr(null)
+    queueMicrotask(() => {
+      if (!cancelled) {
+        setSummaryLoading(true)
+        setSummaryErr(null)
+        setLogsLoading(true)
+        setLogsErr(null)
+      }
+    })
     getAdminEmailLogSummary(token)
       .then(res => { if (!cancelled) setSummary(res?.data ?? null) })
       .catch(err => {
@@ -840,8 +851,6 @@ function EmailActivityPanel({ C, token, onSessionExpired }) {
       })
       .finally(() => { if (!cancelled) setSummaryLoading(false) })
 
-    setLogsLoading(true)
-    setLogsErr(null)
     const params = { limit: PAGE_SIZE, offset: page * PAGE_SIZE }
     if (filterType) params.email_type = filterType
     if (filterStatus) params.status = filterStatus
@@ -1082,13 +1091,16 @@ export default function AdminDashboard({ token, user, onLogout, onSessionExpired
   const is401 = err => err?.message?.startsWith('401')
 
   useEffect(() => {
-    setHistoryLoading(true)
+    queueMicrotask(() => {
+      setHistoryLoading(true)
+      setScheduledLoading(true)
+      setNotifLoading(true)
+    })
     getMyData(token)
       .then(d => setHistory(d?.data?.execution_history ?? []))
       .catch(err => { if (is401(err)) onSessionExpired() })
       .finally(() => setHistoryLoading(false))
 
-    setScheduledLoading(true)
     getScheduledWorkflows(token)
       .then(d => setScheduledList(d?.data ?? []))
       .catch(err => { if (is401(err)) onSessionExpired() })
@@ -1102,7 +1114,6 @@ export default function AdminDashboard({ token, user, onLogout, onSessionExpired
       .then(d => setWorkflowList(d?.data ?? []))
       .catch(err => { if (is401(err)) onSessionExpired() })
 
-    setNotifLoading(true)
     getNotifications(token)
       .then(d => setNotifications(d?.data ?? []))
       .catch(err => { if (is401(err)) onSessionExpired() })

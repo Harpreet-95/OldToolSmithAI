@@ -4,6 +4,7 @@
  * Supported chart_type values:
  *   bar | line | pie | donut          — v1, unchanged
  *   bar_horizontal                     — v3: same BarChart, forced HBarChart layout
+ *                                         (HTML/CSS row layout, not SVG — see HBarChart)
  *   scatter                            — v2: {x_label, y_label, points:[{x,y}]}
  *   heatmap                            — v2: {x_labels, y_labels, values:[][]}
  *   correlation_matrix                 — v2: {columns, matrix:[][]}
@@ -11,10 +12,9 @@
  * Chart recommendation:
  *   recommendChartType(chart) → inferred best chart_type string
  */
+import { useState } from 'react'
 
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
-const MONO = "'Cascadia Code', 'Fira Code', monospace"
-
 // Categorical colour palette (cycles)
 const PALETTE = [
   '#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981',
@@ -61,7 +61,7 @@ function corrText(v, C) {
  * @param {object} chart – the chart sub-object from a section
  * @returns {string} recommended chart_type
  */
-export function recommendChartType(chart) {
+function recommendChartType(chart) {
   const explicit = chart?.chart_type
   if (explicit && explicit !== 'auto') return explicit
 
@@ -122,40 +122,168 @@ function FallbackTable({ labels, series, C }) {
 // ─── Bar chart ────────────────────────────────────────────────────────────────
 
 // Horizontal bar — used when labels are long or chart is dense (> 12 bars).
-// Labels sit on the left, bars grow right, values appear after the bar.
-function HBarChart({ labels, nums, maxVal, name, C }) {
-  const n          = labels.length
-  const LBL_W      = 130, VAL_W = 52, TOP = 10
-  const BAR_H      = 20,  GAP   = 7
-  const SVG_W      = 520, CHART_W = SVG_W - LBL_W - VAL_W
-  const SVG_H      = TOP + n * (BAR_H + GAP) + 4
-  const multiColor = n <= 12
+// HTML/CSS rows (not SVG) so category labels can wrap instead of being
+// truncated, the chart fills the available card width responsively, and
+// every row is keyboard-focusable with an accessible full-label tooltip.
+function HBarRow({ label, val, maxVal, color, index, active, onActivate, onDeactivate, C }) {
+  const pct      = maxVal > 0 ? Math.max(1.5, (val / maxVal) * 100) : 0
+  const exact    = Number(val).toLocaleString()
+  const tooltipId = `hbar-tip-${index}`
 
   return (
-    <div style={{ overflowX: 'auto' }}>
-      <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} width="100%"
-        style={{ display: 'block', minWidth: '280px', maxWidth: `${SVG_W}px` }}
-        aria-label={name || 'bar chart'}>
-        {labels.map((label, i) => {
-          const val   = nums[i]
-          const barW  = Math.max(2, Math.round((val / maxVal) * CHART_W * 0.95))
-          const y     = TOP + i * (BAR_H + GAP)
-          const color = multiColor ? PALETTE[i % PALETTE.length] : '#6366f1'
-          const short = label.length > 20 ? label.slice(0, 19) + '…' : label
-          return (
-            <g key={i}>
-              <text x={LBL_W - 8} y={y + BAR_H / 2 + 4} textAnchor="end"
-                fontSize={8} fill={C.text} fontFamily={FONT}>{short}</text>
-              <rect x={LBL_W} y={y} width={barW} height={BAR_H} fill={color} rx={3} opacity={0.86}>
-                <title>{label}: {val.toLocaleString()}</title>
-              </rect>
-              <text x={LBL_W + barW + 5} y={y + BAR_H / 2 + 4} textAnchor="start"
-                fontSize={8} fill={C.textSec} fontFamily={FONT} fontWeight="600">{fmtVal(val)}</text>
-            </g>
-          )
-        })}
-      </svg>
-      {name && <div style={{ fontSize: '0.65rem', color: C.textMuted, textAlign: 'center', marginTop: '4px' }}>{name}</div>}
+    <div
+      role="listitem"
+      aria-label={`${label}: ${exact}`}
+      aria-describedby={tooltipId}
+      tabIndex={0}
+      onMouseEnter={onActivate}
+      onMouseLeave={onDeactivate}
+      onFocus={onActivate}
+      onBlur={onDeactivate}
+      style={{
+        position: 'relative',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        padding: '3px 2px',
+        borderRadius: '4px',
+      }}
+    >
+      <span
+        title={label}
+        style={{
+          flex: '0 0 auto',
+          width: 'var(--hbar-label-w)',
+          fontSize: '0.72rem',
+          lineHeight: 1.25,
+          color: C.text,
+          textAlign: 'right',
+          display: '-webkit-box',
+          WebkitLineClamp: 2,
+          WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+          wordBreak: 'break-word',
+        }}
+      >
+        {label}
+      </span>
+
+      <span style={{ position: 'relative', flex: '1 1 auto', minWidth: 0, height: '16px' }}>
+        <span style={{
+          position: 'absolute', inset: 0,
+          background: C.border, opacity: 0.3, borderRadius: '3px',
+        }} />
+        <span style={{
+          position: 'absolute', left: 0, top: 0, bottom: 0,
+          width: `${pct}%`, background: color, opacity: 0.88, borderRadius: '3px',
+        }} />
+      </span>
+
+      <span style={{
+        flex: '0 0 auto', minWidth: '3.4em',
+        fontSize: '0.72rem', fontWeight: 600, color: C.textSec,
+        textAlign: 'left', whiteSpace: 'nowrap',
+      }}>
+        {fmtVal(val)}
+      </span>
+
+      <div
+        id={tooltipId}
+        role="tooltip"
+        style={{
+          position: 'absolute',
+          left: 'var(--hbar-label-w)',
+          marginLeft: '8px',
+          bottom: 'calc(100% + 4px)',
+          background: C.surface,
+          border: `1px solid ${C.border}`,
+          borderRadius: '6px',
+          padding: '5px 9px',
+          fontSize: '0.72rem',
+          color: C.text,
+          boxShadow: '0 4px 16px rgba(0,0,0,0.18)',
+          maxWidth: '320px',
+          whiteSpace: 'normal',
+          wordBreak: 'break-word',
+          zIndex: 5,
+          pointerEvents: 'none',
+          opacity: active ? 1 : 0,
+          visibility: active ? 'visible' : 'hidden',
+          transition: 'opacity 0.1s',
+        }}
+      >
+        <strong>{label}</strong>: {exact}
+      </div>
+    </div>
+  )
+}
+
+function HBarChart({ labels, nums, maxVal, name, C }) {
+  const n          = labels.length
+  const [activeIdx, setActiveIdx] = useState(null)
+  const [showTable, setShowTable] = useState(false)
+  const multiColor = n <= 12
+
+  // Reserve left-side space for labels based on both the longest observed
+  // label (in character units) and a cap relative to the card's own width,
+  // so short labels stay compact and long ones get room without starving
+  // the bar track on narrow cards.
+  const longest  = Math.max(...labels.map(l => String(l).length), 4)
+  const labelCh  = Math.min(Math.max(longest, 10), 30)
+  const labelVar = `min(${labelCh}ch, 42%)`
+
+  return (
+    <div style={{ '--hbar-label-w': labelVar }}>
+      <div role="list" aria-label={name || 'bar chart'} style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+        {labels.map((label, i) => (
+          <HBarRow
+            key={i}
+            index={i}
+            label={label}
+            val={nums[i]}
+            maxVal={maxVal}
+            color={multiColor ? PALETTE[i % PALETTE.length] : '#6366f1'}
+            active={activeIdx === i}
+            onActivate={() => setActiveIdx(i)}
+            onDeactivate={() => setActiveIdx(idx => (idx === i ? null : idx))}
+            C={C}
+          />
+        ))}
+      </div>
+
+      {name && <div style={{ fontSize: '0.65rem', color: C.textMuted, textAlign: 'center', marginTop: '6px' }}>{name}</div>}
+
+      <details
+        open={showTable}
+        onToggle={e => setShowTable(e.target.open)}
+        style={{ marginTop: '8px' }}
+      >
+        <summary style={{ cursor: 'pointer', fontSize: '0.68rem', color: C.textMuted, userSelect: 'none' }}>
+          View data ({n} rows)
+        </summary>
+        <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '6px' }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left', padding: '4px 6px', borderBottom: `1px solid ${C.border}`, fontSize: '0.68rem', color: C.textMuted, fontWeight: 600 }}>
+                {name || 'Category'}
+              </th>
+              <th style={{ textAlign: 'right', padding: '4px 6px', borderBottom: `1px solid ${C.border}`, fontSize: '0.68rem', color: C.textMuted, fontWeight: 600 }}>
+                Value
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {labels.map((label, i) => (
+              <tr key={i}>
+                <td style={{ padding: '4px 6px', borderBottom: `1px solid ${C.border}`, fontSize: '0.72rem', color: C.text }}>{label}</td>
+                <td style={{ padding: '4px 6px', borderBottom: `1px solid ${C.border}`, fontSize: '0.72rem', color: C.text, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                  {Number(nums[i]).toLocaleString()}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </details>
     </div>
   )
 }
@@ -343,19 +471,28 @@ function LineChart({ labels, series, C }) {
               </g>
             )
           })}
-          {labels.map((label, i) => {
-            const x = LEFT + i * xStep, lbl = String(label)
-            const rotate = lbl.length > 6 || n > 10
-            const short  = lbl.length > 12 ? lbl.slice(0, 11) + '…' : lbl
-            return rotate ? (
-              <text key={i} x={x} y={BASE_Y + 10} textAnchor="end"
-                fontSize={7} fill={C.textMuted} fontFamily={FONT}
-                transform={`rotate(-42,${x},${BASE_Y + 10})`}>{short}</text>
-            ) : (
-              <text key={i} x={x} y={BASE_Y + 15} textAnchor="middle"
-                fontSize={7.5} fill={C.textMuted} fontFamily={FONT}>{short}</text>
-            )
-          })}
+          {/* Dense series (e.g. a multi-year monthly trend) would otherwise
+              render one rotated label per point and collapse into an
+              unreadable smear -- thin to every Nth label the same way
+              ForecastChart already does below, never dropping a data
+              point/circle, only its text label. */}
+          {(() => {
+            const step = n > 14 ? Math.ceil(n / 14) : 1
+            return labels.map((label, i) => {
+              if (step > 1 && i % step !== 0 && i !== n - 1) return null
+              const x = LEFT + i * xStep, lbl = String(label)
+              const rotate = lbl.length > 6 || n > 10
+              const short  = lbl.length > 12 ? lbl.slice(0, 11) + '…' : lbl
+              return rotate ? (
+                <text key={i} x={x} y={BASE_Y + 10} textAnchor="end"
+                  fontSize={7} fill={C.textMuted} fontFamily={FONT}
+                  transform={`rotate(-42,${x},${BASE_Y + 10})`}>{short}</text>
+              ) : (
+                <text key={i} x={x} y={BASE_Y + 15} textAnchor="middle"
+                  fontSize={7.5} fill={C.textMuted} fontFamily={FONT}>{short}</text>
+              )
+            })
+          })()}
         </svg>
       </div>
       {name && <div style={{ fontSize: '0.65rem', color: C.textMuted, textAlign: 'center', marginTop: '4px' }}>{name}</div>}
@@ -384,12 +521,11 @@ function DonutChart({ labels, series, C }) {
   }
 
   const CX = 90, CY = 90, OR = 74, IR = 44, SIZE = 180
-  let angle = -Math.PI / 2
-
   const slices = shown.map((item, i) => {
     const frac = item.val / total
-    const start = angle, end = angle + frac * 2 * Math.PI
-    angle = end
+    const priorFraction = shown.slice(0, i).reduce((sum, prior) => sum + prior.val / total, 0)
+    const start = -Math.PI / 2 + priorFraction * 2 * Math.PI
+    const end = start + frac * 2 * Math.PI
     const x1o = CX + OR * Math.cos(start), y1o = CY + OR * Math.sin(start)
     const x2o = CX + OR * Math.cos(end),   y2o = CY + OR * Math.sin(end)
     const x1i = CX + IR * Math.cos(end),   y1i = CY + IR * Math.sin(end)
@@ -517,44 +653,76 @@ function StackedBarChart({ labels, series, C }) {
 }
 
 // ─── Grouped line chart ───────────────────────────────────────────────────────
-// Multi-series line chart, each series rendered in a distinct palette colour.
+// Multi-series line chart, each series rendered in a distinct colour.
+//
+// Two series whose magnitudes differ by more than DUAL_AXIS_RATIO (e.g. a
+// payment COUNT of ~250 beside a payment TOTAL of ~46,000) cannot share one
+// y-axis: the smaller series flattens to a line on zero. For that exact case
+// each series gets its OWN labelled axis (left = series 1, right = series 2,
+// tick labels coloured to match their line). Every other shape keeps the
+// single shared axis.
+const LINE_COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ec4899', '#3b82f6', '#ef4444', '#14b8a6', '#f97316']
+const DUAL_AXIS_RATIO = 10
+
 function GroupedLineChart({ labels, series, C }) {
   if (!labels.length || !series.length) return <FallbackTable labels={labels} series={series} C={C} />
   if (labels.length < 2) return <FallbackTable labels={labels} series={series} C={C} />
 
-  const allNums = series.flatMap(s => (s.data || []).filter(v => typeof v === 'number' && isFinite(v)))
+  const numsOf = s => (s.data || []).filter(v => typeof v === 'number' && isFinite(v))
+  const allNums = series.flatMap(numsOf)
   if (!allNums.length) return <FallbackTable labels={labels} series={series} C={C} />
 
   const n = labels.length
-  const maxVal = Math.max(...allNums, 1)
-  const minVal = Math.min(...allNums, 0)
-  const range = maxVal - minVal || 1
+  const maxOf = s => Math.max(...numsOf(s), 0)
+  const dual = series.length === 2 && (() => {
+    const a = maxOf(series[0]), b = maxOf(series[1])
+    return Math.min(a, b) > 0 && Math.max(a, b) / Math.min(a, b) > DUAL_AXIS_RATIO
+  })()
 
-  const LEFT = 42, RIGHT = 16, TOP = 20, CH = 160, LBL_H = 48
+  // [min, max] per series: its own range when dual, otherwise the shared range.
+  const sharedMax = Math.max(...allNums, 1)
+  const sharedMin = Math.min(...allNums, 0)
+  const rangeFor = si => dual
+    ? [Math.min(...numsOf(series[si]), 0), Math.max(...numsOf(series[si]), 1)]
+    : [sharedMin, sharedMax]
+
+  const LEFT = 42, RIGHT = dual ? 46 : 16, TOP = 20, CH = 160, LBL_H = 48
   const SVG_W = 520, SVG_H = TOP + CH + LBL_H
   const CHART_W = SVG_W - LEFT - RIGHT, BASE_Y = TOP + CH
   const xStep = CHART_W / (n - 1)
 
-  const toY = v => TOP + CH * 0.96 - ((v - minVal) / range) * CH * 0.92
-  const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => ({ val: Math.round(minVal + f * range), y: TOP + CH * 0.96 - f * CH * 0.92 }))
+  const toY = (v, si) => {
+    const [lo, hi] = rangeFor(si)
+    return TOP + CH * 0.96 - ((v - lo) / ((hi - lo) || 1)) * CH * 0.92
+  }
+  const fracs = [0, 0.25, 0.5, 0.75, 1]
+  const ticksFor = si => {
+    const [lo, hi] = rangeFor(si)
+    return fracs.map(f => ({ val: Math.round(lo + f * (hi - lo)), y: TOP + CH * 0.96 - f * CH * 0.92 }))
+  }
 
   return (
     <div style={{ overflowX: 'auto' }}>
       <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} width="100%"
         style={{ display: 'block', minWidth: '200px', maxWidth: `${SVG_W}px` }}
         aria-label="grouped line chart">
-        {ticks.map(({ val, y }, gi) => (
+        {ticksFor(0).map(({ val, y }, gi) => (
           <g key={gi}>
             <line x1={LEFT} y1={y} x2={SVG_W - RIGHT} y2={y}
               stroke={C.border} strokeWidth={0.7} strokeDasharray="3 3" />
-            <text x={LEFT - 4} y={y + 3.5} textAnchor="end" fontSize={7} fill={C.textMuted} fontFamily={FONT}>{fmtVal(val)}</text>
+            <text x={LEFT - 4} y={y + 3.5} textAnchor="end" fontSize={7}
+              fill={dual ? LINE_COLORS[0] : C.textMuted} fontFamily={FONT}>{fmtVal(val)}</text>
           </g>
+        ))}
+        {dual && ticksFor(1).map(({ val, y }, gi) => (
+          <text key={`r${gi}`} x={SVG_W - RIGHT + 4} y={y + 3.5} textAnchor="start" fontSize={7}
+            fill={LINE_COLORS[1]} fontFamily={FONT}>{fmtVal(val)}</text>
         ))}
         <line x1={LEFT} y1={BASE_Y} x2={SVG_W - RIGHT} y2={BASE_Y} stroke={C.border} strokeWidth={1} />
         {series.map((s, si) => {
-          const color = PALETTE[si % PALETTE.length]
+          const color = LINE_COLORS[si % LINE_COLORS.length]
           const nums = (s.data || []).map(v => (typeof v === 'number' && isFinite(v) ? v : null))
-          const pts = nums.map((v, i) => v != null ? { x: LEFT + i * xStep, y: toY(v), v } : null)
+          const pts = nums.map((v, i) => v != null ? { x: LEFT + i * xStep, y: toY(v, si), v } : null)
           const linePts = pts.filter(Boolean).map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')
           return (
             <g key={si}>
@@ -568,23 +736,29 @@ function GroupedLineChart({ labels, series, C }) {
             </g>
           )
         })}
-        {labels.map((label, i) => {
-          const x = LEFT + i * xStep, lbl = String(label)
-          const rotate = lbl.length > 6 || n > 10
-          const short = lbl.length > 12 ? lbl.slice(0, 11) + '…' : lbl
-          return rotate ? (
-            <text key={i} x={x} y={BASE_Y + 10} textAnchor="end" fontSize={7} fill={C.textMuted} fontFamily={FONT}
-              transform={`rotate(-42,${x},${BASE_Y + 10})`}>{short}</text>
-          ) : (
-            <text key={i} x={x} y={BASE_Y + 15} textAnchor="middle" fontSize={7.5} fill={C.textMuted} fontFamily={FONT}>{short}</text>
-          )
-        })}
+        {(() => {
+          const step = n > 14 ? Math.ceil(n / 14) : 1
+          return labels.map((label, i) => {
+            if (step > 1 && i % step !== 0 && i !== n - 1) return null
+            const x = LEFT + i * xStep, lbl = String(label)
+            const rotate = lbl.length > 6 || n > 10
+            const short = lbl.length > 12 ? lbl.slice(0, 11) + '…' : lbl
+            return rotate ? (
+              <text key={i} x={x} y={BASE_Y + 10} textAnchor="end" fontSize={7} fill={C.textMuted} fontFamily={FONT}
+                transform={`rotate(-42,${x},${BASE_Y + 10})`}>{short}</text>
+            ) : (
+              <text key={i} x={x} y={BASE_Y + 15} textAnchor="middle" fontSize={7.5} fill={C.textMuted} fontFamily={FONT}>{short}</text>
+            )
+          })
+        })()}
       </svg>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px 14px', justifyContent: 'center', marginTop: '6px' }}>
         {series.map((s, si) => (
           <div key={si} style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-            <svg width="20" height="4"><line x1="0" y1="2" x2="20" y2="2" stroke={PALETTE[si % PALETTE.length]} strokeWidth="2" /></svg>
-            <span style={{ fontSize: '0.67rem', color: C.textSec }}>{s.name || `Series ${si + 1}`}</span>
+            <svg width="20" height="4"><line x1="0" y1="2" x2="20" y2="2" stroke={LINE_COLORS[si % LINE_COLORS.length]} strokeWidth="2" /></svg>
+            <span style={{ fontSize: '0.67rem', color: C.textSec }}>
+              {s.name || `Series ${si + 1}`}{dual ? (si === 0 ? ' (left axis)' : ' (right axis)') : ''}
+            </span>
           </div>
         ))}
       </div>
@@ -828,7 +1002,6 @@ function CorrelationMatrix({ chart, C }) {
               const v   = typeof raw === 'number' && isFinite(raw) ? raw : null
               const isDiag = ri === ci
               const fill   = isDiag ? C.accentSoft : (v != null ? corrFill(v) : C.borderAlt)
-              const border = isDiag ? `1px solid ${C.accent}40` : 'none'
               const tColor = isDiag ? C.accent : (v != null ? corrText(v, C) : C.textMuted)
               const label  = isDiag ? '—' : (v != null ? v.toFixed(2) : '?')
               const absV   = Math.abs(v ?? 0)

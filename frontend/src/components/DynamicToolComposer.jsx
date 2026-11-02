@@ -47,7 +47,7 @@ function SmallBadge({ label, color, bg }) {
   )
 }
 
-function IconBtn({ onClick, disabled, title, color, dangerSoft, children }) {
+function IconBtn({ onClick, disabled, title, color, children }) {
   return (
     <button
       onClick={onClick}

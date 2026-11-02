@@ -65,6 +65,19 @@ describe('ExportDropdown — visibility gating', () => {
     expect(screen.getByLabelText('Export')).toBeInTheDocument()
   })
 
+  it('renders the Export button for a successful AI-first fast-path answer (agent_status "ok")', () => {
+    renderPanel({ agent_status: 'ok' })
+    expect(screen.getByLabelText('Export')).toBeInTheDocument()
+  })
+
+  it.each(['non_data', 'unsupported', 'not_enabled', 'state_reset', 'clarification_required', 'validation_failed'])(
+    'never renders Export for the fast-path status "%s"',
+    (status) => {
+      renderPanel({ agent_status: status })
+      expect(screen.queryByLabelText('Export')).not.toBeInTheDocument()
+    },
+  )
+
   it('never renders Export for a safely-refused answer', () => {
     renderPanel({ agent_status: 'safely_refused' })
     expect(screen.queryByLabelText('Export')).not.toBeInTheDocument()
@@ -83,6 +96,18 @@ describe('ExportDropdown — visibility gating', () => {
   it('never renders Export when there is no enterprise_answer at all', () => {
     renderPanel({ enterprise_answer: null })
     expect(screen.queryByLabelText('Export')).not.toBeInTheDocument()
+  })
+})
+
+describe('ExportDropdown — fast-path export request', () => {
+  it('sends agent_status "ok" through to exportComposerAnswer on click', async () => {
+    exportComposerAnswer.mockResolvedValueOnce(undefined)
+    renderPanel({ agent_status: 'ok' })
+    fireEvent.click(screen.getByLabelText('Export'))
+    fireEvent.click(screen.getByText('CSV'))
+    await waitFor(() => expect(exportComposerAnswer).toHaveBeenCalled())
+    expect(exportComposerAnswer.mock.calls.at(-1)[1].agentStatus).toBe('ok')
+    exportComposerAnswer.mockClear()
   })
 })
 

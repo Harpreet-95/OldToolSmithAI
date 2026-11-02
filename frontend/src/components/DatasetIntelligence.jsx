@@ -132,7 +132,7 @@ function buildCorrChart(pairs) {
 }
 
 // ─── Tab: Overview ────────────────────────────────────────────────────────────
-function OverviewTab({ ds, quality, C, onGenerateReport, hasReport, report }) {
+function OverviewTab({ ds, C, onGenerateReport, hasReport, report }) {
   const cols    = ds.columns || []
   const numCols = (ds.numeric_columns || []).length
   const dateCols = (ds.date_profile?.date_columns || []).length
@@ -390,7 +390,7 @@ function ColumnsTab({ ds, C }) {
 // ─── Tab: Correlations ────────────────────────────────────────────────────────
 function CorrelationsTab({ ds, C }) {
   const [pairSearch, setPairSearch] = useState('')
-  const pairs  = ds.correlation_profile || []
+  const pairs  = useMemo(() => ds.correlation_profile || [], [ds.correlation_profile])
   const chart  = useMemo(() => buildCorrChart(pairs), [pairs])
 
   if (!pairs.length) {
@@ -654,7 +654,7 @@ function PreviewTab({ ds, C }) {
 }
 
 // ─── Main component ────────────────────────────────────────────────────────────
-export default function DatasetIntelligence({ ds, C, S, onGenerateReport, hasReport, report }) {
+export default function DatasetIntelligence({ ds, C, onGenerateReport, hasReport, report }) {
   const [tab, setTab] = useState('overview')
   const quality = useMemo(() => computeQuality(ds), [ds])
 

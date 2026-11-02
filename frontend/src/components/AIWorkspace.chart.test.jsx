@@ -7,6 +7,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { ComposerResultPanel } from './AIWorkspace'
+import ChartSection from './ChartSection'
 
 const C = {
   bg: '#f8f8fb', surface: '#ffffff', border: '#e2e2ec',
@@ -70,8 +71,14 @@ describe('EnterpriseAnswerBlock — automatic chart', () => {
         series: [{ name: 'Students', data: [90, 75] }],
       },
     })
-    expect(screen.getByText('CS101')).toBeInTheDocument()
-    expect(screen.getByText('Data Science 101')).toBeInTheDocument()
+    // Each full label appears twice: once as the bar row's own label, once
+    // in the accessible "View data" table fallback (requirement: complete
+    // names + exact values available outside the bar's visual rendering).
+    expect(screen.getAllByText('CS101').length).toBeGreaterThanOrEqual(1)
+    expect(screen.getAllByText('Data Science 101').length).toBeGreaterThanOrEqual(1)
+    // Each row is keyboard-focusable and exposes the full label + exact value.
+    expect(screen.getByRole('listitem', { name: 'CS101: 90' })).toBeInTheDocument()
+    expect(screen.getByRole('listitem', { name: 'Data Science 101: 75' })).toBeInTheDocument()
   })
 
   it('renders nothing extra when chart is absent (e.g. a scalar answer)', () => {
@@ -94,5 +101,92 @@ describe('EnterpriseAnswerBlock — automatic chart', () => {
     // The table's column headers prove the table is still rendered, not replaced.
     expect(screen.getByRole('columnheader', { name: 'Year' })).toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: 'Students' })).toBeInTheDocument()
+  })
+})
+
+describe('ChartSection — dense time-series label thinning', () => {
+  // Phase 7, Step 6G1 -- a long monthly trend (e.g. 172 months of real
+  // CCPP enrollment data) previously rendered one rotated <text> label per
+  // point and collapsed into an unreadable smear. Every data point/circle
+  // must still render (no data loss); only the TEXT label density thins.
+  function monthlyChart(n) {
+    const labels = Array.from({ length: n }, (_, i) => `2012-${String((i % 12) + 1).padStart(2, '0')}`)
+    const data = Array.from({ length: n }, (_, i) => i + 1)
+    return { chart_type: 'line', labels, series: [{ name: 'Enrollment Total', data }] }
+  }
+
+  it('renders far fewer text labels than data points for a 172-point line chart', () => {
+    const { container } = render(<ChartSection chart={monthlyChart(172)} C={C} />)
+    const texts = container.querySelectorAll('svg text')
+    const circles = container.querySelectorAll('svg circle')
+    expect(circles.length).toBe(172)
+    expect(texts.length).toBeGreaterThan(0)
+    expect(texts.length).toBeLessThan(30)
+  })
+
+  it('always keeps the last label visible so the chart end date is never cut off', () => {
+    const chart = monthlyChart(172)
+    const { container } = render(<ChartSection chart={chart} C={C} />)
+    const texts = Array.from(container.querySelectorAll('svg text')).map(t => t.textContent)
+    expect(texts.some(t => chart.labels[chart.labels.length - 1].startsWith(t.replace('…', '')))).toBe(true)
+  })
+
+  it('renders every label for a short series (no thinning below the threshold)', () => {
+    const { container } = render(<ChartSection chart={monthlyChart(10)} C={C} />)
+    expect(container.querySelectorAll('svg text').length).toBeGreaterThanOrEqual(10)
+  })
+})
+
+describe('ChartSection — grouped_line (date + multiple measures)', () => {
+  it('renders one line series per measure without crashing or losing points', () => {
+    const chart = {
+      chart_type: 'grouped_line',
+      labels: ['2026-01', '2026-02', '2026-03'],
+      series: [
+        { name: 'Payment Count', data: [279, 268, 253] },
+        { name: 'Total Amount Paid', data: [4969, 7573, 13542] },
+      ],
+    }
+    const { container } = render(<ChartSection chart={chart} C={C} />)
+    expect(screen.getByText('Payment Count (left axis)')).toBeInTheDocument()
+    expect(screen.getByText('Total Amount Paid (right axis)')).toBeInTheDocument()
+    // One circle per data point per series (3 points x 2 series).
+    expect(container.querySelectorAll('svg circle').length).toBe(6)
+  })
+
+  it('gives two series of very different magnitude their own labelled axes (no flat line on zero)', () => {
+    const chart = {
+      chart_type: 'grouped_line',
+      labels: ['2026-01', '2026-02', '2026-03'],
+      series: [
+        { name: 'Payment Count', data: [250, 260, 255] },
+        { name: 'Total Amount Paid', data: [4000, 46000, 13000] },
+      ],
+    }
+    const { container } = render(<ChartSection chart={chart} C={C} />)
+    expect(screen.getByText('Payment Count (left axis)')).toBeInTheDocument()
+    expect(screen.getByText('Total Amount Paid (right axis)')).toBeInTheDocument()
+    // The small series must span a real vertical range, not sit on the baseline.
+    const countCircles = Array.from(container.querySelectorAll('svg circle')).slice(0, 3)
+    const ys = countCircles.map(c => Number(c.getAttribute('cy')))
+    const baseY = 20 + 160
+    expect(Math.min(...ys)).toBeLessThan(baseY - 20)
+    // Distinct colours per series.
+    const fills = new Set(Array.from(container.querySelectorAll('svg circle')).map(c => c.getAttribute('fill')))
+    expect(fills.size).toBe(2)
+  })
+
+  it('keeps one shared axis when the two series are of comparable magnitude', () => {
+    const chart = {
+      chart_type: 'grouped_line',
+      labels: ['a', 'b', 'c'],
+      series: [
+        { name: 'Revenue', data: [100, 120, 90] },
+        { name: 'Cost', data: [60, 70, 65] },
+      ],
+    }
+    render(<ChartSection chart={chart} C={C} />)
+    expect(screen.getByText('Revenue')).toBeInTheDocument()
+    expect(screen.queryByText(/axis\)/)).not.toBeInTheDocument()
   })
 })

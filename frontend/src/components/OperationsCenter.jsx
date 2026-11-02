@@ -127,7 +127,7 @@ function HealthSummary({ history, C }) {
 // ─── Throughput Chart (7-day SVG) ─────────────────────────────────────────────
 function ThroughputChart({ history, C }) {
   const DAYS = 7
-  const now = Date.now()
+  const [now] = useState(() => Date.now())
   const windowStart = now - DAYS * 86400000
 
   const buckets = Array.from({ length: DAYS }, (_, i) => {
@@ -423,7 +423,7 @@ function SchedulerPanel({ scheduledList, schedRunNowLoading, onRunNow, onNavigat
 // ─── Drift Alert Center ───────────────────────────────────────────────────────
 function DriftAlerts({ reportList, onNavigate, C }) {
   const STALE_DAYS = 7
-  const now = Date.now()
+  const [now] = useState(() => Date.now())
 
   const candidates = reportList
     .filter(r => r.task_type === 'generate_dataset_report' || r.task_type === 'email_dataset_report')

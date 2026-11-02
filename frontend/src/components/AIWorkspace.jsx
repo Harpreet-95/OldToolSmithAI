@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
-import { composeIntent, interpretTask, askComposer, askReport, askDataset, planEngineTool, saveEngineTool, listEngineTools, executeEngineTool, getEngineRun, submitEngineTool, approveEngineTool, listDataSources } from '../api/client'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { composeIntent, interpretTask, askComposer, askReport, askDataset, planEngineTool, saveEngineTool, submitEngineTool, approveEngineTool, listDataSources, promoteConceptMapping, exportComposerAnswer } from '../api/client'
+import { useConversationState, buildComposerPayload } from '../hooks/useConversationState'
 import ProposalPreview from './ProposalPreview'
 import ChartSection from './ChartSection'
+import { ExecutiveReportContent } from './ExecutiveReportView'
 
 const FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 const MONO = "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace"
@@ -34,6 +36,33 @@ const QUICK_STARTS = [
   },
 ]
 
+const DATABASE_QUICK_STARTS = [
+  {
+    prompt: 'How many students are there?',
+    text: 'Count all students currently in the database',
+    color: '#34d399',
+    iconType: 'bars',
+  },
+  {
+    prompt: 'Show total student enrollments by month across all available years.',
+    text: 'Show monthly student enrollment trends',
+    color: '#38bdf8',
+    iconType: 'trend',
+  },
+  {
+    prompt: 'Show the top 10 programs by number of enrolled students.',
+    text: 'Rank the top 10 programs by enrollment',
+    color: '#a78bfa',
+    iconType: 'bars',
+  },
+  {
+    prompt: 'How many students are enrolled in SQL classes?',
+    text: 'Count students enrolled in SQL classes',
+    color: '#fbbf24',
+    iconType: 'document',
+  },
+]
+
 function QsIcon({ type, color }) {
   const p = { width: 20, height: 20, viewBox: '0 0 24 24', fill: 'none', stroke: color, strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }
   if (type === 'bars')     return <svg {...p}><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
@@ -59,36 +88,6 @@ const COPILOT_SUGGESTIONS = [
 ]
 
 // ── Report style display metadata (maps backend style name → badge label/colors) ──
-const STYLE_LABELS = {
-  executive_brief:    { label: 'Executive Brief',    color: '#6366f1', bg: 'rgba(99,102,241,0.12)', border: 'rgba(99,102,241,0.28)' },
-  visual_dashboard:   { label: 'Visual Dashboard',   color: '#38bdf8', bg: 'rgba(56,189,248,0.12)',  border: 'rgba(56,189,248,0.28)'  },
-  analyst_deep_dive:  null, // default — no badge shown
-  table_heavy_report: { label: 'Table-Heavy',        color: '#f59e0b', bg: 'rgba(245,158,11,0.12)',  border: 'rgba(245,158,11,0.28)'  },
-  operational_report: { label: 'Operational',        color: '#10b981', bg: 'rgba(16,185,129,0.12)',  border: 'rgba(16,185,129,0.28)'  },
-  anomaly_report:     { label: 'Anomaly Report',     color: '#f87171', bg: 'rgba(248,113,113,0.12)', border: 'rgba(248,113,113,0.28)' },
-  kpi_summary:        { label: 'KPI Summary',        color: '#fbbf24', bg: 'rgba(251,191,36,0.12)',  border: 'rgba(251,191,36,0.28)'  },
-  monitoring_report:  { label: 'Monitoring',         color: '#60a5fa', bg: 'rgba(96,165,250,0.12)',  border: 'rgba(96,165,250,0.28)'  },
-}
-
-function ReportStyleBadge({ style }) {
-  if (!style) return null
-  const meta = STYLE_LABELS[style]
-  if (!meta) return null
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: '5px',
-      background: meta.bg, border: `1px solid ${meta.border}`,
-      borderRadius: '20px', padding: '3px 10px',
-      fontSize: '0.57rem', fontWeight: '700', color: meta.color,
-      textTransform: 'uppercase', letterSpacing: '0.10em', fontFamily: FONT,
-      flexShrink: 0,
-    }}>
-      <span style={{ width: '5px', height: '5px', borderRadius: '50%', background: meta.color, flexShrink: 0 }} />
-      {meta.label}
-    </span>
-  )
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function getFileType(f) {
@@ -101,7 +100,6 @@ function getFileType(f) {
 }
 
 const DS_COLOR = { CSV: '#10b981', Excel: '#34d399', JSON: '#8b5cf6', SQL: '#f59e0b' }
-const DS_BG    = { CSV: '#10b9811a', Excel: '#34d3991a', JSON: '#8b5cf61a', SQL: '#f59e0b1a' }
 
 // Routes tool/workflow creation intent to the engine planner instead of interpretTask.
 // Matches explicit construction verbs or scheduling/recurrence signals paired with automation
@@ -532,181 +530,6 @@ function ExecPhaseIcon({ type, color, size = 13 }) {
   return null
 }
 
-function AIExecutionFlow({ C }) {
-  const [activePhase, setActivePhase] = useState(0)
-
-  useEffect(() => {
-    let elapsed = 0
-    const timers = EXEC_PHASES.map((phase, i) => {
-      const t = setTimeout(() => setActivePhase(i), elapsed)
-      elapsed += phase.dur
-      return t
-    })
-    return () => timers.forEach(clearTimeout)
-  }, [])
-
-  const totalDur = EXEC_PHASES.reduce((s, p) => s + p.dur, 0)
-  const elapsedDur = EXEC_PHASES.slice(0, activePhase + 1).reduce((s, p) => s + p.dur, 0)
-  const progress = Math.min(95, Math.round((elapsedDur / totalDur) * 100))
-
-  return (
-    <div style={{
-      background: C.surface, border: `1px solid ${C.border}`, borderRadius: '20px',
-      overflow: 'hidden', boxShadow: '0 8px 48px rgba(0,0,0,0.14)', position: 'relative',
-      animation: 'ws-fadein 0.35s ease',
-    }}>
-      {/* Ambient glow blobs */}
-      <div style={{ position: 'absolute', top: '-80px', right: '-60px', width: '320px', height: '320px', background: 'radial-gradient(circle, rgba(99,102,241,0.11) 0%, transparent 65%)', pointerEvents: 'none', zIndex: 0 }} />
-      <div style={{ position: 'absolute', bottom: '-50px', left: '-30px', width: '220px', height: '220px', background: 'radial-gradient(circle, rgba(59,130,246,0.07) 0%, transparent 65%)', pointerEvents: 'none', zIndex: 0 }} />
-
-      <div style={{ position: 'relative', zIndex: 1 }}>
-        {/* Header row */}
-        <div style={{ padding: '28px 32px 22px', display: 'flex', alignItems: 'center', gap: '20px', borderBottom: `1px solid ${C.border}` }}>
-          {/* Compact orbital */}
-          <div style={{ width: '52px', height: '52px', position: 'relative', flexShrink: 0 }}>
-            <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '1.5px solid rgba(99,102,241,0.28)', animation: 'ws-arc-cw 3.5s linear infinite' }}>
-              <div style={{ position: 'absolute', top: 0, left: '50%', transform: 'translate(-50%,-50%)', width: '5px', height: '5px', borderRadius: '50%', background: '#6366f1', boxShadow: '0 0 8px #6366f1' }} />
-            </div>
-            <div style={{ position: 'absolute', inset: '11px', borderRadius: '50%', border: '1.5px solid rgba(59,130,246,0.28)', animation: 'ws-arc-ccw 2.4s linear infinite' }}>
-              <div style={{ position: 'absolute', top: 0, left: '50%', transform: 'translate(-50%,-50%)', width: '4px', height: '4px', borderRadius: '50%', background: '#3b82f6', boxShadow: '0 0 6px #3b82f6' }} />
-            </div>
-            <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <div style={{ width: '18px', height: '18px', borderRadius: '50%', background: 'radial-gradient(circle, #a5b4fc 0%, #6366f1 100%)', boxShadow: '0 0 14px rgba(99,102,241,0.55)', animation: 'ws-core-breathe 2s ease-in-out infinite' }} />
-            </div>
-          </div>
-
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: '0.56rem', fontWeight: '800', color: '#6366f1', textTransform: 'uppercase', letterSpacing: '0.16em', marginBottom: '5px' }}>Analyzing</div>
-            <div style={{ fontSize: '1.05rem', fontWeight: '700', color: C.text, letterSpacing: '-0.3px', marginBottom: '4px' }}>Preparing Your Report</div>
-            <div style={{ fontSize: '0.74rem', color: C.textSec }}>Building your intelligence report…</div>
-          </div>
-
-          <div style={{ flexShrink: 0, textAlign: 'right' }}>
-            <div style={{ fontSize: '2rem', fontWeight: '800', color: '#6366f1', lineHeight: 1, fontFamily: MONO, letterSpacing: '-1px' }}>{progress}%</div>
-            <div style={{ fontSize: '0.6rem', color: C.textMuted, marginTop: '3px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>estimated</div>
-          </div>
-        </div>
-
-        {/* Progress bar */}
-        <div style={{ height: '3px', background: C.border, overflow: 'hidden' }}>
-          <div style={{
-            height: '100%', width: `${progress}%`,
-            background: 'linear-gradient(90deg, #4f46e5, #6366f1, #a5b4fc, #6366f1, #4f46e5)',
-            backgroundSize: '300% 100%',
-            animation: 'ws-progress-shimmer 2.2s linear infinite',
-            transition: 'width 0.7s ease',
-            borderRadius: '0 2px 2px 0',
-          }} />
-        </div>
-
-        {/* Phase timeline — 2-column grid */}
-        <div style={{ padding: '20px 32px 28px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-          {EXEC_PHASES.map((phase, i) => {
-            const isActive  = i === activePhase
-            const isDone    = i < activePhase
-            const isPending = i > activePhase
-            return (
-              <div key={i} style={{
-                display: 'flex', alignItems: 'center', gap: '11px',
-                padding: '11px 14px', borderRadius: '12px',
-                background: isActive ? 'rgba(99,102,241,0.08)' : isDone ? 'rgba(16,185,129,0.05)' : 'transparent',
-                border: `1px solid ${isActive ? 'rgba(99,102,241,0.25)' : isDone ? 'rgba(16,185,129,0.15)' : C.border}`,
-                opacity: isPending ? 0.38 : 1,
-                transition: 'opacity 0.4s ease, background 0.4s ease, border-color 0.4s ease',
-              }}>
-                {/* Status node */}
-                <div style={{
-                  width: '30px', height: '30px', borderRadius: '50%', flexShrink: 0,
-                  background: isActive ? 'rgba(99,102,241,0.14)' : isDone ? 'rgba(16,185,129,0.12)' : C.bg,
-                  border: `2px solid ${isActive ? '#6366f1' : isDone ? '#10b981' : C.borderAlt}`,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  animation: isActive ? 'ws-phase-active 1.6s ease-in-out infinite' : 'none',
-                }}>
-                  {isDone
-                    ? <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                    : isActive
-                      ? <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#6366f1', animation: 'ws-core-breathe 1s ease-in-out infinite' }} />
-                      : <ExecPhaseIcon type={phase.icon} color={C.borderAlt} size={12} />
-                  }
-                </div>
-                {/* Label */}
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: '0.73rem', fontWeight: isActive ? '700' : '500', color: isActive ? '#a5b4fc' : isDone ? '#10b981' : C.textMuted, lineHeight: 1.3 }}>{phase.label}</div>
-                  {isActive  && <div style={{ fontSize: '0.59rem', color: '#6366f1', marginTop: '2px', opacity: 0.8 }}>processing…</div>}
-                  {isDone    && <div style={{ fontSize: '0.59rem', color: '#10b981', marginTop: '2px', opacity: 0.7 }}>complete</div>}
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── Execution Console ────────────────────────────────────────────────────────
-
-function OutcomeEvent({ label, active, failed }) {
-  const color = failed ? '#ef4444' : active ? '#10b981' : '#6b7280'
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-        {failed
-          ? <><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>
-          : <polyline points="20 6 9 17 4 12"/>
-        }
-      </svg>
-      <span style={{ fontSize: '0.70rem', fontWeight: '500', color: active || failed ? color : '#6b7280' }}>{label}</span>
-    </div>
-  )
-}
-
-const EC_STATUS = {
-  pending:   { dotBg: 'transparent', dotBorder: '#6b7280', labelColor: '#6b7280', rowBg: 'transparent',              rowBorder: null },
-  completed: { dotBg: 'rgba(16,185,129,0.12)', dotBorder: '#10b981', labelColor: '#10b981', rowBg: 'rgba(16,185,129,0.05)', rowBorder: 'rgba(16,185,129,0.18)' },
-  failed:    { dotBg: 'rgba(239,68,68,0.12)',  dotBorder: '#ef4444', labelColor: '#ef4444', rowBg: 'rgba(239,68,68,0.05)',  rowBorder: 'rgba(239,68,68,0.18)'  },
-  skipped:   { dotBg: 'rgba(245,158,11,0.1)',  dotBorder: '#f59e0b', labelColor: '#f59e0b', rowBg: 'rgba(245,158,11,0.04)', rowBorder: 'rgba(245,158,11,0.18)' },
-}
-
-function ECStatusIcon({ status }) {
-  const s = { width: 11, height: 11, viewBox: '0 0 24 24', fill: 'none', strokeWidth: 2.5, strokeLinecap: 'round', strokeLinejoin: 'round' }
-  if (status === 'completed') return <svg {...s} stroke="#10b981"><polyline points="20 6 9 17 4 12"/></svg>
-  if (status === 'failed')    return <svg {...s} stroke="#ef4444"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-  if (status === 'skipped')   return <svg {...s} stroke="#f59e0b"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-  return <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#6b7280' }} />
-}
-
-const EC_ACTION_LABELS = {
-  generate_dataset_report: 'Generate Intelligence Report',
-  generate_report:         'Generate Intelligence Report',
-  send_notification:       'Send Notification',
-  create_schedule:         'Create Schedule',
-  save_workflow:           'Saving',
-  create_tool:             'Create Tool',
-  validate_workflow:       'Validate Request',
-  build_workflow_graph:    'Prepare Analysis',
-  send_email:              'Send Email',
-}
-
-const STATUS_DISPLAY_LABELS = {
-  completed: 'Done',
-  pending:   'Waiting',
-  failed:    'Could Not Complete',
-  skipped:   'Not Needed',
-}
-
-function ecDisplayLabel(step) {
-  const at = (step.action_type ?? '').toLowerCase()
-  if (at === 'schedule' || at === 'create_schedule') {
-    const freq = (step.human_label ?? '').toLowerCase()
-    if (freq === 'weekly')  return 'Create Weekly Schedule'
-    if (freq === 'daily')   return 'Create Daily Schedule'
-    if (freq === 'monthly') return 'Create Monthly Schedule'
-    return 'Create Schedule'
-  }
-  return EC_ACTION_LABELS[at] ?? step.label
-}
-
 const EC_PHASE_COLORS = [
   { bg: 'rgba(99,102,241,0.15)', border: 'rgba(99,102,241,0.28)', fg: '#a5b4fc' },
   { bg: 'rgba(59,130,246,0.15)',  border: 'rgba(59,130,246,0.28)',  fg: '#60a5fa' },
@@ -716,96 +539,12 @@ const EC_PHASE_COLORS = [
   { bg: 'rgba(16,185,129,0.15)', border: 'rgba(16,185,129,0.28)', fg: '#34d399' },
 ]
 
-function ActivityTimeline({ result, wsInput, datasetName, C }) {
+function ExecutionConsole({ result, wsInput, enginePlan, datasetName, activeDs, C, onOpenReport, onBack, onRunAgain, execDurationMs }) {
   const [activePhase, setActivePhase] = useState(0)
 
   useEffect(() => {
     if (result) return
-    setActivePhase(0)
-    let elapsed = 0
-    const timers = EXEC_PHASES.map((phase, i) => {
-      const t = setTimeout(() => setActivePhase(i), elapsed)
-      elapsed += phase.dur
-      return t
-    })
-    return () => timers.forEach(clearTimeout)
-  }, [result])
-
-  const isComplete = !!result
-  const reportOut  = isComplete && !!(result.report_id || result.dataset_report)
-  const notifOut   = isComplete && !!(result.notification_sent || result.notification_id)
-
-  const loadingEvents = [
-    { label: 'Request Received',   minPhase: -1 },
-    { label: 'Intent Parsed',      minPhase: 0  },
-    ...(datasetName ? [{ label: 'Dataset Loaded',    minPhase: 0 }] : []),
-    { label: 'Validation Passed',  minPhase: 1  },
-    { label: 'Analysis Started',   minPhase: 2  },
-    { label: 'KPI Generation',     minPhase: 3  },
-    { label: 'Report Generated',   minPhase: 4  },
-    { label: 'Delivering Results', minPhase: 5  },
-  ]
-
-  const completedEvents = [
-    { label: 'Request Received'    },
-    { label: 'Intent Parsed'       },
-    ...(datasetName ? [{ label: 'Dataset Loaded' }] : []),
-    { label: 'Validation Passed'   },
-    { label: 'Analysis Started'    },
-    { label: 'KPI Generation'      },
-    ...(reportOut ? [{ label: 'Report Generated' }] : []),
-    ...(notifOut  ? [{ label: 'Notification Sent' }] : []),
-    { label: 'Execution Completed' },
-  ]
-
-  const events = isComplete ? completedEvents : loadingEvents
-
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ padding: '14px 16px 12px', borderBottom: `1px solid ${C.border}` }}>
-        <div style={{ fontSize: '0.50rem', fontWeight: '800', color: '#6366f1', textTransform: 'uppercase', letterSpacing: '0.16em', marginBottom: '4px' }}>Activity Timeline</div>
-        <div style={{ fontSize: '0.72rem', fontWeight: '600', color: C.text }}>
-          {isComplete ? 'Execution complete' : 'Execution in progress…'}
-        </div>
-      </div>
-      <div style={{ padding: '14px 16px', overflowY: 'auto' }}>
-        {events.map((ev, i) => {
-          const isLast = i === events.length - 1
-          const done   = isComplete ? true : activePhase > ev.minPhase
-          const active = !isComplete && activePhase === ev.minPhase
-          return (
-            <div key={i} style={{ display: 'flex', gap: '10px', animation: `ws-fadeup 0.25s ease both`, animationDelay: `${i * 0.05}s` }}>
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '16px', flexShrink: 0 }}>
-                <div style={{ width: '12px', height: '12px', borderRadius: '50%', flexShrink: 0, marginTop: '3px', background: done ? '#10b981' : active ? '#6366f1' : 'transparent', border: `2px solid ${done ? '#10b981' : active ? '#6366f1' : C.borderAlt}`, animation: active ? 'ws-core-breathe 1.2s ease infinite' : 'none', transition: 'background 0.3s ease, border-color 0.3s ease', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  {done && <svg width="6" height="6" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>}
-                </div>
-                {!isLast && <div style={{ width: '2px', flex: 1, minHeight: '16px', background: done ? 'rgba(16,185,129,0.30)' : 'rgba(107,114,128,0.15)', borderRadius: '1px', margin: '3px 0' }} />}
-              </div>
-              <div style={{ flex: 1, paddingBottom: isLast ? '0' : '12px' }}>
-                <div style={{ fontSize: '0.71rem', fontWeight: done ? '600' : active ? '700' : '400', color: done ? C.text : active ? '#a5b4fc' : C.textMuted, lineHeight: 1.4, transition: 'color 0.3s ease' }}>
-                  {ev.label}
-                </div>
-                {active && (
-                  <div style={{ fontSize: '0.57rem', color: '#6366f1', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <div style={{ width: '4px', height: '4px', borderRadius: '50%', background: '#6366f1', animation: 'ws-core-breathe 1s ease infinite' }} />
-                    In progress
-                  </div>
-                )}
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function ExecutionConsole({ result, wsInput, enginePlan, datasetName, activeDs, intel, C, onOpenReport, setActiveNav, onBack, onRunAgain, execDurationMs, user }) {
-  const [activePhase, setActivePhase] = useState(0)
-
-  useEffect(() => {
-    if (result) return
-    setActivePhase(0)
+    queueMicrotask(() => setActivePhase(0))
     let elapsed = 0
     const timers = EXEC_PHASES.map((phase, i) => {
       const t = setTimeout(() => setActivePhase(i), elapsed)
@@ -846,8 +585,6 @@ function ExecutionConsole({ result, wsInput, enginePlan, datasetName, activeDs, 
   const notifSent         = result?.notification_sent === true || result?.notification_id != null
   const emailConfigured   = result?.email_delivery_configured === true && !emailSent
   const notifConfigured   = result?.notification_configured === true && !notifSent
-  const title           = wsInput.trim() || 'Analysis in progress'
-
   // Use schedule-focused phases when the result is a future-schedule-only configuration
   // (no report generated, schedule created). Fall back to the standard execution journey.
   const isScheduleOnly  = isComplete && scheduleCreated && !reportGenerated
@@ -935,10 +672,6 @@ function ExecutionConsole({ result, wsInput, enginePlan, datasetName, activeDs, 
 
           {/* Metadata columns */}
           {(() => {
-            const runDate        = result?.started_at ? new Date(result.started_at).toISOString().slice(0,10).replace(/-/g,'') : null
-            const runSeq         = result?.report_id  ? String(result.report_id).padStart(3,'0') : '001'
-            const runId          = result?.run_id != null ? String(result.run_id) : (runDate ? `RUN-${runDate}-${runSeq}` : null)
-            const execLabel      = runId ? `Execution #${runId}` : 'Execution'
             const fmtDT          = iso => {
               if (!iso) return null
               const d = new Date(iso)
@@ -1157,121 +890,6 @@ function ExecutionConsole({ result, wsInput, enginePlan, datasetName, activeDs, 
 
 // ─── Result canvas subcomponents (unchanged) ──────────────────────────────────
 
-function AiLiveBadge({ aiMeta }) {
-  const active = aiMeta?.ai_enrichment_used
-  const model  = aiMeta?.ai_model_used
-    ? aiMeta.ai_model_used.replace('gpt-4o-mini', 'GPT-4o mini').replace('gpt-4o', 'GPT-4o')
-    : null
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: '6px',
-      background: active ? 'rgba(16,185,129,0.12)' : 'rgba(107,114,128,0.1)',
-      border: `1px solid ${active ? 'rgba(16,185,129,0.3)' : 'rgba(107,114,128,0.2)'}`,
-      borderRadius: '20px', padding: '4px 12px',
-      fontSize: '0.7rem', fontWeight: '600', color: active ? '#10b981' : '#9ca3af', fontFamily: FONT,
-    }}>
-      <span style={{ width: '6px', height: '6px', borderRadius: '50%', flexShrink: 0, background: active ? '#10b981' : '#9ca3af', animation: active ? 'ws-dot-blink 1.8s ease infinite' : 'none' }} />
-      {active ? 'AI Intelligence Active' : 'Standard Analysis'}
-      {model && <span style={{ opacity: 0.65, fontWeight: '400', marginLeft: '2px' }}>· {model}</span>}
-    </span>
-  )
-}
-
-function ConfidenceRing({ confidence }) {
-  if (confidence == null) return null
-  const pct   = Math.round(confidence * 100)
-  const color = confidence >= 0.85 ? '#10b981' : confidence >= 0.65 ? '#f59e0b' : '#9ca3af'
-  const r = 14, circ = 2 * Math.PI * r
-  const dash = (pct / 100) * circ
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-      <svg width="36" height="36" viewBox="0 0 36 36" style={{ flexShrink: 0 }}>
-        <circle cx="18" cy="18" r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="3" />
-        <circle cx="18" cy="18" r={r} fill="none" stroke={color} strokeWidth="3"
-          strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
-          style={{ transform: 'rotate(-90deg)', transformOrigin: '18px 18px', transition: 'stroke-dasharray 0.6s ease' }}
-        />
-        <text x="18" y="22" textAnchor="middle" fill={color} style={{ fontSize: '9px', fontWeight: '700', fontFamily: FONT }}>{pct}%</text>
-      </svg>
-      <div>
-        <div style={{ fontSize: '0.6rem', color: 'rgba(255,255,255,0.45)', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Confidence</div>
-        <div style={{ fontSize: '0.78rem', fontWeight: '700', color }}>{pct}%</div>
-      </div>
-    </div>
-  )
-}
-
-function MiniSparkline({ direction }) {
-  const pts = { up: [3,5,4,7,5,8,7,9], down: [9,7,8,5,7,4,5,3], flat: [5,6,5,6,5,7,5,6] }
-  const data  = pts[direction] || pts.flat
-  const color = direction === 'up' ? '#10b981' : direction === 'down' ? '#f87171' : '#64748b'
-  const W = 80, H = 24
-  const mn = Math.min(...data), mx = Math.max(...data), rng = (mx - mn) || 1
-  const xs = data.map((_, i) => i / (data.length - 1) * W)
-  const ys = data.map(v => H - ((v - mn) / rng) * (H - 4) - 1)
-  const line = xs.map((x, i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ')
-  const area = `${line} L${W},${H} L0,${H}Z`
-  return (
-    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block', marginTop: '8px' }} preserveAspectRatio="none">
-      <path d={area} fill={color} fillOpacity="0.14" />
-      <path d={line} fill="none" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function KpiCard({ kpi, C, delay = 0 }) {
-  const statusMap = { good: { color: '#10b981' }, warning: { color: '#f59e0b' }, risk: { color: '#f87171' } }
-  const st   = statusMap[kpi.status] || statusMap.good
-  const fmtV = (v, fmt) => {
-    if (v == null) return '—'
-    if (fmt === 'percent')  return `${v}%`
-    if (fmt === 'currency') return `$${Number(v).toLocaleString()}`
-    if (fmt === 'number')   return Number(v).toLocaleString()
-    return String(v)
-  }
-  const dir        = kpi.delta_direction
-  const arrow      = dir === 'up' ? '↑' : dir === 'down' ? '↓' : null
-  const deltaColor = dir === 'up' ? '#10b981' : dir === 'down' ? '#f87171' : C.textMuted
-  return (
-    <div className="ws-kpi-card" style={{
-      background: C.surface, border: `1px solid ${C.border}`, borderLeft: `4px solid ${st.color}`,
-      borderRadius: '14px', padding: '20px 20px 16px', flex: '1 1 148px', minWidth: '148px',
-      boxShadow: '0 2px 8px rgba(0,0,0,0.08)', animation: `ws-fadeup 0.35s ease both`, animationDelay: `${delay}s`,
-    }}>
-      <div style={{ fontSize: '0.58rem', color: C.textMuted, fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.09em', marginBottom: '12px' }}>{kpi.label}</div>
-      <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: '2.1rem', fontWeight: '800', color: st.color, letterSpacing: '-2px', lineHeight: 1, fontFamily: MONO }}>{fmtV(kpi.value, kpi.format)}</span>
-        {arrow && kpi.delta != null && (
-          <span style={{ fontSize: '0.72rem', fontWeight: '700', color: deltaColor, background: `${deltaColor}18`, borderRadius: '6px', padding: '2px 7px', marginBottom: '4px', flexShrink: 0 }}>
-            {arrow} {Math.abs(kpi.delta)}
-          </span>
-        )}
-      </div>
-      {(kpi.explanation || kpi.description) && (
-        <div style={{ fontSize: '0.66rem', color: st.color, lineHeight: 1.45, fontWeight: '500', opacity: 0.85 }}>{kpi.explanation || kpi.description}</div>
-      )}
-      <MiniSparkline direction={dir || 'flat'} />
-    </div>
-  )
-}
-
-function InsightCard({ label, text, accentColor, icon, C, delay = 0 }) {
-  if (!text) return null
-  return (
-    <div className="ws-insight-card" style={{
-      background: C.surface, border: `1px solid ${accentColor}20`, borderLeft: `4px solid ${accentColor}`,
-      borderRadius: '14px', padding: '20px 22px', flex: 1, minWidth: '200px',
-      boxShadow: '0 2px 12px rgba(0,0,0,0.06)', animation: `ws-fadeup 0.38s ease both`, animationDelay: `${delay}s`,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px' }}>
-        <div style={{ width: '32px', height: '32px', borderRadius: '10px', background: `${accentColor}18`, border: `1px solid ${accentColor}28`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: accentColor, flexShrink: 0 }}>{icon}</div>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: accentColor, textTransform: 'uppercase', letterSpacing: '0.12em' }}>{label}</span>
-      </div>
-      <p style={{ margin: 0, fontSize: '0.85rem', color: C.text, lineHeight: 1.7 }}>{text}</p>
-    </div>
-  )
-}
-
 function CopilotPanel({ reportId, aiMeta, intel, user, token, onSessionExpired, C }) {
   const [question, setQuestion] = useState('')
   const [answer,   setAnswer]   = useState(null)
@@ -1446,1441 +1064,61 @@ function CopilotPanel({ reportId, aiMeta, intel, user, token, onSessionExpired, 
   )
 }
 
-function PremiumExecutiveHero({ intel, C, onOpenReport, setActiveNav }) {
-  const aiMeta = intel.aiMeta
-  const dur = intel.started_at && intel.finished_at
-    ? `${((new Date(intel.finished_at) - new Date(intel.started_at)) / 1000).toFixed(1)}s`
-    : null
-  const { topInsight, highestRisk, topAction, topOpportunity } = intel
-
-  const miniCards = [
-    topInsight    && { label: 'Top Insight',        text: topInsight,    accent: '#a5b4fc', bg: 'rgba(167,139,250,0.07)', border: 'rgba(167,139,250,0.20)', icon: <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> },
-    highestRisk   && { label: 'Highest Risk',       text: highestRisk,   accent: '#f87171', bg: 'rgba(248,113,113,0.06)', border: 'rgba(248,113,113,0.18)', icon: <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> },
-    topAction     && { label: 'Recommended Action', text: topAction,     accent: '#10b981', bg: 'rgba(16,185,129,0.06)',  border: 'rgba(16,185,129,0.18)',  icon: <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> },
-    topOpportunity && { label: 'Key Opportunity',   text: topOpportunity, accent: '#38bdf8', bg: 'rgba(56,189,248,0.06)', border: 'rgba(56,189,248,0.18)',  icon: <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg> },
-  ].filter(Boolean)
-
+function MiniSparkline({ direction }) {
+  const pts = { up: [3,5,4,7,5,8,7,9], down: [9,7,8,5,7,4,5,3], flat: [5,6,5,6,5,7,5,6] }
+  const data  = pts[direction] || pts.flat
+  const color = direction === 'up' ? '#10b981' : direction === 'down' ? '#f87171' : '#64748b'
+  const W = 80, H = 24
+  const mn = Math.min(...data), mx = Math.max(...data), rng = (mx - mn) || 1
+  const xs = data.map((_, i) => i / (data.length - 1) * W)
+  const ys = data.map(v => H - ((v - mn) / rng) * (H - 4) - 1)
+  const line = xs.map((x, i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ')
+  const area = `${line} L${W},${H} L0,${H}Z`
   return (
-    <div className="ws-section ws-s1" style={{ position: 'relative', overflow: 'hidden', borderRadius: '20px', background: C.surface, border: '1px solid rgba(99,102,241,0.22)', boxShadow: '0 8px 48px rgba(0,0,0,0.16), 0 2px 8px rgba(0,0,0,0.08)' }}>
-      {/* Accent gradient strip */}
-      <div style={{ height: '3px', background: 'linear-gradient(90deg, #4f46e5 0%, #6366f1 40%, #a5b4fc 70%, #60a5fa 100%)' }} />
-
-      {/* Ambient glows */}
-      <div style={{ position: 'absolute', top: 0, right: 0, width: '420px', height: '280px', background: 'radial-gradient(ellipse at 90% 0%, rgba(99,102,241,0.10) 0%, rgba(59,130,246,0.04) 50%, transparent 70%)', pointerEvents: 'none', zIndex: 0, animation: 'ws-hero-ambient 5s ease-in-out infinite' }} />
-      <div style={{ position: 'absolute', bottom: 0, left: 0, width: '240px', height: '180px', background: 'radial-gradient(ellipse at 0% 100%, rgba(16,185,129,0.05) 0%, transparent 70%)', pointerEvents: 'none', zIndex: 0 }} />
-
-      <div style={{ position: 'relative', zIndex: 1 }}>
-        {/* Main hero body */}
-        <div style={{ padding: '30px 38px 26px' }}>
-          {/* Meta row */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', flexWrap: 'wrap' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.22)', borderRadius: '20px', padding: '4px 11px 4px 8px' }}>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="#a5b4fc"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
-              <span style={{ fontSize: '0.56rem', fontWeight: '800', color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: '0.16em' }}>Executive Briefing</span>
-            </div>
-            <ReportStyleBadge style={intel.reportPlan?.report_style} />
-            {aiMeta && <AiLiveBadge aiMeta={aiMeta} />}
-          </div>
-
-          {/* Title + actions row */}
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '28px', flexWrap: 'wrap', marginBottom: miniCards.length ? '22px' : '0' }}>
-            <div style={{ flex: 1, minWidth: '260px' }}>
-              <h2 style={{ margin: '0 0 14px', fontSize: 'clamp(1.35rem, 2.4vw, 1.85rem)', fontWeight: '800', color: C.text, letterSpacing: '-0.8px', lineHeight: 1.15 }}>{intel.title}</h2>
-              {intel.execSummary && <p style={{ margin: 0, fontSize: '0.9rem', color: C.textSec, lineHeight: 1.82, maxWidth: '580px' }}>{intel.execSummary}</p>}
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', alignItems: 'flex-end', flexShrink: 0 }}>
-              {aiMeta?.confidence != null && <ConfidenceRing confidence={aiMeta.confidence} />}
-              {intel.reportId && onOpenReport && (
-                <button className="ws-action-btn" onClick={() => onOpenReport(intel.reportId)}
-                  style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', border: 'none', borderRadius: '10px', padding: '9px 18px', fontSize: '0.8rem', fontWeight: '700', color: '#fff', cursor: 'pointer', fontFamily: FONT, whiteSpace: 'nowrap', boxShadow: '0 4px 16px rgba(99,102,241,0.35)' }}>
-                  Open Full Workspace
-                </button>
-              )}
-              {intel.reportId && setActiveNav && (
-                <button className="ws-ghost-btn" onClick={() => setActiveNav('reports')}
-                  style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: '10px', padding: '7px 14px', fontSize: '0.74rem', fontWeight: '500', color: C.textMuted, cursor: 'pointer', fontFamily: FONT, whiteSpace: 'nowrap' }}>
-                  View in Reports
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Insight mini-cards */}
-          {miniCards.length > 0 && (
-            <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(miniCards.length, 2)}, 1fr)`, gap: '10px' }}>
-              {miniCards.map((card, i) => (
-                <div key={i} style={{ background: card.bg, border: `1px solid ${card.border}`, borderRadius: '12px', padding: '13px 16px', animation: `ws-reveal-up 0.4s ease both`, animationDelay: `${0.08 + i * 0.07}s` }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '7px' }}>
-                    <div style={{ width: '20px', height: '20px', borderRadius: '6px', background: `${card.accent}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>{card.icon}</div>
-                    <span style={{ fontSize: '0.57rem', fontWeight: '800', color: card.accent, textTransform: 'uppercase', letterSpacing: '0.11em' }}>{card.label}</span>
-                  </div>
-                  <p style={{ margin: 0, fontSize: '0.78rem', color: C.text, lineHeight: 1.65 }}>{card.text}</p>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Footer strip */}
-        {(dur || intel.reportId || intel.emailDelivery?.sent) && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '20px', padding: '11px 38px', borderTop: `1px solid ${C.border}`, background: C.bg, flexWrap: 'wrap' }}>
-            {dur && <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.68rem', color: C.textMuted }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Generated in {dur}</div>}
-            {intel.reportId && <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.68rem', color: '#10b981' }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Saved as report #{intel.reportId}</div>}
-            {intel.emailDelivery?.sent && <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.68rem', color: '#10b981' }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>Delivered to {intel.emailDelivery.to}</div>}
-          </div>
-        )}
-      </div>
-    </div>
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block', marginTop: '8px' }} preserveAspectRatio="none">
+      <path d={area} fill={color} fillOpacity="0.14" />
+      <path d={line} fill="none" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   )
 }
 
-function WatchlistPanel({ watchlist, C }) {
-  if (!watchlist?.length) return null
-  const sevMap = { high: { color: '#f87171', bg: 'rgba(248,113,113,0.1)', label: 'HIGH' }, medium: { color: '#f59e0b', bg: 'rgba(245,158,11,0.1)', label: 'MED' }, low: { color: '#6366f1', bg: 'rgba(99,102,241,0.1)', label: 'LOW' } }
-  return (
-    <div className="ws-section ws-s4" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '14px 22px', borderBottom: `1px solid ${C.border}`, background: 'rgba(245,158,11,0.04)' }}>
-        <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'rgba(245,158,11,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#f59e0b' }}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-        </div>
-        <span style={{ fontSize: '0.65rem', fontWeight: '800', color: '#f59e0b', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Watchlist — Drift Signals</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.65rem', color: C.textMuted, background: C.bg, borderRadius: '10px', padding: '1px 8px', border: `1px solid ${C.border}` }}>{watchlist.length} signal{watchlist.length !== 1 ? 's' : ''}</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {watchlist.map((d, i) => {
-          const sv  = sevMap[d.severity] || sevMap.low
-          const pct = d.drift_percent != null ? `${d.drift_percent > 0 ? '+' : ''}${d.drift_percent}%` : null
-          return (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '14px 22px', borderBottom: i < watchlist.length - 1 ? `1px solid ${C.border}` : 'none', transition: 'background 0.14s' }}
-              onMouseEnter={e => e.currentTarget.style.background = C.bg} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              <span style={{ fontSize: '0.59rem', fontWeight: '800', color: sv.color, background: sv.bg, borderRadius: '5px', padding: '2px 7px', textTransform: 'uppercase', letterSpacing: '0.06em', flexShrink: 0 }}>{sv.label}</span>
-              {pct && <span style={{ fontSize: '1.05rem', fontWeight: '800', color: sv.color, lineHeight: 1, flexShrink: 0, fontFamily: MONO }}>{pct}</span>}
-              <span style={{ fontSize: '0.82rem', color: C.text, fontWeight: '500', flex: 1, minWidth: 0 }}>{d.metric || '—'}</span>
-              {d.description && <span style={{ fontSize: '0.71rem', color: C.textMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '200px', flexShrink: 0 }}>{d.description}</span>}
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function PriorityInsights({ recommendations, C }) {
-  if (!recommendations?.length) return null
-  const pMap = { high: { color: '#f87171', bg: 'rgba(248,113,113,0.1)', label: 'HIGH' }, medium: { color: '#f59e0b', bg: 'rgba(245,158,11,0.1)', label: 'MEDIUM' }, low: { color: '#10b981', bg: 'rgba(16,185,129,0.1)', label: 'LOW' } }
-  return (
-    <div className="ws-section ws-s5" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '14px 22px', borderBottom: `1px solid ${C.border}`, background: 'rgba(99,102,241,0.04)' }}>
-        <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'rgba(99,102,241,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#a5b4fc' }}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-        </div>
-        <span style={{ fontSize: '0.65rem', fontWeight: '800', color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Priority Insights</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.65rem', color: C.textMuted, background: C.bg, borderRadius: '10px', padding: '1px 8px', border: `1px solid ${C.border}` }}>{Math.min(recommendations.length, 5)} items</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {recommendations.slice(0, 5).map((rec, i) => {
-          const p = pMap[rec.priority] || pMap.low
-          return (
-            <div key={i} style={{ padding: '16px 22px', borderBottom: i < Math.min(recommendations.length, 5) - 1 ? `1px solid ${C.border}` : 'none', borderLeft: `3px solid ${p.color}`, transition: 'background 0.14s' }}
-              onMouseEnter={e => e.currentTarget.style.background = C.bg} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: rec.reason ? '6px' : 0, flexWrap: 'wrap' }}>
-                <span style={{ display: 'inline-flex', alignItems: 'center', background: p.bg, color: p.color, borderRadius: '5px', padding: '1px 7px', fontSize: '0.59rem', fontWeight: '800', letterSpacing: '0.08em', flexShrink: 0, textTransform: 'uppercase' }}>{p.label}</span>
-                <span style={{ fontSize: '0.84rem', fontWeight: '600', color: C.text }}>{rec.title || '—'}</span>
-              </div>
-              {rec.reason && <p style={{ margin: 0, fontSize: '0.77rem', color: C.textSec, lineHeight: 1.6 }}>{rec.reason}</p>}
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function ChartPanel({ sec, C, delay = 0 }) {
-  const note = sec.explanation || sec.caption || sec.insight || null
-  return (
-    <div className="ws-chart-panel" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 16px rgba(0,0,0,0.07)', animation: `ws-fadeup 0.38s ease both`, animationDelay: `${delay}s` }}>
-      {sec.heading && (
-        <div style={{ padding: '14px 22px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div style={{ width: '4px', height: '16px', background: 'linear-gradient(180deg,#6366f1,#8b5cf6)', borderRadius: '2px', flexShrink: 0 }} />
-          <span style={{ fontSize: '0.7rem', fontWeight: '700', color: C.textSec }}>{sec.heading}</span>
-        </div>
-      )}
-      <div style={{ padding: '20px 22px' }}><ChartSection chart={sec.chart || {}} C={C} /></div>
-      {note && (
-        <div style={{ padding: '10px 22px 14px', borderTop: `1px solid ${C.border}`, display: 'flex', alignItems: 'flex-start', gap: '7px' }}>
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: '2px', opacity: 0.6 }}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          <p style={{ margin: 0, fontSize: '0.72rem', color: C.textSec, lineHeight: 1.6 }}>{note}</p>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ─── Enterprise result sections ──────────────────────────────────────────────
-
-function WorkflowTimeline({ intel, C }) {
-  const totalMs  = intel.started_at && intel.finished_at
-    ? (new Date(intel.finished_at) - new Date(intel.started_at))
-    : null
-  const totalSec = totalMs ? (totalMs / 1000).toFixed(1) : null
-  const hasEmail = !!intel.emailDelivery?.sent
-
-  function mkDur(pct) {
-    if (!totalMs) return null
-    const s = (totalMs * pct) / 1000
-    return s >= 1 ? `${s.toFixed(1)}s` : `${(s * 1000).toFixed(0)}ms`
+function KpiCard({ kpi, C, delay = 0 }) {
+  const statusMap = { good: { color: '#10b981' }, warning: { color: '#f59e0b' }, risk: { color: '#f87171' } }
+  const st   = statusMap[kpi.status] || statusMap.good
+  const fmtV = (v, fmt) => {
+    if (v == null) return '—'
+    if (fmt === 'percent')  return `${v}%`
+    if (fmt === 'currency') return `$${Number(v).toLocaleString()}`
+    if (fmt === 'number')   return Number(v).toLocaleString()
+    return String(v)
   }
-
-  const steps = [
-    {
-      label: 'Request understood',
-      desc:  'Intent parsed · capabilities selected · workflow planned',
-      dur:   mkDur(0.08) || '0.3s',
-      icon:  'star',   accent: '#a5b4fc',
-    },
-    {
-      label: 'Dataset loaded',
-      desc:  'Schema analysed · data quality validated · rows indexed',
-      dur:   mkDur(0.18) || '0.8s',
-      icon:  'database', accent: '#38bdf8',
-    },
-    {
-      label: 'Analysis executed',
-      desc:  [
-        intel.kpis?.length > 0         && `${intel.kpis.length} KPIs computed`,
-        intel.recommendations?.length > 0 && `${intel.recommendations.length} recommendations surfaced`,
-        intel.watchlist?.length > 0    && `${intel.watchlist.length} drift signals detected`,
-      ].filter(Boolean).join(' · ') || 'Patterns detected · anomalies ranked · insights extracted',
-      dur:   mkDur(0.42) || '2.1s',
-      icon:  'scan',   accent: '#f59e0b',
-    },
-    {
-      label: 'Report generated',
-      desc:  intel.title ? `"${intel.title}" compiled with executive summary` : 'Intelligence report compiled',
-      dur:   mkDur(0.22) || '1.0s',
-      icon:  'document', accent: '#6366f1',
-    },
-    {
-      label: hasEmail ? 'Notification sent' : 'Notification prepared',
-      desc:  hasEmail
-        ? `Summary delivered to ${intel.emailDelivery.to || 'recipient'}`
-        : 'Notification summary ready for delivery',
-      dur:   mkDur(0.10) || '0.4s',
-      icon:  'mail',   accent: hasEmail ? '#10b981' : '#94a3b8',
-    },
-  ]
-
-  function TLIcon({ type, color, size = 11 }) {
-    const p = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: color, strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }
-    if (type === 'star')     return <svg {...p} fill={color}><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
-    if (type === 'database') return <svg {...p}><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-    if (type === 'scan')     return <svg {...p}><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-    if (type === 'document') return <svg {...p}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-    if (type === 'mail')     return <svg {...p}><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-    return null
-  }
-
+  const dir        = kpi.delta_direction
+  const arrow      = dir === 'up' ? '↑' : dir === 'down' ? '↓' : null
+  const deltaColor = dir === 'up' ? '#10b981' : dir === 'down' ? '#f87171' : C.textMuted
   return (
-    <div className="ws-section ws-s6" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '14px 22px', borderBottom: `1px solid ${C.border}`, background: 'rgba(99,102,241,0.03)' }}>
-        <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'rgba(99,102,241,0.14)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        </div>
-        <span style={{ fontSize: '0.65rem', fontWeight: '800', color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Execution Timeline</span>
-        {totalSec && (
-          <span style={{ marginLeft: 'auto', fontSize: '0.67rem', color: C.textMuted, background: C.bg, borderRadius: '10px', padding: '2px 10px', border: `1px solid ${C.border}`, fontFamily: MONO }}>
-            {totalSec}s total
+    <div className="ws-kpi-card" style={{
+      background: C.surface, border: `1px solid ${C.border}`, borderLeft: `4px solid ${st.color}`,
+      borderRadius: '14px', padding: '20px 20px 16px', flex: '1 1 148px', minWidth: '148px',
+      boxShadow: '0 2px 8px rgba(0,0,0,0.08)', animation: `ws-fadeup 0.35s ease both`, animationDelay: `${delay}s`,
+    }}>
+      <div style={{ fontSize: '0.58rem', color: C.textMuted, fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.09em', marginBottom: '12px' }}>{kpi.label}</div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: '2.1rem', fontWeight: '800', color: st.color, letterSpacing: '-2px', lineHeight: 1, fontFamily: MONO }}>{fmtV(kpi.value, kpi.format)}</span>
+        {arrow && kpi.delta != null && (
+          <span style={{ fontSize: '0.72rem', fontWeight: '700', color: deltaColor, background: `${deltaColor}18`, borderRadius: '6px', padding: '2px 7px', marginBottom: '4px', flexShrink: 0 }}>
+            {arrow} {Math.abs(kpi.delta)}
           </span>
         )}
       </div>
-
-      <div style={{ padding: '20px 22px 16px', display: 'flex', flexDirection: 'column' }}>
-        {steps.map((step, i) => {
-          const isLast = i === steps.length - 1
-          return (
-            <div key={i} style={{ display: 'flex', alignItems: 'stretch', animation: `ws-fadeup 0.35s ease both`, animationDelay: `${0.05 + i * 0.07}s` }}>
-              {/* Connector column */}
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '36px', flexShrink: 0 }}>
-                <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: `${step.accent}14`, border: `2px solid ${step.accent}55`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: '6px' }}>
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                </div>
-                {!isLast && (
-                  <div style={{ width: '2px', flex: 1, minHeight: '12px', background: `linear-gradient(180deg,${step.accent}35,${step.accent}08)`, borderRadius: '1px', margin: '3px 0' }} />
-                )}
-              </div>
-
-              {/* Content */}
-              <div style={{ flex: 1, marginLeft: '14px', paddingBottom: isLast ? '4px' : '14px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <div style={{ width: '22px', height: '22px', borderRadius: '6px', background: `${step.accent}14`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <TLIcon type={step.icon} color={step.accent} size={11} />
-                    </div>
-                    <span style={{ fontSize: '0.82rem', fontWeight: '700', color: C.text }}>{step.label}</span>
-                  </div>
-                  <span style={{ fontSize: '0.59rem', color: '#10b981', background: 'rgba(16,185,129,0.10)', border: '1px solid rgba(16,185,129,0.18)', borderRadius: '4px', padding: '1px 7px', fontWeight: '700', flexShrink: 0 }}>
-                    ✓ Complete
-                  </span>
-                  {step.dur && (
-                    <span style={{ fontSize: '0.62rem', color: C.textMuted, fontFamily: MONO, marginLeft: 'auto', flexShrink: 0 }}>{step.dur}</span>
-                  )}
-                </div>
-                <p style={{ margin: 0, fontSize: '0.73rem', color: C.textSec, lineHeight: 1.6 }}>{step.desc}</p>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function GeneratedOutputs({ intel, C, onOpenReport, setActiveNav }) {
-  const hasReport = !!intel.reportId
-  const hasKpis   = (intel.kpis?.length || 0) > 0
-  const hasEmail  = !!intel.emailDelivery?.sent
-
-  const outputs = [
-    hasReport && {
-      key: 'report', icon: 'document', accent: '#6366f1',
-      title:  intel.title || 'Intelligence Report',
-      desc:   intel.execSummary
-        ? (intel.execSummary.length > 110 ? intel.execSummary.slice(0, 110) + '…' : intel.execSummary)
-        : 'Full executive report with KPIs, insights, and recommendations.',
-      status: 'Ready', statusColor: '#10b981',
-      actions: [
-        onOpenReport && { label: 'View Report',       primary: true,  fn: () => onOpenReport(intel.reportId) },
-        setActiveNav  && { label: 'Open in Reports',  primary: false, fn: () => setActiveNav('reports') },
-      ].filter(Boolean),
-    },
-    {
-      key: 'insights', icon: 'scan', accent: '#f59e0b',
-      title:  'Dataset Insights',
-      desc:   [
-        intel.kpis?.length > 0         && `${intel.kpis.length} KPI${intel.kpis.length !== 1 ? 's' : ''}`,
-        intel.recommendations?.length > 0 && `${intel.recommendations.length} recommendation${intel.recommendations.length !== 1 ? 's' : ''}`,
-        intel.watchlist?.length > 0    && `${intel.watchlist.length} drift signal${intel.watchlist.length !== 1 ? 's' : ''}`,
-      ].filter(Boolean).join(' · ') || 'Patterns, anomalies, and trends extracted from your dataset.',
-      status: 'Ready', statusColor: '#10b981',
-      actions: [],
-    },
-    hasKpis && {
-      key: 'kpi', icon: 'bar', accent: '#38bdf8',
-      title:  'KPI Summary',
-      desc:   `${intel.kpis.length} performance indicator${intel.kpis.length !== 1 ? 's' : ''} computed${intel.kpis.some(k => k.status === 'risk') ? ' · risk flags detected' : ''}`,
-      status: 'Ready', statusColor: '#10b981',
-      actions: [],
-    },
-    hasEmail && {
-      key: 'notification', icon: 'mail', accent: '#10b981',
-      title:  'Notification',
-      desc:   `Summary delivered to ${intel.emailDelivery.to || 'recipient'}`,
-      status: 'Sent', statusColor: '#10b981',
-      actions: [],
-    },
-  ].filter(Boolean)
-
-  if (!outputs.length) return null
-
-  function OutIcon({ type, color, size = 14 }) {
-    const p = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: color, strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }
-    if (type === 'document') return <svg {...p}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-    if (type === 'scan')     return <svg {...p}><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-    if (type === 'bar')      return <svg {...p}><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-    if (type === 'mail')     return <svg {...p}><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-    return null
-  }
-
-  return (
-    <div className="ws-section ws-s6" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '14px 22px', borderBottom: `1px solid ${C.border}`, background: 'rgba(56,189,248,0.03)' }}>
-        <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'rgba(56,189,248,0.14)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-        </div>
-        <span style={{ fontSize: '0.65rem', fontWeight: '800', color: '#38bdf8', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Generated Outputs</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.65rem', color: C.textMuted, background: C.bg, borderRadius: '10px', padding: '1px 8px', border: `1px solid ${C.border}` }}>
-          {outputs.length} output{outputs.length !== 1 ? 's' : ''}
-        </span>
-      </div>
-
-      <div style={{ padding: '16px 22px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: '12px' }}>
-        {outputs.map((out, i) => (
-          <div key={out.key}
-            style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: '10px', animation: `ws-fadeup 0.35s ease both`, animationDelay: `${0.06 + i * 0.06}s`, transition: 'border-color 0.14s, box-shadow 0.14s' }}
-            onMouseEnter={e => { e.currentTarget.style.borderColor = `${out.accent}40`; e.currentTarget.style.boxShadow = `0 4px 16px ${out.accent}12` }}
-            onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.boxShadow = 'none' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <div style={{ width: '34px', height: '34px', borderRadius: '10px', background: `${out.accent}14`, border: `1px solid ${out.accent}28`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                <OutIcon type={out.icon} color={out.accent} size={15} />
-              </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: '0.81rem', fontWeight: '700', color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: '3px' }}>{out.title}</div>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '0.58rem', fontWeight: '700', color: out.statusColor, background: `${out.statusColor}12`, borderRadius: '4px', padding: '1px 6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                  <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: out.statusColor, flexShrink: 0 }} />
-                  {out.status}
-                </span>
-              </div>
-            </div>
-
-            <p style={{ margin: 0, fontSize: '0.73rem', color: C.textSec, lineHeight: 1.6 }}>{out.desc}</p>
-
-            {out.actions?.length > 0 && (
-              <div style={{ display: 'flex', gap: '7px', flexWrap: 'wrap' }}>
-                {out.actions.map((act, j) => (
-                  <button key={j} onClick={act.fn}
-                    style={{ background: act.primary ? `linear-gradient(135deg,${out.accent},${out.accent}cc)` : 'transparent', border: act.primary ? 'none' : `1px solid ${C.borderAlt}`, borderRadius: '8px', padding: '6px 13px', fontSize: '0.71rem', fontWeight: '700', color: act.primary ? '#fff' : C.textSec, cursor: 'pointer', fontFamily: FONT, boxShadow: act.primary ? `0 3px 10px ${out.accent}30` : 'none', transition: 'opacity 0.14s, transform 0.14s' }}
-                    onMouseEnter={e => { e.currentTarget.style.opacity = '0.85'; e.currentTarget.style.transform = 'translateY(-1px)' }}
-                    onMouseLeave={e => { e.currentTarget.style.opacity = '1';    e.currentTarget.style.transform = 'translateY(0)' }}>
-                    {act.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function ActionsCompleted({ intel, C }) {
-  const hasEmail = !!intel.emailDelivery?.sent
-
-  const actions = [
-    {
-      label:  'Analysed dataset',
-      detail: intel.kpis?.length > 0
-        ? `Processed data · extracted ${intel.kpis.length} KPI${intel.kpis.length !== 1 ? 's' : ''}`
-        : 'Data patterns extracted and ranked by significance',
-      color:  '#6366f1',
-    },
-    intel.kind === 'report' && {
-      label:  'Generated intelligence report',
-      detail: intel.title || 'Executive-level report with structured findings compiled',
-      color:  '#38bdf8',
-    },
-    (intel.kpis?.length > 0 || intel.recommendations?.length > 0 || intel.watchlist?.length > 0) && {
-      label:  'Surfaced insights',
-      detail: [
-        intel.kpis?.length > 0         && `${intel.kpis.length} KPI${intel.kpis.length !== 1 ? 's' : ''}`,
-        intel.recommendations?.length > 0 && `${intel.recommendations.length} recommendation${intel.recommendations.length !== 1 ? 's' : ''}`,
-        intel.watchlist?.length > 0    && `${intel.watchlist.length} drift signal${intel.watchlist.length !== 1 ? 's' : ''}`,
-      ].filter(Boolean).join(' · ') + ' ready for review',
-      color:  '#10b981',
-    },
-    hasEmail && {
-      label:  'Notification delivered',
-      detail: `Summary sent to ${intel.emailDelivery.to || 'recipient'}`,
-      color:  '#f472b6',
-    },
-  ].filter(Boolean)
-
-  if (!actions.length) return null
-
-  return (
-    <div className="ws-section ws-s6" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '14px 22px', borderBottom: `1px solid ${C.border}`, background: 'rgba(16,185,129,0.03)' }}>
-        <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'rgba(16,185,129,0.14)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-        </div>
-        <span style={{ fontSize: '0.65rem', fontWeight: '800', color: '#10b981', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Actions Completed</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.65rem', color: C.textMuted, background: C.bg, borderRadius: '10px', padding: '1px 8px', border: `1px solid ${C.border}` }}>
-          {actions.length} action{actions.length !== 1 ? 's' : ''}
-        </span>
-      </div>
-
-      <div style={{ padding: '14px 22px 18px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        {actions.map((action, i) => (
-          <div key={i}
-            style={{ display: 'flex', alignItems: 'center', gap: '13px', padding: '11px 14px', background: C.bg, borderRadius: '11px', border: `1px solid ${C.border}`, animation: `ws-fadeup 0.32s ease both`, animationDelay: `${0.05 + i * 0.06}s`, transition: 'border-color 0.14s' }}
-            onMouseEnter={e => e.currentTarget.style.borderColor = `${action.color}30`}
-            onMouseLeave={e => e.currentTarget.style.borderColor = C.border}>
-            <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: `${action.color}14`, border: `1.5px solid ${action.color}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={action.color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: '0.81rem', fontWeight: '700', color: C.text, marginBottom: '2px' }}>{action.label}</div>
-              <div style={{ fontSize: '0.71rem', color: C.textMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.detail}</div>
-            </div>
-            <span style={{ fontSize: '0.59rem', fontWeight: '700', color: '#10b981', background: 'rgba(16,185,129,0.10)', borderRadius: '4px', padding: '2px 7px', textTransform: 'uppercase', letterSpacing: '0.06em', flexShrink: 0 }}>Done</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function SaveWorkflowCTA({ C, onSave, alreadySaved, saving }) {
-  return (
-    <div className="ws-section ws-s6" style={{ position: 'relative', overflow: 'hidden', borderRadius: '16px', background: C.surface, border: '1px solid rgba(99,102,241,0.20)', boxShadow: '0 4px 24px rgba(0,0,0,0.08)' }}>
-      <div style={{ position: 'absolute', top: '-50px', right: '-50px', width: '220px', height: '220px', background: 'radial-gradient(circle, rgba(99,102,241,0.10) 0%, transparent 65%)', pointerEvents: 'none' }} />
-      <div style={{ position: 'absolute', bottom: '-30px', left: '-20px', width: '140px', height: '140px', background: 'radial-gradient(circle, rgba(59,130,246,0.06) 0%, transparent 65%)', pointerEvents: 'none' }} />
-
-      <div style={{ position: 'relative', padding: '22px 28px', display: 'flex', alignItems: 'center', gap: '20px', flexWrap: 'wrap' }}>
-        <div style={{ width: '44px', height: '44px', borderRadius: '13px', background: 'rgba(99,102,241,0.14)', border: '1px solid rgba(99,102,241,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-            <polyline points="17 21 17 13 7 13 7 21"/>
-            <polyline points="7 3 7 8 15 8"/>
-          </svg>
-        </div>
-
-        <div style={{ flex: 1, minWidth: '200px' }}>
-          <div style={{ fontSize: '0.95rem', fontWeight: '700', color: C.text, marginBottom: '4px' }}>Save as Reusable Workflow</div>
-          <p style={{ margin: 0, fontSize: '0.78rem', color: C.textSec, lineHeight: 1.6 }}>
-            Turn this analysis into an automated workflow that runs on a schedule or on demand — no manual setup required.
-          </p>
-        </div>
-
-        <div style={{ flexShrink: 0 }}>
-          {alreadySaved ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '7px', padding: '9px 18px', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.28)', borderRadius: '10px', fontSize: '0.78rem', fontWeight: '700', color: '#10b981' }}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-              Saved to Tools Library
-            </div>
-          ) : saving ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '9px 18px', background: 'rgba(99,102,241,0.10)', border: '1px solid rgba(99,102,241,0.25)', borderRadius: '10px', fontSize: '0.78rem', fontWeight: '600', color: '#a5b4fc' }}>
-              <div style={{ width: '13px', height: '13px', borderRadius: '50%', border: '2px solid rgba(167,139,250,0.35)', borderTopColor: '#a5b4fc', animation: 'ws-spin 0.75s linear infinite', flexShrink: 0 }} />
-              Saving to library…
-            </div>
-          ) : (
-            <button onClick={onSave}
-              style={{ display: 'flex', alignItems: 'center', gap: '7px', background: 'linear-gradient(135deg,#4f46e5,#6366f1)', border: 'none', borderRadius: '10px', padding: '9px 18px', fontSize: '0.78rem', fontWeight: '700', color: '#fff', cursor: 'pointer', fontFamily: FONT, boxShadow: '0 4px 16px rgba(99,102,241,0.35)', transition: 'opacity 0.14s, transform 0.14s' }}
-              onMouseEnter={e => { e.currentTarget.style.opacity = '0.9'; e.currentTarget.style.transform = 'translateY(-1px)' }}
-              onMouseLeave={e => { e.currentTarget.style.opacity = '1';   e.currentTarget.style.transform = 'translateY(0)' }}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-              Save as Reusable Workflow
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function relTime(iso) {
-  const m = Math.floor((Date.now() - new Date(iso).getTime()) / 60000)
-  if (m < 1)  return 'just now'
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  return `${Math.floor(h / 24)}d ago`
-}
-
-function ReusableWorkflows({ workflows, onRunWorkflow, C }) {
-  const empty = !workflows.length
-
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)', animation: 'ws-fadein 0.3s ease' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '9px', padding: '14px 22px', borderBottom: `1px solid ${C.border}`, background: 'rgba(99,102,241,0.03)' }}>
-        <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'rgba(99,102,241,0.14)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-        </div>
-        <span style={{ fontSize: '0.65rem', fontWeight: '800', color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Reusable Workflows</span>
-        {!empty && (
-          <span style={{ marginLeft: 'auto', fontSize: '0.65rem', color: C.textMuted, background: C.bg, borderRadius: '10px', padding: '1px 8px', border: `1px solid ${C.border}` }}>
-            {workflows.length} saved
-          </span>
-        )}
-      </div>
-
-      {empty ? (
-        /* ── Empty state ── */
-        <div style={{ padding: '36px 24px', textAlign: 'center' }}>
-          <div style={{ width: '48px', height: '48px', borderRadius: '14px', background: 'rgba(99,102,241,0.08)', border: `1px solid rgba(99,102,241,0.18)`, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 14px' }}>
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.6 }}><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-          </div>
-          <div style={{ fontSize: '0.88rem', fontWeight: '700', color: C.textSec, marginBottom: '6px' }}>No reusable workflows yet</div>
-          <p style={{ margin: 0, fontSize: '0.74rem', color: C.textMuted, lineHeight: 1.6, maxWidth: '280px', marginLeft: 'auto', marginRight: 'auto' }}>
-            Run an analysis and save it to build your operational workflow library.
-          </p>
-        </div>
-      ) : (
-        /* ── Workflow card grid ── */
-        <div style={{ padding: '16px 22px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '12px' }}>
-          {workflows.map((wf, i) => (
-            <div key={wf.id}
-              style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: '10px', animation: `ws-fadeup 0.3s ease both`, animationDelay: `${i * 0.05}s`, transition: 'border-color 0.14s, box-shadow 0.14s' }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(99,102,241,0.35)'; e.currentTarget.style.boxShadow = '0 4px 16px rgba(99,102,241,0.10)' }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.boxShadow = 'none' }}>
-
-              {/* Icon + title row */}
-              <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
-                <div style={{ width: '32px', height: '32px', borderRadius: '9px', background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.22)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: '1px' }}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: '0.83rem', fontWeight: '700', color: C.text, lineHeight: 1.3, marginBottom: '3px', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                    {wf.title}
-                  </div>
-                  <div style={{ fontSize: '0.62rem', color: C.textMuted }}>{relTime(wf.createdAt)}</div>
-                </div>
-              </div>
-
-              {/* Intent summary */}
-              <p style={{ margin: 0, fontSize: '0.72rem', color: C.textSec, lineHeight: 1.55, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                {wf.intent}
-              </p>
-
-              {/* Schedule badge */}
-              {wf.scheduleType && { weekly: 'Weekly', daily: 'Daily', monthly: 'Monthly', recurring: 'Recurring', automated: 'Automated' }[wf.scheduleType] && (
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', alignSelf: 'flex-start' }}>
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-                  <span style={{ fontSize: '0.62rem', fontWeight: '700', color: '#a5b4fc', background: 'rgba(167,139,250,0.10)', border: '1px solid rgba(167,139,250,0.22)', borderRadius: '5px', padding: '1px 7px', letterSpacing: '0.02em' }}>
-                    {{ weekly: 'Weekly', daily: 'Daily', monthly: 'Monthly', recurring: 'Recurring', automated: 'Automated' }[wf.scheduleType]}
-                  </span>
-                </div>
-              )}
-
-              {/* Dataset tag */}
-              {wf.datasetName && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-                  <span style={{ fontSize: '0.67rem', color: '#fbbf24', fontWeight: '600', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '180px' }}>{wf.datasetName}</span>
-                </div>
-              )}
-
-              {/* Run Again button */}
-              <button onClick={() => onRunWorkflow(wf)}
-                style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'linear-gradient(135deg,#4f46e5,#6366f1)', border: 'none', borderRadius: '9px', padding: '7px 14px', fontSize: '0.72rem', fontWeight: '700', color: '#fff', cursor: 'pointer', fontFamily: FONT, boxShadow: '0 3px 10px rgba(99,102,241,0.30)', transition: 'opacity 0.14s, transform 0.14s', alignSelf: 'flex-start', marginTop: 'auto' }}
-                onMouseEnter={e => { e.currentTarget.style.opacity = '0.88'; e.currentTarget.style.transform = 'translateY(-1px)' }}
-                onMouseLeave={e => { e.currentTarget.style.opacity = '1';    e.currentTarget.style.transform = 'translateY(0)' }}>
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                Run Again
-              </button>
-            </div>
-          ))}
-        </div>
+      {(kpi.explanation || kpi.description) && (
+        <div style={{ fontSize: '0.66rem', color: st.color, lineHeight: 1.45, fontWeight: '500', opacity: 0.85 }}>{kpi.explanation || kpi.description}</div>
       )}
+      <MiniSparkline direction={dir || 'flat'} />
     </div>
   )
 }
 
-// ─── Intelligence section renderers ──────────────────────────────────────────
-// These components render the backend sections that were ignored before Step 1.
-// Each is null-safe and returns null when the section is absent or empty.
-
-function InsightPriorityPanel({ sec, C }) {
-  const insights = sec?.insights
-  if (!insights?.length) return null
-  const sevMeta = {
-    high:   { color: '#f87171', bg: 'rgba(248,113,113,0.10)', label: 'HIGH' },
-    medium: { color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  label: 'MED'  },
-    low:    { color: '#10b981', bg: 'rgba(16,185,129,0.10)',  label: 'LOW'  },
-  }
-  return (
-    <div style={{ background: 'rgba(99,102,241,0.04)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '14px', overflow: 'hidden', animation: 'ws-fadein 0.25s ease' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: '1px solid rgba(99,102,241,0.12)' }}>
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="#a5b4fc"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Top Insights</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.61rem', color: '#a5b4fc', opacity: 0.7 }}>{insights.length} ranked</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {insights.slice(0, 5).map((ins, i) => {
-          const sv = sevMeta[ins.severity] || sevMeta.low
-          return (
-            <div key={i}
-              style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', padding: '10px 16px', borderBottom: i < Math.min(insights.length, 5) - 1 ? '1px solid rgba(99,102,241,0.10)' : 'none', transition: 'background 0.12s' }}
-              onMouseEnter={e => e.currentTarget.style.background = 'rgba(99,102,241,0.06)'}
-              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              <span style={{ fontSize: '0.55rem', fontWeight: '800', color: sv.color, background: sv.bg, borderRadius: '4px', padding: '2px 6px', textTransform: 'uppercase', letterSpacing: '0.06em', flexShrink: 0, marginTop: '2px' }}>{sv.label}</span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: '0.79rem', fontWeight: '600', color: C.text, marginBottom: ins.evidence ? '3px' : 0 }}>{ins.title}</div>
-                {ins.evidence && <div style={{ fontSize: '0.70rem', color: C.textSec, lineHeight: 1.5 }}>{ins.evidence}</div>}
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function AnomalyPanel({ sec, C }) {
-  const anomalies = sec?.anomalies
-  if (!anomalies?.length) return null
-  const real = anomalies.filter(a => a.severity !== 'none' && a.category !== 'all_clear')
-  if (!real.length) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 16px', background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.18)', borderRadius: '12px', animation: 'ws-fadein 0.25s ease' }}>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        <span style={{ fontSize: '0.76rem', fontWeight: '600', color: '#10b981' }}>No major anomalies detected</span>
-        <span style={{ fontSize: '0.70rem', color: C.textMuted, marginLeft: '4px' }}>· {anomalies.length} check{anomalies.length !== 1 ? 's' : ''} passed</span>
-      </div>
-    )
-  }
-  const sevMeta = {
-    high:   { color: '#f87171', bg: 'rgba(248,113,113,0.10)', label: 'HIGH' },
-    medium: { color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  label: 'MED'  },
-    low:    { color: '#6366f1', bg: 'rgba(99,102,241,0.08)',  label: 'LOW'  },
-  }
-  return (
-    <div style={{ background: C.surface, border: '1px solid rgba(248,113,113,0.22)', borderRadius: '14px', overflow: 'hidden', animation: 'ws-fadein 0.25s ease' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: '1px solid rgba(248,113,113,0.14)', background: 'rgba(248,113,113,0.04)' }}>
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: '#f87171', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Anomalies & Risks</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.61rem', color: '#f87171', opacity: 0.75 }}>{real.length} detected</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {real.slice(0, 5).map((a, i) => {
-          const sv = sevMeta[a.severity] || sevMeta.low
-          return (
-            <div key={i}
-              style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', padding: '10px 16px', borderBottom: i < Math.min(real.length, 5) - 1 ? `1px solid ${C.border}` : 'none', transition: 'background 0.12s' }}
-              onMouseEnter={e => e.currentTarget.style.background = C.bg}
-              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              <span style={{ fontSize: '0.55rem', fontWeight: '800', color: sv.color, background: sv.bg, borderRadius: '4px', padding: '2px 6px', textTransform: 'uppercase', letterSpacing: '0.06em', flexShrink: 0, marginTop: '2px' }}>{sv.label}</span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: '0.79rem', fontWeight: '600', color: C.text, marginBottom: a.evidence ? '3px' : 0 }}>{a.title}</div>
-                {a.evidence && <div style={{ fontSize: '0.70rem', color: C.textSec, lineHeight: 1.5 }}>{a.evidence}</div>}
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function TrendPanel({ sec, C }) {
-  const trends = sec?.trends
-  if (!trends?.length) return null
-  const dirMeta = {
-    up:      { color: '#10b981', symbol: '↑', label: 'Increasing' },
-    down:    { color: '#f87171', symbol: '↓', label: 'Decreasing' },
-    stable:  { color: '#94a3b8', symbol: '→', label: 'Stable'     },
-    neutral: { color: '#94a3b8', symbol: '—', label: 'Neutral'    },
-  }
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', overflow: 'hidden', animation: 'ws-fadein 0.25s ease' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${C.border}`, background: 'rgba(56,189,248,0.03)' }}>
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: '#38bdf8', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Trend Intelligence</span>
-        <span style={{ marginLeft: 'auto', fontSize: '0.61rem', color: C.textMuted }}>{trends.length} signal{trends.length !== 1 ? 's' : ''}</span>
-      </div>
-      <div style={{ padding: '12px 16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '10px' }}>
-        {trends.map((t, i) => {
-          const d = dirMeta[t.direction] || dirMeta.stable
-          return (
-            <div key={i} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '10px', padding: '11px 14px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '5px' }}>
-                <span style={{ fontSize: '1.05rem', fontWeight: '800', color: d.color, lineHeight: 1, flexShrink: 0 }}>{d.symbol}</span>
-                <span style={{ fontSize: '0.78rem', fontWeight: '700', color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title}</span>
-              </div>
-              {t.evidence && <div style={{ fontSize: '0.70rem', color: C.textSec, lineHeight: 1.5 }}>{t.evidence}</div>}
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function ForecastPanel({ sec, C }) {
-  if (!sec?.forecast_ready) return null
-  const items  = sec.items || []
-  const dirLine = items.find(it => it?.includes('Volume trend:')) || null
-  const projLine = items.find(it => it?.includes('Projected average:')) || null
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', overflow: 'hidden', animation: 'ws-fadein 0.25s ease' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${C.border}`, background: 'rgba(167,139,250,0.03)' }}>
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: '#a5b4fc', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Forecast · {sec.target_column}</span>
-        {sec.horizon_periods != null && (
-          <span style={{ marginLeft: 'auto', fontSize: '0.61rem', color: C.textMuted, background: C.bg, borderRadius: '8px', padding: '1px 7px', border: `1px solid ${C.border}` }}>{sec.horizon_periods} period{sec.horizon_periods !== 1 ? 's' : ''} ahead</span>
-        )}
-      </div>
-      <div style={{ padding: '14px 16px' }}>
-        {sec.chart && <ChartSection chart={sec.chart} C={C} />}
-        {(dirLine || projLine) && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: sec.chart ? '12px' : 0 }}>
-            {[dirLine, projLine].filter(Boolean).map((line, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: '7px', fontSize: '0.71rem', color: C.textSec, lineHeight: 1.5 }}>
-                <span style={{ color: '#a5b4fc', flexShrink: 0 }}>·</span>{line}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-function SegmentationPanel({ sec, C }) {
-  const segments = sec?.segments
-  if (!segments?.length) return null
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', overflow: 'hidden', animation: 'ws-fadein 0.25s ease' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${C.border}`, background: 'rgba(16,185,129,0.03)' }}>
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: '#10b981', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Segment Analysis</span>
-      </div>
-      <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-        {segments.slice(0, 3).map((seg, i) => {
-          const top = seg.top_segments?.slice(0, 5) || []
-          return (
-            <div key={i}>
-              <div style={{ fontSize: '0.64rem', fontWeight: '700', color: C.textSec, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>
-                {seg.metric} by {seg.dimension}
-              </div>
-              {seg.insight_summary && (
-                <div style={{ fontSize: '0.72rem', color: C.textSec, lineHeight: 1.5, marginBottom: '8px' }}>{seg.insight_summary}</div>
-              )}
-              {top.length > 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                  {top.map((row, j) => {
-                    const pct = row.pct_of_total != null ? Math.min(100, Math.round(row.pct_of_total)) : null
-                    return (
-                      <div key={j} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                        <span style={{ fontSize: '0.71rem', color: C.text, fontWeight: '500', minWidth: '90px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.label}</span>
-                        <div style={{ flex: 1, height: '5px', background: C.border, borderRadius: '3px', overflow: 'hidden' }}>
-                          <div style={{ height: '100%', width: `${pct ?? 0}%`, background: 'linear-gradient(90deg,#10b981,#34d399)', borderRadius: '3px' }} />
-                        </div>
-                        {pct != null && <span style={{ fontSize: '0.66rem', color: C.textMuted, minWidth: '30px', textAlign: 'right' }}>{pct}%</span>}
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function DrilldownPanel({ sec, C }) {
-  const tables = sec?.tables
-  if (!tables?.length) return null
-  return (
-    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', overflow: 'hidden', animation: 'ws-fadein 0.25s ease' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${C.border}`, background: 'rgba(251,191,36,0.03)' }}>
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-        <span style={{ fontSize: '0.62rem', fontWeight: '800', color: '#fbbf24', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Drilldown</span>
-      </div>
-      {tables.slice(0, 2).map((tbl, ti) => (
-        <div key={ti} style={{ padding: '12px 16px', borderBottom: ti < Math.min(tables.length, 2) - 1 ? `1px solid ${C.border}` : 'none' }}>
-          <div style={{ fontSize: '0.64rem', fontWeight: '700', color: C.textSec, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>
-            {tbl.metric} by {tbl.dimension}
-          </div>
-          {tbl.summary && <div style={{ fontSize: '0.70rem', color: C.textMuted, marginBottom: '8px', lineHeight: 1.5 }}>{tbl.summary}</div>}
-          {tbl.rows?.length > 0 && (
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem' }}>
-                <thead>
-                  <tr>
-                    {(tbl.columns || [tbl.dimension, 'Total', 'Share %']).slice(0, 4).map((col, ci) => (
-                      <th key={ci} style={{ padding: '4px 10px', textAlign: ci === 0 ? 'left' : 'right', color: C.textMuted, fontWeight: '700', fontSize: '0.60rem', textTransform: 'uppercase', letterSpacing: '0.06em', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap', fontFamily: FONT }}>{col}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {tbl.rows.slice(0, 6).map((row, ri) => (
-                    <tr key={ri}
-                      onMouseEnter={e => e.currentTarget.style.background = C.bg}
-                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                      <td style={{ padding: '6px 10px', color: C.text, fontWeight: '500', maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', borderBottom: `1px solid ${C.border}` }}>{row.label}</td>
-                      <td style={{ padding: '6px 10px', color: C.text, textAlign: 'right', fontFamily: MONO, fontSize: '0.70rem', borderBottom: `1px solid ${C.border}` }}>
-                        {row.value != null ? Number(row.value).toLocaleString(undefined, { maximumFractionDigits: 1 }) : '—'}
-                      </td>
-                      {row.count != null && (
-                        <td style={{ padding: '6px 10px', color: C.textSec, textAlign: 'right', fontSize: '0.70rem', borderBottom: `1px solid ${C.border}` }}>{Number(row.count).toLocaleString()}</td>
-                      )}
-                      {row.pct_of_total != null && (
-                        <td style={{ padding: '6px 10px', color: C.textMuted, textAlign: 'right', fontSize: '0.70rem', borderBottom: `1px solid ${C.border}` }}>{Math.round(row.pct_of_total)}%</td>
-                      )}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  )
-}
-
-// ─── Intent-adaptive helpers ─────────────────────────────────────────────────
-
-function getDefaultTabForStyle(style) {
-  if (style === 'visual_dashboard') return 'visuals'
-  if (style === 'kpi_summary')      return 'kpis'
-  return 'overview'
-}
-
-function buildAnswerSummary(intel) {
-  if (!intel) return null
-  const style = intel.reportPlan?.report_style
-  const kpis  = intel.kpis || []
-
-  if (style === 'kpi_summary') {
-    if (!kpis.length) return null
-    const top       = kpis[0]
-    const formatted = top.value_formatted || top.value_display || String(top.value ?? '')
-    return {
-      accent: '#fbbf24',
-      label:  'KPI Summary',
-      text:   `${kpis.length} business KPI${kpis.length !== 1 ? 's' : ''} computed. Leading indicator: ${top.label} — ${formatted}.`,
-    }
-  }
-
-  if (style === 'visual_dashboard') {
-    const n = (intel.chartSecs || []).length
-    return {
-      accent: '#38bdf8',
-      label:  'Visual Dashboard',
-      text:   `${n > 0 ? `${n} chart${n !== 1 ? 's' : ''} generated.` : 'Visual analysis ready.'} Open the Visuals tab to explore all charts and trends.`,
-    }
-  }
-
-  if (style === 'executive_brief') {
-    const parts = [
-      intel.execSummary,
-      intel.topAction && `Recommended action: ${intel.topAction}`,
-    ].filter(Boolean)
-    if (!parts.length) return null
-    return { accent: '#6366f1', label: 'Executive Brief', text: parts.join(' ') }
-  }
-
-  if (style === 'anomaly_report') {
-    const flagged = (intel.anomalySec?.anomalies || []).filter(
-      a => a.severity === 'high' || a.severity === 'medium'
-    )
-    if (!flagged.length && !intel.highestRisk) return null
-    const leadText = flagged.length > 0
-      ? `${flagged.length} anomal${flagged.length !== 1 ? 'ies' : 'y'} detected. Highest risk: ${flagged[0].title}.`
-      : `Risk identified: ${intel.highestRisk}`
-    return { accent: '#f87171', label: 'Risk & Anomalies', text: leadText }
-  }
-
-  if (style === 'operational_report' || style === 'monitoring_report') {
-    const parts = [
-      intel.watchlist?.length > 0       && `${intel.watchlist.length} drift signal${intel.watchlist.length !== 1 ? 's' : ''} detected.`,
-      intel.recommendations?.length > 0 && `${intel.recommendations.length} recommended action${intel.recommendations.length !== 1 ? 's' : ''}.`,
-    ].filter(Boolean)
-    if (!parts.length) return null
-    return {
-      accent: '#10b981',
-      label:  style === 'monitoring_report' ? 'Monitoring Report' : 'Operational Report',
-      text:   parts.join(' '),
-    }
-  }
-
-  // Dimension KPI — product/category/region/customer performance answer
-  const dimKpi = kpis.find(k => ['product', 'category', 'region', 'customer'].includes(k.semantic_source))
-  if (dimKpi) {
-    const val  = dimKpi.value_formatted || dimKpi.value_display || String(dimKpi.value ?? '')
-    const expl = dimKpi.explanation ? ` ${dimKpi.explanation}` : ''
-    return { accent: '#a5b4fc', label: 'Top Finding', text: `${dimKpi.label}: ${val}.${expl}` }
-  }
-
-  // Revenue KPI
-  const revKpi = kpis.find(k => k.semantic_source === 'revenue')
-  if (revKpi) {
-    const val = revKpi.value_formatted || String(revKpi.value ?? '')
-    return { accent: '#10b981', label: 'Top Finding', text: `${revKpi.label}: ${val}. ${revKpi.explanation || ''}`.trim() }
-  }
-
-  // Fallback: exec summary
-  if (intel.execSummary) {
-    return { accent: '#94a3b8', label: 'Analysis Summary', text: intel.execSummary }
-  }
-
-  return null
-}
-
-function AnswerSummaryBlock({ intel, C }) {
-  const summary = buildAnswerSummary(intel)
-  if (!summary) return null
-  return (
-    <div style={{
-      display: 'flex', alignItems: 'flex-start', gap: '12px',
-      padding: '12px 18px',
-      background: `${summary.accent}0d`,
-      border: `1px solid ${summary.accent}30`,
-      borderRadius: '12px',
-      animation: 'ws-fadeup 0.30s ease both',
-    }}>
-      <div style={{
-        width: '6px', height: '6px', borderRadius: '50%',
-        background: summary.accent, flexShrink: 0, marginTop: '7px',
-      }} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{
-          fontSize: '0.56rem', fontWeight: '800', color: summary.accent,
-          textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: '4px',
-        }}>
-          {summary.label}
-        </div>
-        <p style={{ margin: 0, fontSize: '0.83rem', color: C.text, lineHeight: 1.65 }}>
-          {summary.text}
-        </p>
-      </div>
-    </div>
-  )
-}
-
-function ReportDeliveryCard({ result, wsInput, C }) {
-  if (!result) return null
-
-  const schedType  = extractScheduleType(wsInput)
-  const schedLabel = schedType
-    ? ({ weekly: 'Weekly', daily: 'Daily', monthly: 'Monthly', recurring: 'Recurring', automated: 'Automated' })[schedType] ?? schedType
-    : null
-
-  const reportGenerated  = !!(result.report_id || result.dataset_report)
-  const savedToReports   = !!result.report_id
-  const scheduleCreated  = result.schedule_created === true || result.schedule_id != null
-  const notifSent        = result.notification_sent === true || result.notification_id != null
-  const emailSentCard    = !!(result.email_delivery?.sent)
-  const emailConfigured  = result.email_delivery_configured === true && !emailSentCard
-  const notifConfigured  = result.notification_configured === true && !notifSent
-  const workflowCreated  = !!result.workflow_id ||
-    /create_tool|create_workflow|save_workflow|build_workflow/i.test(result.task_type ?? '')
-
-  const items = [
-    reportGenerated && {
-      label:  'Report Generated',
-      detail: result.report_id ? `Report ID: ${result.report_id}` : null,
-      color:  '#10b981',
-    },
-    savedToReports && {
-      label:  'Saved to Reports',
-      detail: null,
-      color:  '#34d399',
-    },
-    scheduleCreated && {
-      label:  'Schedule Created',
-      detail: schedLabel ? `Schedule: ${schedLabel}` : result.schedule_id ? `ID: ${result.schedule_id}` : null,
-      color:  '#a5b4fc',
-    },
-    emailConfigured && {
-      label:  'Email Delivery Configured',
-      detail: 'Will deliver on schedule',
-      color:  '#a5b4fc',
-    },
-    notifConfigured && {
-      label:  'In-App Notification Configured',
-      detail: 'Will notify on schedule',
-      color:  '#a5b4fc',
-    },
-    notifSent && {
-      label:  'Notification Sent',
-      detail: 'Notification Status: Sent',
-      color:  '#38bdf8',
-    },
-    workflowCreated && {
-      label:  'Workflow Created',
-      detail: result.workflow_id ? `ID: ${result.workflow_id}` : null,
-      color:  '#f59e0b',
-    },
-  ].filter(Boolean)
-
-  if (items.length === 0) return null
-
-  return (
-    <div style={{
-      background: C.surface, border: `1px solid ${C.border}`, borderRadius: '12px',
-      padding: '10px 16px', display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap',
-      animation: 'ws-fadein 0.35s ease',
-    }}>
-      <span style={{ fontSize: '0.63rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em', flexShrink: 0 }}>Delivery Status</span>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-        {items.map((item, i) => (
-          <div key={i} style={{
-            display: 'flex', alignItems: 'center', gap: '5px',
-            padding: '4px 10px', background: `${item.color}0d`,
-            border: `1px solid ${item.color}28`, borderRadius: '20px',
-            animation: `ws-fadeup 0.25s ease both`, animationDelay: `${i * 0.05}s`,
-          }}>
-            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke={item.color} strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            <span style={{ fontSize: '0.70rem', fontWeight: '600', color: item.color, lineHeight: 1, whiteSpace: 'nowrap' }}>{item.label}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function WorkflowExplanationCard({ result, wsInput, enginePlan, datasetName, C }) {
-  const hasCreationResult = !!result?.workflow_id ||
-    /create_tool|create_workflow|save_workflow|build_workflow/i.test(result?.task_type ?? '')
-  const hasCreationIntent = isToolCreationIntent(wsInput)
-  const hasPlan           = !!enginePlan
-
-  if (!hasPlan && !hasCreationIntent && !hasCreationResult) return null
-
-  // ── Workflow Name ──────────────────────────────────────────────────────────
-  const rawName = enginePlan?.description || (enginePlan?.name ? slugToTitle(enginePlan.name) : null)
-  const wfName  = rawName
-    ? (rawName.length <= 68 ? rawName : rawName.split(/[.!?]/)[0].trim() || rawName.slice(0, 68) + '…')
-    : wsInput?.trim()
-      ? (wsInput.trim().length <= 68 ? wsInput.trim() : wsInput.trim().slice(0, 68) + '…')
-      : null
-
-  // ── Workflow Type ──────────────────────────────────────────────────────────
-  const schedType    = extractScheduleType(wsInput)
-  const schedEnabled = enginePlan?.schedule?.enabled === true || !!schedType
-  const isToolIntent = /\b(tool|automation|agent|pipeline)\b/i.test(wsInput ?? '')
-  const wfType = schedEnabled                                   ? 'Scheduled Workflow'
-    : isToolIntent                                              ? 'Automation'
-    : (enginePlan?.graph?.nodes ?? []).length > 0              ? 'Workflow'
-    : hasCreationResult                                        ? 'Workflow'
-    : null
-
-  // ── Output ─────────────────────────────────────────────────────────────────
-  const reportOut = !!(result?.report_id || result?.dataset_report)
-  const emailOut  = !!(result?.task_type?.includes('email') ||
-    (enginePlan?.graph?.nodes ?? []).some(n => /send_email|email/i.test(n.action_type ?? '')))
-  const outputLabel = reportOut && schedEnabled ? 'Scheduled Report'
-    : reportOut && emailOut                     ? 'Email Report Delivery'
-    : reportOut                                 ? 'Intelligence Report'
-    : emailOut                                  ? 'Email Delivery'
-    : null
-
-  // ── Schedule ───────────────────────────────────────────────────────────────
-  const schedFreq = enginePlan?.schedule?.human_label ??
-    (schedType
-      ? ({ weekly: 'Weekly', daily: 'Daily', monthly: 'Monthly', recurring: 'Recurring', automated: 'Automated' })[schedType]
-      : null)
-
-  // ── Notifications (only when actually sent) ────────────────────────────────
-  const notifLabel = (result?.notification_sent === true || result?.notification_id != null)
-    ? 'Enabled' : null
-
-  // ── Status ─────────────────────────────────────────────────────────────────
-  const status = (result?.schedule_created === true || result?.schedule_id != null) ? 'Scheduled'
-    : result?.workflow_id                                                            ? 'Saved'
-    : (result?.status === 'success' || result?.status === 'completed')              ? 'Executed'
-    : null
-
-  const fields = [
-    wfName      && { label: 'Workflow Name', value: wfName },
-    wfType      && { label: 'Workflow Type', value: wfType },
-    datasetName && { label: 'Input',         value: datasetName },
-    outputLabel && { label: 'Output',        value: outputLabel },
-    schedFreq   && { label: 'Schedule',      value: schedFreq },
-    notifLabel  && { label: 'Notifications', value: notifLabel },
-    status      && { label: 'Status',        value: status },
-  ].filter(Boolean)
-
-  if (fields.length === 0) return null
-
-  return (
-    <div style={{
-      background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px',
-      overflow: 'hidden', boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
-      animation: 'ws-fadein 0.35s ease',
-    }}>
-      <div style={{ padding: '14px 20px 12px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <div style={{ width: '18px', height: '18px', borderRadius: '50%', background: 'rgba(99,102,241,0.12)', border: '1.5px solid rgba(99,102,241,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
-            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
-          </svg>
-        </div>
-        <div style={{ fontSize: '0.54rem', fontWeight: '800', color: '#6366f1', textTransform: 'uppercase', letterSpacing: '0.16em' }}>What ToolSmithAI Created</div>
-      </div>
-      <div style={{ padding: '14px 20px 16px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '12px 20px' }}>
-        {fields.map((f, i) => (
-          <div key={i} style={{ animation: `ws-fadeup 0.3s ease both`, animationDelay: `${i * 0.05}s` }}>
-            <div style={{ fontSize: '0.52rem', fontWeight: '800', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: '3px' }}>{f.label}</div>
-            <div style={{ fontSize: '0.74rem', fontWeight: '600', color: C.textSec, lineHeight: 1.4, wordBreak: 'break-word' }}>{f.value}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function IntelligenceCanvas({ intel, C, onOpenReport, onExportReport, setActiveNav, onSaveWorkflow, workflowAlreadySaved, workflowSaving }) {
-  // Hook must be called before any conditional returns (Rules of Hooks)
-  const [activeTab, setActiveTab] = useState(() => getDefaultTabForStyle(intel?.reportPlan?.report_style))
-
-  if (!intel) return null
-
-  // ── Basic (non-report) result ─────────────────────────────────────────────
-  if (intel.kind === 'basic') {
-    const ok = intel.status === 'success' || intel.status === 'completed' || intel.status === 'ok'
-    return (
-      <div className="ws-section ws-s1" style={{ background: C.surface, border: `1px solid ${ok ? '#10b98130' : '#f8717130'}`, borderRadius: '18px', padding: '48px 36px', textAlign: 'center', boxShadow: '0 4px 24px rgba(0,0,0,0.08)' }}>
-        <div style={{ width: '60px', height: '60px', borderRadius: '50%', background: ok ? 'rgba(16,185,129,0.12)' : 'rgba(248,113,113,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 18px', color: ok ? '#10b981' : '#f87171' }}>
-          {ok ? <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-               : <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>}
-        </div>
-        <div style={{ fontSize: '1.15rem', fontWeight: '700', color: C.text, marginBottom: '8px' }}>{ok ? 'Analysis Complete' : 'Request Failed'}</div>
-        <div style={{ fontSize: '0.8rem', color: C.textMuted }}>{ok ? 'Your request was processed successfully.' : 'Something went wrong. Please try again.'}</div>
-        {intel.emailDelivery?.sent && <div style={{ marginTop: '12px', fontSize: '0.8rem', color: '#10b981' }}>Delivered to {intel.emailDelivery.to}</div>}
-      </div>
-    )
-  }
-
-  const { kpis, recommendations, watchlist, chartSecs } = intel
-
-  // ── Adaptive layout from report_plan ──────────────────────────────────────
-  const reportPlan  = intel.reportPlan || null
-  const planStyle   = reportPlan?.report_style || 'analyst_deep_dive'
-  const vizPref     = reportPlan?.visual_preference || 'balanced'
-
-  // Chart visibility per style (0 = none, null = all)
-  const chartLimits = {
-    executive_brief: 0, kpi_summary: 0, anomaly_report: 0,
-    visual_dashboard: null, analyst_deep_dive: null,
-    table_heavy_report: 1, operational_report: 2, monitoring_report: 2,
-  }
-  const chartLimit   = Object.prototype.hasOwnProperty.call(chartLimits, planStyle) ? chartLimits[planStyle] : null
-  const visibleCharts = chartLimit === 0 ? [] : chartLimit == null ? chartSecs : chartSecs.slice(0, chartLimit)
-
-  // Layer ordering flags
-  const chartsFirst   = planStyle === 'visual_dashboard'
-  const insightFirst  = ['operational_report', 'anomaly_report', 'monitoring_report'].includes(planStyle)
-
-  // KPI card min-width: kpi_summary gets wider cards for prominence
-  const kpiMinWidth = planStyle === 'kpi_summary' ? '200px' : '160px'
-
-  // ── Reusable layer fragments ──────────────────────────────────────────────
-  const KpiLayer = kpis.length > 0 && (
-    <div className="ws-section ws-s2">
-      <div style={{ fontSize: '0.57rem', fontWeight: '800', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-        Key Performance Indicators
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${kpiMinWidth}, 1fr))`, gap: '10px' }}>
-        {kpis.map((kpi, i) => <KpiCard key={i} kpi={kpi} C={C} delay={0.04 + i * 0.04} />)}
-      </div>
-    </div>
-  )
-
-  const InsightLayer = (watchlist?.length > 0 || recommendations?.length > 0) && (
-    <div className="ws-section ws-s3" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '14px' }}>
-      {watchlist?.length > 0 && <WatchlistPanel watchlist={watchlist} C={C} />}
-      {recommendations?.length > 0 && <PriorityInsights recommendations={recommendations} C={C} />}
-    </div>
-  )
-
-  const ChartLayer = visibleCharts.length > 0 && (
-    <div className="ws-section ws-s4">
-      <div style={{ fontSize: '0.57rem', fontWeight: '800', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        Visual Intelligence
-        {vizPref === 'visual_heavy' && (
-          <span style={{ fontSize: '0.54rem', color: C.textMuted, fontWeight: '500', marginLeft: '4px' }}>· visual-first layout</span>
-        )}
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: '12px' }}>
-        {visibleCharts.map((sec, i) => <ChartPanel key={i} sec={sec} C={C} delay={0.06 + i * 0.07} />)}
-      </div>
-    </div>
-  )
-
-  // ── Tab definitions (hide empty tabs) ────────────────────────────────────
-  const tabs = [
-    { id: 'overview',   label: 'Overview',   icon: 'home'  },
-    kpis.length > 0          && { id: 'kpis',      label: 'KPIs',      icon: 'bar',   badge: kpis.length },
-    visibleCharts.length > 0 && { id: 'visuals',   label: 'Visuals',   icon: 'chart', badge: visibleCharts.length },
-    { id: 'execution',  label: 'Execution',  icon: 'clock' },
-    { id: 'outputs',    label: 'Outputs',    icon: 'doc'   },
-  ].filter(Boolean)
-
-  function TabIcon({ type }) {
-    const p = { width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }
-    if (type === 'home')  return <svg {...p}><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-    if (type === 'bar')   return <svg {...p}><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-    if (type === 'chart') return <svg {...p}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-    if (type === 'clock') return <svg {...p}><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-    if (type === 'doc')   return <svg {...p}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-    return null
-  }
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-
-      {/* ── Executive hero — always visible ── */}
-      <PremiumExecutiveHero intel={intel} C={C} onOpenReport={onOpenReport} setActiveNav={setActiveNav} />
-
-      {/* ── Answer-first summary — direct response to user intent ── */}
-      <AnswerSummaryBlock intel={intel} C={C} />
-
-      {/* ── Tabbed dashboard card ── */}
-      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '16px', overflow: 'hidden', boxShadow: '0 2px 12px rgba(0,0,0,0.06)' }}>
-
-        {/* Tab bar */}
-        <div style={{ display: 'flex', alignItems: 'center', borderBottom: `1px solid ${C.border}`, background: C.bg, overflowX: 'auto' }}>
-          {tabs.map(tab => {
-            const on = activeTab === tab.id
-            return (
-              <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
-                display: 'flex', alignItems: 'center', gap: '6px',
-                background: 'none', border: 'none',
-                borderBottom: on ? '2px solid #6366f1' : '2px solid transparent',
-                padding: '13px 16px 11px',
-                fontSize: '0.75rem', fontWeight: on ? '700' : '500',
-                color: on ? '#a5b4fc' : C.textMuted,
-                cursor: 'pointer', fontFamily: FONT, whiteSpace: 'nowrap',
-                transition: 'color 0.14s, border-color 0.14s',
-              }}>
-                <TabIcon type={tab.icon} />
-                {tab.label}
-                {tab.badge != null && (
-                  <span style={{ fontSize: '0.57rem', fontWeight: '800', background: on ? 'rgba(99,102,241,0.18)' : 'rgba(255,255,255,0.06)', color: on ? '#a5b4fc' : C.textMuted, borderRadius: '10px', padding: '1px 6px', minWidth: '18px', textAlign: 'center' }}>
-                    {tab.badge}
-                  </span>
-                )}
-              </button>
-            )
-          })}
-
-          {/* Compact Save Workflow CTA — right side of tab bar, always visible */}
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', padding: '0 16px', flexShrink: 0, borderLeft: `1px solid ${C.border}` }}>
-            {workflowAlreadySaved ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.68rem', fontWeight: '700', color: '#10b981' }}>
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                Saved to library
-              </div>
-            ) : workflowSaving ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.68rem', color: '#a5b4fc' }}>
-                <div style={{ width: '11px', height: '11px', borderRadius: '50%', border: '2px solid rgba(167,139,250,0.35)', borderTopColor: '#a5b4fc', animation: 'ws-spin 0.75s linear infinite', flexShrink: 0 }} />
-                Saving…
-              </div>
-            ) : (
-              <button onClick={onSaveWorkflow} style={{
-                display: 'flex', alignItems: 'center', gap: '6px',
-                background: 'rgba(99,102,241,0.10)', border: '1px solid rgba(99,102,241,0.25)',
-                borderRadius: '8px', padding: '6px 12px',
-                fontSize: '0.68rem', fontWeight: '700', color: '#a5b4fc',
-                cursor: 'pointer', fontFamily: FONT, whiteSpace: 'nowrap',
-                transition: 'background 0.14s',
-              }}
-                onMouseEnter={e => e.currentTarget.style.background = 'rgba(99,102,241,0.18)'}
-                onMouseLeave={e => e.currentTarget.style.background = 'rgba(99,102,241,0.10)'}>
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
-                Save Workflow
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Tab content — key forces remount+fade on tab switch */}
-        <div key={activeTab} style={{ padding: '22px', animation: 'ws-fadein 0.20s ease' }}>
-
-          {/* ── Overview ── intent-adaptive content order ── */}
-          {activeTab === 'overview' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              {/* Dataset summary text — subtle info strip */}
-              {intel.textSec?.items?.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px', padding: '9px 14px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '10px', fontSize: '0.71rem', color: C.textMuted, lineHeight: 1.5 }}>
-                  {intel.textSec.items.slice(0, 2).map((item, i) => (
-                    <span key={i}>{item}</span>
-                  ))}
-                </div>
-              )}
-
-              {/* kpi_summary: full KPI grid leads — all cards, wider layout */}
-              {planStyle === 'kpi_summary' && kpis.length > 0 && (
-                <div>
-                  <div style={{ fontSize: '0.57rem', fontWeight: '800', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-                    Business KPIs
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${kpiMinWidth}, 1fr))`, gap: '10px' }}>
-                    {kpis.map((kpi, i) => <KpiCard key={i} kpi={kpi} C={C} delay={0.03 + i * 0.04} />)}
-                  </div>
-                </div>
-              )}
-
-              {/* operational/anomaly/monitoring: risks and actions surface first */}
-              {insightFirst && <AnomalyPanel sec={intel.anomalySec} C={C} />}
-              {insightFirst && InsightLayer}
-
-              {/* Default order: prioritized insights lead */}
-              {!insightFirst && <InsightPriorityPanel sec={intel.insightPrioritySec} C={C} />}
-
-              {/* KPI mini-grid — all styles except kpi_summary (already shown above) */}
-              {planStyle !== 'kpi_summary' && kpis.length > 0 && (
-                <div>
-                  <div style={{ fontSize: '0.57rem', fontWeight: '800', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-                    Key Metrics
-                    {kpis.length > 4 && (
-                      <button onClick={() => setActiveTab('kpis')} style={{ marginLeft: '4px', background: 'none', border: 'none', fontSize: '0.57rem', color: '#6366f1', cursor: 'pointer', fontFamily: FONT, fontWeight: '700', padding: 0 }}>
-                        View all {kpis.length} →
-                      </button>
-                    )}
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))', gap: '10px' }}>
-                    {kpis.slice(0, 4).map((kpi, i) => <KpiCard key={i} kpi={kpi} C={C} delay={0.03 + i * 0.04} />)}
-                  </div>
-                </div>
-              )}
-
-              {/* Watchlist + recommendations — default position */}
-              {!insightFirst && InsightLayer}
-
-              {/* Anomalies — default position */}
-              {!insightFirst && <AnomalyPanel sec={intel.anomalySec} C={C} />}
-
-              {/* Insight priority — secondary for operational/anomaly styles */}
-              {insightFirst && <InsightPriorityPanel sec={intel.insightPrioritySec} C={C} />}
-
-              {/* Empty state — only when nothing at all to show */}
-              {!kpis.length && !watchlist?.length && !recommendations?.length && !intel.insightPrioritySec && !intel.anomalySec && (
-                <div style={{ textAlign: 'center', padding: '28px 0', color: C.textMuted, fontSize: '0.82rem' }}>
-                  Analysis complete. Explore the KPIs, Visuals, and Execution tabs for details.
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ── KPIs ── full grid + segmentation + drilldown */}
-          {activeTab === 'kpis' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {KpiLayer || (
-                <div style={{ textAlign: 'center', padding: '28px 0', color: C.textMuted, fontSize: '0.82rem' }}>No KPI data for this analysis.</div>
-              )}
-              <SegmentationPanel sec={intel.segmentationSec} C={C} />
-              <DrilldownPanel sec={intel.drilldownSec} C={C} />
-            </div>
-          )}
-
-          {/* ── Visuals ── charts + trends + forecast */}
-          {activeTab === 'visuals' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {ChartLayer || (
-                <div style={{ textAlign: 'center', padding: '28px 0', color: C.textMuted, fontSize: '0.82rem' }}>No chart visualizations for this report style.</div>
-              )}
-              <TrendPanel sec={intel.trendSec} C={C} />
-              <ForecastPanel sec={intel.forecastSec} C={C} />
-            </div>
-          )}
-
-          {/* ── Execution ── timeline + actions */}
-          {activeTab === 'execution' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <WorkflowTimeline intel={intel} C={C} />
-              <ActionsCompleted intel={intel} C={C} />
-            </div>
-          )}
-
-          {/* ── Outputs ── generated files + delivery */}
-          {activeTab === 'outputs' && (
-            <div>
-              <GeneratedOutputs intel={intel} C={C} onOpenReport={onOpenReport} setActiveNav={setActiveNav} />
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// WorkspaceLoading replaced by AIExecutionFlow (defined above with EXEC_PHASES)
-
-// ── Empty AI Assistant panel — matches screenshot exactly ─────────────────────
-function EmptyAssistantPanel({ C, proposal, onSuggestionSelect, activeDs, wsInput, token }) {
+function EmptyAssistantPanel({ C, proposal, activeDs, activeSource, wsInput, token }) {
   const [question,     setQuestion]     = useState('')
   const [answer,       setAnswer]       = useState(null)
   const [loading,      setLoading]      = useState(false)
@@ -3015,11 +1253,11 @@ function EmptyAssistantPanel({ C, proposal, onSuggestionSelect, activeDs, wsInpu
         </div>
 
         <p style={{ margin: 0, fontSize: '0.72rem', color: C.textSec, lineHeight: 1.65, padding: '0 8px' }}>
-          {activeDs
-            ? `Analyzing ${activeDs.filename} — ask a question below.`
+          {activeDs || activeSource
+            ? `Using ${activeDs?.filename || activeSource?.display_name} — ask a question below.`
             : proposal
               ? 'Review the plan on the left, then approve and run to see full results.'
-              : 'Select a dataset to enable AI Assistant.'}
+              : 'Select a data source to enable AI Assistant.'}
         </p>
       </div>
 
@@ -3066,7 +1304,7 @@ function EmptyAssistantPanel({ C, proposal, onSuggestionSelect, activeDs, wsInpu
           Suggested Questions
         </div>
         <div style={{ display: 'flex', flexDirection: 'column' }}>
-          {EMPTY_SUGGESTIONS.map((q, i) => (
+          {EMPTY_SUGGESTIONS.map(q => (
             <div
               key={q}
               className="ws-suggest-row"
@@ -3192,16 +1430,6 @@ function actionToLabel(action) {
   return overrides[action] || action.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
 }
 
-function inputFriendlyLabel(name) {
-  if (name === 'dataset_id')  return 'Dataset'
-  if (name === 'report_id')   return 'Report'
-  if (name === 'user_id')     return 'User'
-  if (name === 'email')       return 'Email address'
-  if (name === 'recipient')    return 'Recipient'
-  if (name === 'report_format') return 'Output Type'
-  return name.replace(/_id$/, '').split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
-}
-
 const ACTION_TYPE_META = {
   fetch:                  { color: '#38bdf8', label: 'Load Data'       },
   transform:              { color: '#a5b4fc', label: 'Transform'       },
@@ -3262,10 +1490,50 @@ function Toast({ toast }) {
   )
 }
 
+// Phase 3, Step 3 — shown when "remember this choice" tries to teach a term
+// a meaning that conflicts with what was already taught (409
+// remembered_term_conflict). Conversational wording, not governance
+// language — the user only ever sees "keep" or "replace", never
+// confidence/state jargon.
+export function RememberConflictPanel({ conflict, busy, onKeep, onReplace, C }) {
+  if (!conflict) return null
+  return (
+    <div style={{
+      position: 'fixed', bottom: '24px', right: '28px', zIndex: 9999,
+      maxWidth: '380px', background: C.surface, border: `1px solid ${C.border}`,
+      borderRadius: '12px', padding: '16px 18px',
+      boxShadow: '0 8px 32px rgba(0,0,0,0.24)', animation: 'ws-fadeup 0.25s ease',
+    }}>
+      <div style={{ fontSize: '0.8rem', fontWeight: '600', color: C.text, lineHeight: 1.5, marginBottom: '12px' }}>
+        You previously taught me that &quot;{conflict.term}&quot; means &quot;{conflict.existingCanonicalTerm}&quot;.
+        Replace it with &quot;{conflict.requestedCanonicalTerm}&quot;?
+      </div>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        <button
+          type="button"
+          onClick={onKeep}
+          disabled={busy}
+          style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '7px 14px', fontSize: '0.74rem', fontWeight: '600', color: C.textSec, cursor: busy ? 'not-allowed' : 'pointer', fontFamily: FONT }}
+        >
+          Keep existing meaning
+        </button>
+        <button
+          type="button"
+          onClick={onReplace}
+          disabled={busy}
+          style={{ background: '#6366f1', border: 'none', borderRadius: '8px', padding: '7px 14px', fontSize: '0.74rem', fontWeight: '700', color: '#fff', cursor: busy ? 'not-allowed' : 'pointer', fontFamily: FONT }}
+        >
+          {busy ? 'Replacing…' : 'Replace remembered meaning'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function EngineOrchestrationPlan({
   plan, C, savedToolId, toolStatus,
   engineBusy, onSave, onSubmit, onApprove,
-  onEdit, onClear, showRawJson, setShowRawJson,
+  onEdit, onClear,
   datasetList, planDatasetId, setPlanDatasetId,
 }) {
   const nodes      = plan?.graph?.nodes ?? []
@@ -3392,7 +1660,6 @@ function EngineOrchestrationPlan({
           {reqInputs.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               {reqInputs.map(inp => {
-                const label = inputFriendlyLabel(inp.name)
                 const isDataset = inp.name === 'dataset_id'
 
                 if (isDataset) {
@@ -3822,33 +2089,84 @@ function BusinessAnswerBlock({ answer: ba, C }) {
 // for grouped/ranked/tabular result_preview rows. Row objects already carry
 // business-labeled keys from core/answering/result_formatter.py — no raw
 // column identifiers to hide here.
+const RESULT_PREVIEW_PAGE_SIZE = 25
+
 function ResultPreviewTable({ rows, C }) {
+  const [page, setPage] = useState(0)
+  // A new question/result replaces `rows` entirely — always land back on
+  // page 1 rather than carrying over a stale page index into unrelated data.
+  useEffect(() => { queueMicrotask(() => setPage(0)) }, [rows])
+
   if (!rows?.length) return null
-  const shown = rows.slice(0, 10)
-  const columns = Object.keys(shown[0])
+  const columns = Object.keys(rows[0])
+  const pageCount = Math.max(1, Math.ceil(rows.length / RESULT_PREVIEW_PAGE_SIZE))
+  const currentPage = Math.min(page, pageCount - 1)
+  const start = currentPage * RESULT_PREVIEW_PAGE_SIZE
+  const shown = rows.slice(start, start + RESULT_PREVIEW_PAGE_SIZE)
+
+  // Wide result sets (many business/technical columns) must scroll
+  // horizontally within their own bounded container instead of expanding the
+  // page. min-width: 0 here (and on every flex/grid ancestor up through
+  // App.jsx's post-login shell) is load-bearing: a flex item's default
+  // min-width is its content's min-content size, so without it this
+  // container — and everything above it — would refuse to shrink below the
+  // wide table's natural width and grow the whole page instead of scrolling.
+  // A generous viewport-relative max-height (with its own overflow-y) keeps
+  // results readable at a glance instead of the old fixed 420px box, while
+  // still bounding runaway growth for very large previews. The header row
+  // is sticky (both axes) and the first column is sticky so the row's
+  // identifying value and column names stay visible while scrolling in
+  // either direction. Row volume itself is bounded by paging
+  // (RESULT_PREVIEW_PAGE_SIZE rows at a time) rather than rendering the
+  // entire preview inline.
   return (
-    <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: '10px', marginBottom: '12px', overflowX: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.74rem' }}>
-        <thead>
-          <tr>
-            {columns.map(col => (
-              <th key={col} style={{ textAlign: 'left', padding: '6px 10px', color: C.textMuted, fontWeight: '700', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>{col}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {shown.map((row, i) => (
-            <tr key={i}>
-              {columns.map(col => (
-                <td key={col} style={{ padding: '6px 10px', color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>{String(row[col] ?? '')}</td>
+    <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: '10px', marginBottom: '12px', minWidth: 0 }}>
+      <div style={{ width: '100%', maxWidth: '100%', minWidth: 0, maxHeight: '70vh', overflow: 'auto', border: `1px solid ${C.border}`, borderRadius: '8px' }}>
+        <table style={{ borderCollapse: 'collapse', fontSize: '0.74rem', width: 'max-content', minWidth: '100%' }}>
+          <thead>
+            <tr>
+              {columns.map((col, idx) => (
+                <th key={col} style={{
+                  textAlign: 'left', padding: '6px 10px', color: C.textMuted, fontWeight: '700',
+                  borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap', background: C.surface,
+                  position: 'sticky', top: 0, zIndex: idx === 0 ? 3 : 2,
+                  ...(idx === 0 ? { left: 0, borderRight: `1px solid ${C.border}` } : {}),
+                }}>{col}</th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
-      {rows.length > shown.length && (
-        <div style={{ fontSize: '0.66rem', color: C.textMuted, marginTop: '6px' }}>+{rows.length - shown.length} more row(s) not shown.</div>
-      )}
+          </thead>
+          <tbody>
+            {shown.map((row, i) => (
+              <tr key={start + i}>
+                {columns.map((col, idx) => (
+                  <td key={col} style={{
+                    padding: '6px 10px', color: C.text, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap',
+                    ...(idx === 0 ? { position: 'sticky', left: 0, zIndex: 1, background: C.surface, borderRight: `1px solid ${C.border}` } : {}),
+                  }}>{String(row[col] ?? '')}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap', marginTop: '6px' }}>
+        <span style={{ fontSize: '0.66rem', color: C.textMuted }}>
+          {rows.length} results • Showing {start + 1}–{Math.min(start + RESULT_PREVIEW_PAGE_SIZE, rows.length)}
+        </span>
+        {pageCount > 1 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button type="button" onClick={() => setPage(p => Math.max(0, p - 1))} disabled={currentPage === 0}
+              style={{ fontSize: '0.66rem', fontWeight: '600', padding: '4px 11px', borderRadius: '6px', border: `1px solid ${C.border}`, background: C.surface, color: currentPage === 0 ? C.textMuted : C.text, cursor: currentPage === 0 ? 'default' : 'pointer', fontFamily: FONT }}>
+              Previous
+            </button>
+            <span style={{ fontSize: '0.66rem', color: C.textMuted }}>Page {currentPage + 1} of {pageCount}</span>
+            <button type="button" onClick={() => setPage(p => Math.min(pageCount - 1, p + 1))} disabled={currentPage === pageCount - 1}
+              style={{ fontSize: '0.66rem', fontWeight: '600', padding: '4px 11px', borderRadius: '6px', border: `1px solid ${C.border}`, background: C.surface, color: currentPage === pageCount - 1 ? C.textMuted : C.text, cursor: currentPage === pageCount - 1 ? 'default' : 'pointer', fontFamily: FONT }}>
+              Next
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -3856,17 +2174,16 @@ function ResultPreviewTable({ rows, C }) {
 function EnterpriseAnswerBlock({ answer: ea, C }) {
   if (!ea) return null
   const typeColors = ANSWER_TYPE_COLORS[ea.answer_type] ?? ANSWER_TYPE_COLORS.metadata_lookup
-  const conf       = Math.round(ea.confidence ?? 0)
   const typeLabel  = (ea.answer_type ?? 'unknown').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-  const citations  = ea.citations ?? []
   const limitations = ea.limitations ?? []
   const nextActions = ea.next_actions ?? []
   const resultPreview = ea.result_preview ?? []
   const appliedFilters = ea.applied_filters ?? []
   const dateContext = ea.date_context ?? null
-  const sourceTables = ea.source_tables ?? []
-  const sourceColumns = ea.source_columns ?? []
-  const hasTechnicalDetails = sourceTables.length > 0 || sourceColumns.length > 0
+  const insight = ea.insight ?? null
+  const chart = ea.chart ?? null
+  const kpi = ea.kpi ?? null
+  const groundedInsights = ea.insights ?? []
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '20px', marginBottom: '12px', boxShadow: '0 2px 8px rgba(0,0,0,0.05)' }}>
@@ -3886,6 +2203,26 @@ function EnterpriseAnswerBlock({ answer: ea, C }) {
         <div style={{ fontSize: '0.72rem', color: C.textMuted, lineHeight: 1.45, marginBottom: '12px' }}>{ea.summary}</div>
       )}
 
+      {/* period-comparison insight — Day 4, Capability 2 (Business Insights).
+          Only present for a time-bound single-scalar aggregate answer where
+          data.insight_service actually computed one; absent everywhere else. */}
+      {insight && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '12px',
+          padding: '7px 12px', borderRadius: '9px',
+          background: insight.direction === 'up' ? 'rgba(16,185,129,0.08)' : insight.direction === 'down' ? 'rgba(248,113,113,0.08)' : 'rgba(148,163,184,0.08)',
+          border: `1px solid ${insight.direction === 'up' ? 'rgba(16,185,129,0.22)' : insight.direction === 'down' ? 'rgba(248,113,113,0.22)' : C.border}`,
+        }}>
+          <span style={{ fontSize: '0.8rem', lineHeight: 1 }} aria-hidden="true">
+            {insight.direction === 'up' ? '▲' : insight.direction === 'down' ? '▼' : '▪'}
+          </span>
+          <span style={{ fontSize: '0.74rem', fontWeight: '700', color: insight.direction === 'up' ? '#10b981' : insight.direction === 'down' ? '#f87171' : C.textSec }}>
+            {insight.percent_change > 0 ? '+' : ''}{insight.percent_change}%
+          </span>
+          <span style={{ fontSize: '0.72rem', color: C.textMuted }}>{insight.label}</span>
+        </div>
+      )}
+
       {/* applied filters + date context */}
       {(appliedFilters.length > 0 || dateContext) && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', marginBottom: '12px' }}>
@@ -3902,6 +2239,53 @@ function EnterpriseAnswerBlock({ answer: ea, C }) {
         </div>
       )}
 
+      {/* automatic chart — Day 4, Capability 3. Only present when
+          core.answering.result_formatter._build_chart_spec determined the
+          result shape supports one (grouped/ranked, single dimension, a
+          legible category count); reuses the existing ChartSection
+          component unchanged — the table below is never removed, only
+          supplemented. */}
+      {chart && (
+        <div style={{ marginBottom: '12px', padding: '12px', border: `1px solid ${C.border}`, borderRadius: '10px' }}>
+          {chart.title && <div style={{ fontSize: '0.68rem', fontWeight: '700', color: C.textSec, marginBottom: '8px' }}>{chart.title}</div>}
+          <ChartSection chart={chart} C={C} />
+        </div>
+      )}
+
+      {/* single-scalar KPI — Phase 7, Step 6G. Mutually exclusive with
+          `chart` by construction (core.sqlservice.result_chart_builder):
+          a chart needs >=2 rows, a kpi needs exactly 1. Reuses the
+          existing KpiCard component unchanged. */}
+      {kpi && (
+        <div style={{ marginBottom: '12px' }}>
+          <KpiCard kpi={{ label: kpi.label, value: kpi.value, format: 'number' }} C={C} />
+        </div>
+      )}
+
+      {/* grounded result insights — Phase 7, Step 6G. Populated by
+          core.sqlservice.result_insight_builder (deterministic) or, for a
+          genuinely complex result, the grounded AI answer path — every
+          entry already cites real row/column evidence
+          (core.sqlservice.answer_generation_service.AnswerInsight), never
+          rendered for a truncated result (the builder itself suppresses
+          those). Additive alongside the legacy `insight` badge above;
+          does not replace it. */}
+      {groundedInsights.length > 0 && (
+        <div style={{ marginBottom: '12px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {groundedInsights.map((ins, i) => (
+              <div key={i} style={{ padding: '9px 13px', background: 'rgba(99,102,241,0.04)', border: '1px solid rgba(99,102,241,0.14)', borderRadius: '9px' }}>
+                <div style={{ fontSize: '0.73rem', fontWeight: '700', color: C.text, marginBottom: '2px' }}>{ins.title}</div>
+                <div style={{ fontSize: '0.71rem', color: C.textSec, lineHeight: 1.45 }}>{ins.finding}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: '0.63rem', color: C.textMuted, marginTop: '5px', fontStyle: 'italic' }}>
+            Based on the returned result rows.
+          </div>
+        </div>
+      )}
+
       {/* result preview (grouped/ranked/tabular rows) */}
       <ResultPreviewTable rows={resultPreview} C={C} />
 
@@ -3913,32 +2297,11 @@ function EnterpriseAnswerBlock({ answer: ea, C }) {
         </div>
       )}
 
-      {/* confidence row */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: (citations.length || limitations.length || nextActions.length) ? '12px' : 0 }}>
-        <div style={{ fontSize: '0.68rem', color: C.textMuted, flexShrink: 0 }}>Confidence</div>
-        <div style={{ flex: 1, height: '5px', background: C.border, borderRadius: '3px', overflow: 'hidden', maxWidth: '160px' }}>
-          <div style={{ height: '100%', width: `${conf}%`, background: conf >= 70 ? '#10b981' : conf >= 40 ? '#f59e0b' : '#f87171', borderRadius: '3px', transition: 'width 0.4s ease' }} />
-        </div>
-        <span style={{ fontSize: '0.68rem', fontWeight: '700', color: C.textSec, minWidth: '28px' }}>{conf}%</span>
-      </div>
-
-      {/* citations */}
-      {citations.length > 0 && (
-        <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: '10px', marginBottom: (limitations.length || nextActions.length) ? '10px' : 0 }}>
-          <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Citations</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px' }}>
-            {citations.map((c, i) => (
-              <span key={i} title={c.reference || ''} style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '20px', padding: '3px 9px', fontSize: '0.65rem', color: C.textSec, fontWeight: '500' }}>
-                {c.label || c.source_type || 'source'}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* limitations */}
+      {/* limitations — kept primary: a caveat about the answer itself
+          (e.g. "results truncated", "connection timed out") is user-facing,
+          not a developer diagnostic, so it stays outside Technical details. */}
       {limitations.length > 0 && (
-        <div style={{ borderTop: citations.length ? 'none' : `1px solid ${C.border}`, paddingTop: citations.length ? 0 : '10px', display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: nextActions.length ? '10px' : 0 }}>
+        <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: nextActions.length ? '10px' : 0 }}>
           {limitations.map((lim, i) => (
             <div key={i} style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', fontSize: '0.70rem', color: C.textMuted, lineHeight: 1.45 }}>
               <span style={{ flexShrink: 0, marginTop: '1px', color: '#f59e0b' }}>&#9432;</span>
@@ -3959,26 +2322,6 @@ function EnterpriseAnswerBlock({ answer: ea, C }) {
           ))}
         </div>
       )}
-
-      {/* technical details — raw table/column identifiers, hidden from the
-          primary answer by design, available here for anyone who needs them */}
-      {hasTechnicalDetails && (
-        <details style={{ marginTop: nextActions.length ? '12px' : 0, borderTop: `1px solid ${C.border}`, paddingTop: '10px' }}>
-          <summary style={{ cursor: 'pointer', fontSize: '0.68rem', color: C.textMuted, fontWeight: '600' }}>Technical details</summary>
-          <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {sourceTables.length > 0 && (
-              <div style={{ fontSize: '0.68rem', color: C.textSec }}>
-                <span style={{ color: C.textMuted }}>Source table(s): </span>{sourceTables.join(', ')}
-              </div>
-            )}
-            {sourceColumns.length > 0 && (
-              <div style={{ fontSize: '0.68rem', color: C.textSec, wordBreak: 'break-word' }}>
-                <span style={{ color: C.textMuted }}>Source column(s): </span>{sourceColumns.join(', ')}
-              </div>
-            )}
-          </div>
-        </details>
-      )}
     </div>
   )
 }
@@ -3992,11 +2335,30 @@ function EnterpriseAnswerBlock({ answer: ea, C }) {
 // {term, table_fqn, column_name} (core.orchestrator.context_builder
 // ._apply_clarification_overrides) — NOT by the option's `id`, which exists
 // only as a UI list key.
-export function ClarificationCard({ clarification, wsInput, C, onBack, onResolve, onCancel, resubmitted }) {
+export function ClarificationCard({ clarification, wsInput, C, onBack, onResolve, onCancel, onFreeTextResolve, resubmitted }) {
   const options = clarification?.options ?? []
   const [picked, setPicked]           = useState({})   // term -> option
   const [expanded, setExpanded]       = useState({})   // option.id -> bool
   const [submitting, setSubmitting]   = useState(false)
+  // Phase 7, Step 5 audit fix — Part 7: a clarification with no structured
+  // `options` (e.g. the AI-first pipeline's plain clarification_question,
+  // which never populates `options`) used to leave "Try a different
+  // question" as the ONLY path forward, which discards the pending
+  // clarification state and starts an unrelated query instead of actually
+  // answering it. onFreeTextResolve (wired to the same handleComposerAsk
+  // call a recognized follow-up question already uses) sends the typed
+  // text as a plain message with the pending conversation_state still
+  // attached, which the backend's own is_new_pipeline_clarification_resume
+  // routing (api/v1/composer.py) already treats as the clarification's
+  // answer -- combining it with the original question via
+  // build_combined_clarification_question. No backend change was needed;
+  // only the frontend never exposed this already-supported path.
+  const [freeTextAnswer, setFreeTextAnswer] = useState('')
+  // Phase 2, Step 7b — opt-in only: this writes a persistent, source-scoped
+  // HUMAN_APPROVED governance record (data/concept_mapping_service.py::
+  // promote_clarification_selection), so it defaults unchecked rather than
+  // silently remembering every resolved choice.
+  const [remember, setRemember]       = useState(false)
 
   const groups = {}
   for (const opt of options) {
@@ -4016,13 +2378,21 @@ export function ClarificationCard({ clarification, wsInput, C, onBack, onResolve
       table_fqn:   picked[t].table_fqn,
       column_name: picked[t].column_name ?? null,
     }))
-    onResolve(selections)
+    onResolve(selections, remember)
   }
 
   function handleCancel() {
     if (submitting) return
     setSubmitting(true)
     onCancel()
+  }
+
+  function handleFreeTextSubmit(e) {
+    e.preventDefault()
+    const trimmed = freeTextAnswer.trim()
+    if (!trimmed || submitting || !onFreeTextResolve) return
+    setSubmitting(true)
+    onFreeTextResolve(trimmed)
   }
 
   return (
@@ -4053,15 +2423,48 @@ export function ClarificationCard({ clarification, wsInput, C, onBack, onResolve
       </div>
 
       {termNames.length === 0 ? (
-        // empty options defensive state
-        <>
-          <div style={{ fontSize: '0.78rem', color: C.textMuted, lineHeight: 1.5, marginBottom: '16px' }}>
-            We couldn&apos;t find specific options to choose from. Please try rephrasing your question.
+        // No structured options -- always offer a free-text answer box
+        // (Part 7) rather than leaving "Try a different question" as the
+        // only path, which would silently abandon the pending clarification.
+        <form onSubmit={handleFreeTextSubmit}>
+          <label htmlFor="clarification-free-text-answer" style={{ display: 'block', fontSize: '0.68rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px' }}>
+            Your answer
+          </label>
+          <textarea
+            id="clarification-free-text-answer"
+            value={freeTextAnswer}
+            onChange={e => setFreeTextAnswer(e.target.value)}
+            disabled={submitting}
+            placeholder="Type your answer to the question above…"
+            rows={2}
+            style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical', border: `1px solid ${C.border}`, borderRadius: '9px', padding: '10px 12px', fontSize: '0.82rem', color: C.text, background: C.bg, fontFamily: FONT, marginBottom: '14px' }}
+          />
+          <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+            <button
+              type="submit"
+              disabled={!freeTextAnswer.trim() || submitting || !onFreeTextResolve}
+              style={{ background: (!freeTextAnswer.trim() || submitting || !onFreeTextResolve) ? C.border : '#6366f1', border: 'none', borderRadius: '9px', padding: '9px 18px', fontSize: '0.78rem', fontWeight: '700', color: (!freeTextAnswer.trim() || submitting || !onFreeTextResolve) ? C.textMuted : '#fff', cursor: (!freeTextAnswer.trim() || submitting || !onFreeTextResolve) ? 'not-allowed' : 'pointer', fontFamily: FONT }}
+            >
+              {submitting ? 'Submitting…' : 'Send answer'}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancel}
+              disabled={submitting}
+              style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '9px', padding: '9px 16px', fontSize: '0.78rem', fontWeight: '600', color: C.textSec, cursor: submitting ? 'not-allowed' : 'pointer', fontFamily: FONT }}
+            >
+              Cancel clarification
+            </button>
+            <button
+              type="button"
+              onClick={onBack}
+              disabled={submitting}
+              style={{ background: 'none', border: 'none', padding: '9px 4px', fontSize: '0.78rem', fontWeight: '600', color: C.textMuted, cursor: submitting ? 'not-allowed' : 'pointer', fontFamily: FONT }}
+            >
+              Ask a different question
+            </button>
           </div>
-          <button onClick={onBack} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '9px', padding: '9px 16px', fontSize: '0.78rem', fontWeight: '600', color: C.textSec, cursor: 'pointer', fontFamily: FONT }}>
-            Try a different question
-          </button>
-        </>
+        </form>
       ) : (
         <form onSubmit={handleSubmit}>
           {termNames.map(term => (
@@ -4083,6 +2486,36 @@ export function ClarificationCard({ clarification, wsInput, C, onBack, onResolve
                         />
                         <span style={{ fontSize: '0.82rem', fontWeight: '600', color: C.text }}>{opt.label}</span>
                       </label>
+                      {/* Accuracy Program A4, Fix #3 — additive, optional metadata.
+                          Hidden entirely for older responses without these fields. */}
+                      {(opt.object_type || opt.domain || opt.entity) && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '5px', marginLeft: '24px' }}>
+                          {opt.object_type && (
+                            <span style={{ fontSize: '0.6rem', fontWeight: '700', color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: '5px', padding: '1px 6px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                              {opt.object_type}
+                            </span>
+                          )}
+                          {opt.domain && (
+                            <span style={{ fontSize: '0.62rem', fontWeight: '600', color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: '5px', padding: '1px 6px' }}>
+                              {opt.domain}
+                            </span>
+                          )}
+                          {opt.entity && (
+                            <span style={{ fontSize: '0.62rem', fontWeight: '600', color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: '5px', padding: '1px 6px' }}>
+                              {opt.entity}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {Array.isArray(opt.why_relevant) && opt.why_relevant.length > 0 && (
+                        <ul style={{ margin: '5px 0 0 24px', padding: 0, listStyle: 'none' }}>
+                          {opt.why_relevant.slice(0, 3).map((reason, i) => (
+                            <li key={i} style={{ fontSize: '0.68rem', color: C.textMuted, lineHeight: 1.5 }}>
+                              &#8226; {reason}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                       <button
                         type="button"
                         onClick={() => setExpanded(x => ({ ...x, [opt.id]: !x[opt.id] }))}
@@ -4108,6 +2541,19 @@ export function ClarificationCard({ clarification, wsInput, C, onBack, onResolve
           {clarification?.expected_impact && (
             <div style={{ fontSize: '0.70rem', color: C.textMuted, lineHeight: 1.45, marginBottom: '14px' }}>{clarification.expected_impact}</div>
           )}
+
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '14px', cursor: submitting ? 'not-allowed' : 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={remember}
+              disabled={submitting}
+              onChange={() => setRemember(r => !r)}
+              style={{ marginTop: '2px', flexShrink: 0 }}
+            />
+            <span style={{ fontSize: '0.74rem', color: C.textMuted, lineHeight: 1.4 }}>
+              Remember {termNames.length > 1 ? 'these choices' : 'this choice'} for future questions on this data source
+            </span>
+          </label>
 
           <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
             <button
@@ -4210,7 +2656,11 @@ function ComposerReportCard({ result, wsInput, C, onBack, onOpenReport }) {
                 </>
               )}
               <span style={{ fontSize: '0.69rem', color: C.textMuted, fontWeight: '600', alignSelf: 'center' }}>Source</span>
-              <span style={{ fontSize: '0.82rem', color: C.textSec }}>Uploaded dataset — report pipeline</span>
+              <span style={{ fontSize: '0.82rem', color: C.textSec }}>
+                {result.executive_report
+                  ? 'Live connected database — Executive Report pipeline'
+                  : 'Uploaded dataset — report pipeline'}
+              </span>
             </div>
             {/* Action buttons */}
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -4232,8 +2682,12 @@ function ComposerReportCard({ result, wsInput, C, onBack, onOpenReport }) {
             </div>
           </div>
 
-          {/* ── Summary from business_answer ── */}
-          {ba.answer && (
+          {/* ── Executive Report content: KPI cards, charts, tables, narrative ── */}
+          {result.executive_report ? (
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px', marginBottom: '12px' }}>
+              <ExecutiveReportContent report={result.executive_report} C={C} hideHeader />
+            </div>
+          ) : ba.answer && (
             <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px', marginBottom: '12px' }}>
               <div style={{ fontSize: '0.57rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: '10px' }}>Executive Summary</div>
               <div style={{ fontSize: '0.86rem', color: C.text, lineHeight: 1.6 }}>{ba.answer.replace(/^Report generated successfully\.\s*/i, '')}</div>
@@ -4270,7 +2724,222 @@ function ComposerReportCard({ result, wsInput, C, onBack, onOpenReport }) {
   )
 }
 
-export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, onResolveClarification, onCancelClarification, clarificationResubmitted }) {
+// Milestone M-32 — core.orchestrator.agent.AgentState.trace step names mapped
+// to plain language for "How this answer was prepared". Deliberately never
+// renders step.input_summary/output_summary (still concise but not written
+// for an end user) or any SQL/sample values — see agent.py's own TraceStep
+// docstring for what those fields may legitimately contain. An unmapped
+// tool name (a future trace step this list hasn't caught up with yet) falls
+// back to a humanized version of its own name rather than disappearing.
+const AGENT_TRACE_LABELS = {
+  resolve_intent:                'Understood the question',
+  plan_and_generate_sql:         'Built a data query plan',
+  prepare_selected_tables:       'Prepared metadata for selected tables',
+  inspect_targeted_values:       'Checked a limited set of values',
+  execute_sql:                   'Ran a read-only query',
+  validate_execution_result:     'Validated the returned result',
+  apply_conversation_context:    'Reused the previous question context',
+  apply_clarification_selection: 'Applied your clarification',
+  cancel_clarification:          'Cancelled clarification',
+  request_clarification:         'Identified a clarifying question to ask',
+  validate_join_path:            'Checked how the data connects',
+  build_business_answer:         'Prepared the final answer',
+  agent_loop:                    'Reached a processing limit',
+  compute_period_comparison_insight: 'Compared against the previous period',
+  // AI-first fast-path trace steps (api/v1/ai_first_composer_adapter.py).
+  ai_query_planning:             'AI query planning — intent, schema, and SQL determined in one call',
+}
+
+function agentTraceStepLabel(tool) {
+  return AGENT_TRACE_LABELS[tool] || String(tool || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+}
+
+// core.orchestrator.agent.AgentStatus values -> a controlled, non-alarming
+// display. Only execution_failed (an actual runtime failure, not a
+// deliberate stop) reads as a red/danger state — every other terminal
+// status here is the agent correctly refusing or asking rather than
+// guessing, so it renders as an amber/informational state instead of a
+// generic error, per this milestone's "controlled refusal" requirement.
+const AGENT_STATUS_DISPLAY = {
+  answered:               { label: 'Answered',              color: '#10b981', bg: 'rgba(16,185,129,0.08)' },
+  clarification_required: { label: 'Clarification Needed',  color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  safely_refused:         { label: 'Safely Refused',         color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  governance_blocked:     { label: 'Governance Blocked',     color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  execution_failed:       { label: 'Execution Failed',       color: '#f87171', bg: 'rgba(248,113,113,0.08)' },
+  validation_failed:      { label: 'Validation Issue',       color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  step_limit_reached:     { label: 'Step Limit Reached',     color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  // Phase 7, Step 6F, Part 6 — a truthful badge for a reset/expired-
+  // continuation turn: never shown as a green "answered" success (the
+  // envelope's own top-level `status` field stays "success" by design --
+  // the REQUEST succeeded, it's the CONTINUATION that could not be
+  // trusted), and never conflated with a generic error either.
+  state_reset:             { label: 'Context Reset',          color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  clarification_limit_reached: { label: 'Needs a Full Question', color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  question_too_long:       { label: 'Question Too Long',      color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+  // Phase 8A — a data source that is not enabled for question answering gets
+  // a typed, non-error answer (no query was run).
+  not_enabled:             { label: 'Not Enabled',            color: '#f59e0b', bg: 'rgba(245,158,11,0.08)' },
+}
+
+// core.sqlservice.fast_path_generation_service's RESOLUTION_TYPE_* values
+// -> a short, human-readable label for the Technical Details panel.
+const FOLLOW_UP_RESOLUTION_TYPE_LABELS = {
+  continuation:         'Continuation',
+  clarification_answer: 'Clarification Answer',
+  comparison:           'Comparison',
+  drill_down:           'Drill-down',
+  change:               'Changed Filter/Grouping/Sort',
+  unrelated:             'New, Unrelated Question',
+}
+
+// Compact, collapsed-by-default trace — "concise... safe agent progress/
+// evidence" per this milestone. Renders only step/status/mapped-label;
+// never input_summary/output_summary/reason_code/duration, never SQL.
+function AgentTraceSection({ trace, C }) {
+  if (!trace || trace.length === 0) return null
+  return (
+    <details style={{ marginTop: '12px', borderTop: `1px solid ${C.border}`, paddingTop: '10px' }}>
+      <summary style={{ cursor: 'pointer', fontSize: '0.68rem', color: C.textMuted, fontWeight: '600' }}>
+        How this answer was prepared
+      </summary>
+      <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '7px' }}>
+        {trace.map((step, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.72rem', color: C.textSec }}>
+            <span style={{
+              width: '6px', height: '6px', borderRadius: '50%', flexShrink: 0,
+              background: step.status === 'ok' ? '#10b981' : step.status === 'blocked' ? '#f59e0b' : '#f87171',
+            }} />
+            <span>{agentTraceStepLabel(step.tool)}</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
+// Milestone M-32 — the one place a follow-up question ("What about last
+// quarter?", "Only California.", "Top 5 instead.", "Break it down by
+// department.") can be asked without losing conversation_state. Only shown
+// when the backend actually returned a conversation_state to continue —
+// i.e. only after a real SQL-answerable turn (core.orchestrator.agent
+// AgentState with a resolved query_plan), never for catalog/governance/
+// dictionary answers or a clarification/report card. The frontend never
+// parses or validates the follow-up phrase itself — that is entirely the
+// backend's job (core.orchestrator.agent._classify_follow_up); this box
+// just sends whatever the user types as the next question, exactly like a
+// fresh question, with conversation_state attached.
+function FollowUpBox({ onAsk, C }) {
+  const [value, setValue] = useState('')
+
+  function submit(e) {
+    e.preventDefault()
+    const trimmed = value.trim()
+    if (!trimmed) return
+    onAsk(trimmed)
+    setValue('')
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+      <input
+        type="text"
+        value={value}
+        onChange={e => setValue(e.target.value)}
+        placeholder="Ask a follow-up — e.g. &quot;What about last quarter?&quot;"
+        aria-label="Ask a follow-up"
+        style={{ flex: 1, padding: '9px 12px', borderRadius: '9px', border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontFamily: FONT, fontSize: '0.78rem' }}
+      />
+      <button type="submit" disabled={!value.trim()} style={{ background: '#6366f1', border: 'none', borderRadius: '9px', padding: '9px 16px', fontSize: '0.78rem', fontWeight: '600', color: '#fff', cursor: value.trim() ? 'pointer' : 'default', opacity: value.trim() ? 1 : 0.5, fontFamily: FONT }}>
+        Ask
+      </button>
+    </form>
+  )
+}
+
+// Day 4, Capability 5 — Export. Round-trips the exact enterprise_answer/
+// agent_status this panel already received from composer/ask — never
+// re-derives or re-fetches anything. Renders nothing at all (not even a
+// disabled button) when the answer isn't in a state Day 4's own rule allows
+// exporting: still needs clarification, or the agent didn't reach
+// "answered" — the backend independently re-enforces the same gate
+// (api/v1/composer.py::composer_export -> core.answering.export_service
+// .check_exportable), so this is a UX affordance, not the only guard.
+const _EXPORT_FORMATS = [
+  { format: 'xlsx', label: 'Excel (.xlsx)' },
+  { format: 'csv', label: 'CSV' },
+  { format: 'pdf', label: 'PDF' },
+]
+
+// A successfully answered question: "answered" (agent-routed) or "ok" (AI-first
+// fast path). Must stay in sync with core/answering/export_service.py.
+const EXPORTABLE_AGENT_STATUSES = ['answered', 'ok']
+
+function ExportDropdown({ question, enterpriseAnswer, agentStatus, C, token, onSessionExpired }) {
+  const [open, setOpen] = useState(false)
+  const [busyFormat, setBusyFormat] = useState(null)
+  const [error, setError] = useState(null)
+
+  const exportable = !!enterpriseAnswer
+    && enterpriseAnswer.answer_type !== 'clarification_needed'
+    && (agentStatus == null || EXPORTABLE_AGENT_STATUSES.includes(agentStatus))
+
+  if (!exportable) return null
+
+  async function handleExport(format) {
+    setOpen(false)
+    setError(null)
+    setBusyFormat(format)
+    try {
+      await exportComposerAnswer(token, { question, enterpriseAnswer, agentStatus, format })
+    } catch (err) {
+      if (err?.message?.startsWith('401:')) { onSessionExpired?.(); return }
+      setError(err.message?.replace(/^\d+:\s*/, '') || 'Export failed.')
+    } finally {
+      setBusyFormat(null)
+    }
+  }
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        disabled={!!busyFormat}
+        aria-label="Export"
+        style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '9px', padding: '6px 14px', fontSize: '0.72rem', fontWeight: '600', color: C.textSec, cursor: busyFormat ? 'default' : 'pointer', fontFamily: FONT, display: 'inline-flex', alignItems: 'center', gap: '5px', opacity: busyFormat ? 0.6 : 1 }}
+      >
+        {busyFormat ? 'Exporting…' : 'Export'}
+        {!busyFormat && (
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        )}
+      </button>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 998 }} />
+          <div style={{ position: 'absolute', top: 'calc(100% + 4px)', right: 0, zIndex: 999, background: C.surface, border: `1px solid ${C.border}`, borderRadius: '10px', boxShadow: '0 8px 24px rgba(0,0,0,0.18)', overflow: 'hidden', minWidth: '140px' }}>
+            {_EXPORT_FORMATS.map(({ format, label }) => (
+              <button
+                key={format}
+                onClick={() => handleExport(format)}
+                style={{ display: 'block', width: '100%', textAlign: 'left', background: 'none', border: 'none', padding: '9px 14px', fontSize: '0.74rem', color: C.text, cursor: 'pointer', fontFamily: FONT }}
+                onMouseEnter={e => { e.currentTarget.style.background = C.bg }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'none' }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+      {error && (
+        <div style={{ position: 'absolute', top: 'calc(100% + 4px)', right: 0, zIndex: 999, background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: '8px', padding: '6px 10px', fontSize: '0.68rem', color: '#f87171', whiteSpace: 'nowrap' }}>
+          {error}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, onResolveClarification, onCancelClarification, clarificationResubmitted, onAskFollowUp, token, onSessionExpired }) {
   const [evidenceExpanded, setEvidenceExpanded] = useState(false)
 
   if (!result) return null
@@ -4290,6 +2959,38 @@ export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, 
   const intentLabel     = intentType.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
   const businessAnswer  = result.business_answer ?? null
   const enterpriseAnswer = result.enterprise_answer ?? null
+  // Milestone M-31/M-32 — additive-only agent fields. Absent entirely for
+  // the legacy (non-agent-routed) composer path, so every use below is
+  // conditional and the pre-M-31 rendering is otherwise untouched.
+  const agentStatus      = result.agent_status ?? null
+  const agentTrace       = result.agent_trace ?? []
+  const conversationState = result.conversation_state ?? null
+  // Phase 7, Step 6E3E, Part 1 -- additive-only; absent (null) for every
+  // non-fast-path response, so this renders nothing for those (same
+  // pattern as the M-31/M-32 agent fields above).
+  const planCacheStatus  = result.plan_cache_status ?? null
+  const planCacheNote    = result.plan_cache_note ?? null
+  // Phase 7, Step 6F, Part 6 — present only when this turn resolved
+  // against a prior turn's context (a genuine follow-up/clarification
+  // answer/comparison/drill-down/change); null for a fresh question.
+  // Never includes a row value or raw
+  // result data — see api/v1/ai_first_composer_adapter.py's own
+  // follow_up_resolution field docstring.
+  const followUpResolution     = result.follow_up_resolution ?? null
+  const resolvedStandaloneQuestion = followUpResolution?.resolved_standalone_question ?? null
+  const followUpResolutionType     = followUpResolution?.resolution_type ?? null
+  // Demo cleanup — everything below is developer/diagnostic content that
+  // used to render as always-visible cards; it now lives inside one
+  // collapsed "Technical details" section so the primary answer stays the
+  // focus. Sourced from enterpriseAnswer where it has its own (already
+  // 0-100) confidence/citations/source fields; falls back to the composer's
+  // intent-resolution confidence (0-1 scale) when there is no enterprise
+  // answer, so exactly one Confidence value is ever shown (no duplicate).
+  const citations        = enterpriseAnswer?.citations ?? []
+  const sourceTables      = enterpriseAnswer?.source_tables ?? []
+  const sourceColumns     = enterpriseAnswer?.source_columns ?? []
+  const hasSourceData     = sourceTables.length > 0 || sourceColumns.length > 0
+  const techConfidence    = enterpriseAnswer ? Math.round(enterpriseAnswer.confidence ?? 0) : Math.round(confidence * 100)
 
   // Route report_generation intent to the dedicated enterprise report card.
   if (intentType === 'report_generation') {
@@ -4300,21 +3001,45 @@ export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, 
   // answer gets its own focused card (business-friendly options, no unrelated
   // Evidence/Governance/Services sections) instead of the generic panel body.
   if (enterpriseAnswer?.answer_type === 'clarification_needed' && enterpriseAnswer.clarification) {
+    const clarificationOptions = enterpriseAnswer.clarification.options ?? []
+    // Phase 3, Step 3 — ClarificationCard itself keeps sending plain
+    // {term, table_fqn, column_name} selections (its own tests pin that
+    // exact shape). The chosen option's business label (e.g. "Customer"),
+    // needed as remember_synonym's canonical_term, is looked up here from
+    // the clarification payload already in scope and attached only for the
+    // parent's benefit — a pure addition, not a change to ClarificationCard.
+    function handleResolveWithLabels(selections, remember) {
+      const withLabels = selections.map(sel => {
+        const opt = clarificationOptions.find(o =>
+          o.term === sel.term && o.table_fqn === sel.table_fqn && (o.column_name ?? null) === (sel.column_name ?? null)
+        )
+        return { ...sel, label: opt?.label ?? null }
+      })
+      onResolveClarification(withLabels, remember)
+    }
     return (
       <ClarificationCard
         clarification={enterpriseAnswer.clarification}
         wsInput={wsInput}
         C={C}
         onBack={onBack}
-        onResolve={onResolveClarification}
+        onResolve={handleResolveWithLabels}
         onCancel={onCancelClarification}
+        onFreeTextResolve={onAskFollowUp}
         resubmitted={clarificationResubmitted}
       />
     )
   }
 
-  const statusColor = status === 'success' ? '#10b981' : status === 'partial' ? '#f59e0b' : '#f87171'
-  const statusBg    = status === 'success' ? 'rgba(16,185,129,0.08)' : status === 'partial' ? 'rgba(245,158,11,0.08)' : 'rgba(248,113,113,0.08)'
+  // Milestone M-32 — when the agent ran, its own status (a controlled
+  // refusal/clarification/block, not a generic error) drives the badge
+  // instead of the legacy success/partial/failed status, so a deliberate
+  // stop never reads as a red error. Absent agent_status (every non-agent
+  // response) renders exactly as before — no change for those paths.
+  const agentDisplay = agentStatus ? (AGENT_STATUS_DISPLAY[agentStatus] ?? null) : null
+  const statusColor = agentDisplay?.color ?? (status === 'success' ? '#10b981' : status === 'partial' ? '#f59e0b' : '#f87171')
+  const statusBg    = agentDisplay?.bg    ?? (status === 'success' ? 'rgba(16,185,129,0.08)' : status === 'partial' ? 'rgba(245,158,11,0.08)' : 'rgba(248,113,113,0.08)')
+  const statusLabel = agentDisplay?.label ?? status
 
   return (
     <div style={{ animation: 'ws-fadeup 0.35s ease' }}>
@@ -4331,8 +3056,12 @@ export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', background: statusBg, border: `1px solid ${statusColor}55`, borderRadius: '20px', padding: '3px 10px', fontSize: '0.57rem', fontWeight: '700', color: statusColor, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
             <span style={{ width: '5px', height: '5px', borderRadius: '50%', background: statusColor }} />
-            {status}
+            {statusLabel}
           </span>
+          <ExportDropdown
+            question={wsInput} enterpriseAnswer={enterpriseAnswer} agentStatus={agentStatus}
+            C={C} token={token} onSessionExpired={onSessionExpired}
+          />
           <button onClick={onBack} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '9px', padding: '6px 14px', fontSize: '0.72rem', fontWeight: '600', color: C.textSec, cursor: 'pointer', fontFamily: FONT }}>
             New Query
           </button>
@@ -4349,137 +3078,223 @@ export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, 
         ? <EnterpriseAnswerBlock answer={enterpriseAnswer} C={C} />
         : <BusinessAnswerBlock answer={businessAnswer} C={C} />}
 
-      {/* Row 1: Answer Context + Services Consulted */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
+      {/* Milestone M-32 — (only when the backend returned conversation_state
+          to continue) an inline follow-up box so a follow-up question never
+          has to go through "New Query" and lose context. Kept primary/
+          visible — it's part of the user's Q&A flow, not a diagnostic. The
+          agent trace itself moved into Technical details below. */}
+      {conversationState && onAskFollowUp && <FollowUpBox onAsk={onAskFollowUp} C={C} />}
 
-        {/* Answer Context */}
-        <div className="ws-section ws-s1" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '14px' }}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-            <span style={{ fontSize: '0.57rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Answer Context</span>
-          </div>
-          <div style={{ marginBottom: '11px' }}>
-            <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '3px' }}>Resolved Intent</div>
-            <div style={{ fontSize: '0.86rem', fontWeight: '600', color: C.text }}>{intentLabel}</div>
-          </div>
-          <div style={{ marginBottom: '11px' }}>
-            <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '5px' }}>Confidence</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <div style={{ flex: 1, height: '5px', background: C.border, borderRadius: '3px', overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${Math.round(confidence * 100)}%`, background: confidence >= 0.7 ? '#10b981' : confidence >= 0.4 ? '#f59e0b' : '#f87171', borderRadius: '3px', transition: 'width 0.5s ease' }} />
-              </div>
-              <span style={{ fontSize: '0.72rem', fontWeight: '700', color: C.text, minWidth: '30px' }}>{Math.round(confidence * 100)}%</span>
-            </div>
-          </div>
-          {keywords.length > 0 && (
-            <div>
-              <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Keywords Matched</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                {keywords.slice(0, 6).map(k => (
-                  <span key={k} style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: '20px', padding: '2px 8px', fontSize: '0.63rem', color: '#6366f1', fontWeight: '500' }}>{k}</span>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
+      {/* Technical details — everything below is developer/diagnostic
+          content (Confidence, Citations, Agent Trace, Answer Context,
+          Services Consulted, Evidence Summary, Governance/Warnings, and
+          raw source table/column identifiers), collapsed into one section
+          by design so the primary answer above stays the focus. Native
+          <details>, closed by default; nothing above depends on it. */}
+      <details className="ws-section ws-s1" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px', marginBottom: '12px' }}>
+        <summary style={{ cursor: 'pointer', fontSize: '0.68rem', color: C.textMuted, fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+          Technical details
+        </summary>
 
-        {/* Services Consulted */}
-        <div className="ws-section ws-s2" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '14px' }}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-            <span style={{ fontSize: '0.57rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Services Consulted</span>
-          </div>
-          {services.length > 0 ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              {services.map((svc, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '7px 10px', background: 'rgba(59,130,246,0.06)', border: '1px solid rgba(59,130,246,0.14)', borderRadius: '8px' }}>
-                  <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#3b82f6', flexShrink: 0 }} />
-                  <span style={{ fontSize: '0.74rem', color: C.text, fontFamily: MONO, fontWeight: '500' }}>{svc}</span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div style={{ fontSize: '0.77rem', color: C.textMuted, padding: '10px 0' }}>No services invoked</div>
-          )}
-        </div>
-      </div>
+        <div style={{ marginTop: '18px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
 
-      {/* Evidence Summary */}
-      <div className="ws-section ws-s3" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px', marginBottom: '12px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '14px' }}>
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-          <span style={{ fontSize: '0.57rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Evidence Summary</span>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px', marginBottom: evidenceItems.length > 0 ? '14px' : 0 }}>
-          {[
-            { label: 'Total Items',        value: evidenceSummary.total_items        ?? 0,   color: '#6366f1' },
-            { label: 'Attempted',          value: evidenceSummary.services_attempted ?? 0,   color: '#3b82f6' },
-            { label: 'Succeeded',          value: evidenceSummary.services_succeeded ?? 0,   color: '#10b981' },
-            { label: 'Has Errors',         value: evidenceSummary.has_errors ? 'Yes' : 'No', color: evidenceSummary.has_errors ? '#f87171' : '#10b981' },
-          ].map(({ label, value, color }) => (
-            <div key={label} style={{ textAlign: 'center', padding: '12px 8px', background: `${color}0d`, border: `1px solid ${color}22`, borderRadius: '10px' }}>
-              <div style={{ fontSize: '1.25rem', fontWeight: '700', color, fontFamily: MONO, lineHeight: 1 }}>{value}</div>
-              <div style={{ fontSize: '0.61rem', color: C.textMuted, marginTop: '5px', lineHeight: 1.3 }}>{label}</div>
-            </div>
-          ))}
-        </div>
-        {evidenceItems.length > 0 && (
+          {/* Confidence — the single confidence display for this answer;
+              prefers the enterprise answer's own (already 0-100) value,
+              falling back to intent-resolution confidence when there is
+              no enterprise answer. */}
           <div>
-            <button onClick={() => setEvidenceExpanded(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: C.textSec, fontFamily: FONT, fontSize: '0.72rem', fontWeight: '600' }}>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: evidenceExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s' }}><path d="m9 18 6-6-6-6"/></svg>
-              {evidenceExpanded ? 'Hide' : 'Show'} evidence items ({evidenceItems.length})
-            </button>
-            {evidenceExpanded && (
-              <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                {evidenceItems.map((item, i) => (
-                  <div key={item.evidence_id ?? i} style={{ padding: '9px 13px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px', display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: '10px', alignItems: 'center' }}>
-                    <span style={{ fontSize: '0.63rem', color: C.textMuted, fontFamily: MONO }}>{item.source_service}</span>
-                    <span style={{ fontSize: '0.72rem', color: C.text, fontWeight: '500' }}>{item.capability}</span>
-                    <span style={{ fontSize: '0.63rem', fontWeight: '700', color: (item.confidence ?? 0) >= 0.7 ? '#10b981' : (item.confidence ?? 0) >= 0.4 ? '#f59e0b' : '#f87171' }}>{Math.round((item.confidence ?? 0) * 100)}%</span>
-                  </div>
+            <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Confidence</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ flex: 1, height: '5px', background: C.border, borderRadius: '3px', overflow: 'hidden', maxWidth: '200px' }}>
+                <div style={{ height: '100%', width: `${techConfidence}%`, background: techConfidence >= 70 ? '#10b981' : techConfidence >= 40 ? '#f59e0b' : '#f87171', borderRadius: '3px', transition: 'width 0.4s ease' }} />
+              </div>
+              <span style={{ fontSize: '0.72rem', fontWeight: '700', color: C.textSec, minWidth: '30px' }}>{techConfidence}%</span>
+            </div>
+          </div>
+
+          {/* Citations */}
+          {citations.length > 0 && (
+            <div>
+              <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Citations</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px' }}>
+                {citations.map((c, i) => (
+                  <span key={i} title={c.reference || ''} style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '20px', padding: '3px 9px', fontSize: '0.65rem', color: C.textSec, fontWeight: '500' }}>
+                    {c.label || c.source_type || 'source'}
+                  </span>
                 ))}
+              </div>
+            </div>
+          )}
+
+          {/* Plan cache status. Only present for an AI-first fast-path
+              response that reached plan lookup; absent (not rendered)
+              for every other response shape. A HIT is never shown as "results from
+              cache" — the note is explicit that SQL still ran live. */}
+          {planCacheStatus && (
+            <div>
+              <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Plan Cache</div>
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: '5px', borderRadius: '20px', padding: '3px 10px',
+                fontSize: '0.65rem', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em',
+                background: planCacheStatus === 'HIT' ? 'rgba(16,185,129,0.10)' : 'rgba(148,163,184,0.10)',
+                border: `1px solid ${planCacheStatus === 'HIT' ? 'rgba(16,185,129,0.25)' : 'rgba(148,163,184,0.25)'}`,
+                color: planCacheStatus === 'HIT' ? '#10b981' : '#94a3b8',
+              }}>
+                Plan cache: {planCacheStatus === 'HIT' ? 'Hit' : 'Miss'}
+              </span>
+              {planCacheNote && (
+                <div style={{ fontSize: '0.70rem', color: C.textMuted, marginTop: '6px', lineHeight: 1.5 }}>{planCacheNote}</div>
+              )}
+            </div>
+          )}
+
+          {/* Follow-up resolution — Phase 7, Step 6F, Part 6. Only present
+              when this turn genuinely resolved against a prior turn;
+              shows WHAT was resolved (never a row value, never raw prior
+              context) so the user can verify their follow-up was
+              understood correctly before trusting the answer. */}
+          {followUpResolution && resolvedStandaloneQuestion && followUpResolutionType && followUpResolutionType !== 'none' && (
+            <div>
+              <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Follow-up Resolution</div>
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: '5px', borderRadius: '20px', padding: '3px 10px',
+                fontSize: '0.65rem', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em',
+                background: 'rgba(99,102,241,0.10)', border: '1px solid rgba(99,102,241,0.25)', color: '#6366f1',
+              }}>
+                {FOLLOW_UP_RESOLUTION_TYPE_LABELS[followUpResolutionType] ?? followUpResolutionType}
+              </span>
+              <div style={{ fontSize: '0.70rem', color: C.textSec, marginTop: '6px', lineHeight: 1.5 }}>
+                Understood as: <span style={{ fontWeight: '600', color: C.text }}>&ldquo;{resolvedStandaloneQuestion}&rdquo;</span>
+              </div>
+            </div>
+          )}
+
+          {/* Agent trace — keeps its own inner collapse for the step list */}
+          <AgentTraceSection trace={agentTrace} C={C} />
+
+          {/* Answer Context */}
+          <div>
+            <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '10px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Answer Context</div>
+            <div style={{ marginBottom: '11px' }}>
+              <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '3px' }}>Resolved Intent</div>
+              <div style={{ fontSize: '0.86rem', fontWeight: '600', color: C.text }}>{intentLabel}</div>
+            </div>
+            {keywords.length > 0 && (
+              <div>
+                <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '6px' }}>Keywords Matched</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                  {keywords.slice(0, 6).map(k => (
+                    <span key={k} style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: '20px', padding: '2px 8px', fontSize: '0.63rem', color: '#6366f1', fontWeight: '500' }}>{k}</span>
+                  ))}
+                </div>
               </div>
             )}
           </div>
-        )}
-      </div>
 
-      {/* Governance + Warnings */}
-      {(governanceState || warnings.length > 0 || errors.length > 0) && (
-        <div style={{ display: 'grid', gridTemplateColumns: governanceState && (warnings.length > 0 || errors.length > 0) ? '1fr 1fr' : '1fr', gap: '12px', marginBottom: '12px' }}>
-          {governanceState && (
-            <div className="ws-section ws-s4" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '12px' }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                <span style={{ fontSize: '0.57rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Governance</span>
+          {/* Services Consulted */}
+          <div>
+            <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '10px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Services Consulted</div>
+            {services.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                {services.map((svc, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '7px 10px', background: 'rgba(59,130,246,0.06)', border: '1px solid rgba(59,130,246,0.14)', borderRadius: '8px' }}>
+                    <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#3b82f6', flexShrink: 0 }} />
+                    <span style={{ fontSize: '0.74rem', color: C.text, fontFamily: MONO, fontWeight: '500' }}>{svc}</span>
+                  </div>
+                ))}
               </div>
-              <div style={{ fontSize: '0.85rem', fontWeight: '600', color: C.text }}>{governanceState}</div>
+            ) : (
+              <div style={{ fontSize: '0.77rem', color: C.textMuted }}>No services invoked</div>
+            )}
+          </div>
+
+          {/* Evidence Summary */}
+          <div>
+            <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '10px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Evidence Summary</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px', marginBottom: evidenceItems.length > 0 ? '14px' : 0 }}>
+              {[
+                { label: 'Total Items',        value: evidenceSummary.total_items        ?? 0,   color: '#6366f1' },
+                { label: 'Attempted',          value: evidenceSummary.services_attempted ?? 0,   color: '#3b82f6' },
+                { label: 'Succeeded',          value: evidenceSummary.services_succeeded ?? 0,   color: '#10b981' },
+                { label: 'Has Errors',         value: evidenceSummary.has_errors ? 'Yes' : 'No', color: evidenceSummary.has_errors ? '#f87171' : '#10b981' },
+              ].map(({ label, value, color }) => (
+                <div key={label} style={{ textAlign: 'center', padding: '12px 8px', background: `${color}0d`, border: `1px solid ${color}22`, borderRadius: '10px' }}>
+                  <div style={{ fontSize: '1.25rem', fontWeight: '700', color, fontFamily: MONO, lineHeight: 1 }}>{value}</div>
+                  <div style={{ fontSize: '0.61rem', color: C.textMuted, marginTop: '5px', lineHeight: 1.3 }}>{label}</div>
+                </div>
+              ))}
+            </div>
+            {evidenceItems.length > 0 && (
+              <div>
+                <button onClick={() => setEvidenceExpanded(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: C.textSec, fontFamily: FONT, fontSize: '0.72rem', fontWeight: '600' }}>
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: evidenceExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s' }}><path d="m9 18 6-6-6-6"/></svg>
+                  {evidenceExpanded ? 'Hide' : 'Show'} evidence items ({evidenceItems.length})
+                </button>
+                {evidenceExpanded && (
+                  <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {evidenceItems.map((item, i) => (
+                      <div key={item.evidence_id ?? i} style={{ padding: '9px 13px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px', display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: '10px', alignItems: 'center' }}>
+                        <span style={{ fontSize: '0.63rem', color: C.textMuted, fontFamily: MONO }}>{item.source_service}</span>
+                        <span style={{ fontSize: '0.72rem', color: C.text, fontWeight: '500' }}>{item.capability}</span>
+                        <span style={{ fontSize: '0.63rem', fontWeight: '700', color: (item.confidence ?? 0) >= 0.7 ? '#10b981' : (item.confidence ?? 0) >= 0.4 ? '#f59e0b' : '#f87171' }}>{Math.round((item.confidence ?? 0) * 100)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Governance + Warnings */}
+          {(governanceState || warnings.length > 0 || errors.length > 0) && (
+            <div style={{ display: 'grid', gridTemplateColumns: governanceState && (warnings.length > 0 || errors.length > 0) ? '1fr 1fr' : '1fr', gap: '12px' }}>
+              {governanceState && (
+                <div>
+                  <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '8px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Governance</div>
+                  <div style={{ fontSize: '0.85rem', fontWeight: '600', color: C.text }}>{governanceState}</div>
+                </div>
+              )}
+              {(warnings.length > 0 || errors.length > 0) && (
+                <div>
+                  <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '8px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Warnings</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {warnings.map((w, i) => (
+                      <div key={i} style={{ display: 'flex', gap: '7px', alignItems: 'flex-start', fontSize: '0.76rem', color: '#d97706', lineHeight: 1.45 }}>
+                        <span style={{ marginTop: '1px', flexShrink: 0 }}>&#9888;</span>
+                        <span>{w}</span>
+                      </div>
+                    ))}
+                    {errors.map((e, i) => (
+                      <div key={`err_${i}`} style={{ display: 'flex', gap: '7px', alignItems: 'flex-start', fontSize: '0.76rem', color: '#f87171', lineHeight: 1.45 }}>
+                        <span style={{ marginTop: '1px', flexShrink: 0 }}>&#10005;</span>
+                        <span>{typeof e === 'string' ? e : JSON.stringify(e)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
-          {(warnings.length > 0 || errors.length > 0) && (
-            <div className="ws-section ws-s5" style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '14px', padding: '18px 20px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '12px' }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                <span style={{ fontSize: '0.57rem', fontWeight: '700', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Warnings</span>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                {warnings.map((w, i) => (
-                  <div key={i} style={{ display: 'flex', gap: '7px', alignItems: 'flex-start', fontSize: '0.76rem', color: '#d97706', lineHeight: 1.45 }}>
-                    <span style={{ marginTop: '1px', flexShrink: 0 }}>&#9888;</span>
-                    <span>{w}</span>
-                  </div>
-                ))}
-                {errors.map((e, i) => (
-                  <div key={`err_${i}`} style={{ display: 'flex', gap: '7px', alignItems: 'flex-start', fontSize: '0.76rem', color: '#f87171', lineHeight: 1.45 }}>
-                    <span style={{ marginTop: '1px', flexShrink: 0 }}>&#10005;</span>
-                    <span>{typeof e === 'string' ? e : JSON.stringify(e)}</span>
-                  </div>
-                ))}
-              </div>
+
+          {/* Source table/column identifiers — raw technical identifiers,
+              never shown in the primary answer by design. */}
+          {hasSourceData && (
+            <div>
+              <div style={{ fontSize: '0.68rem', color: C.textMuted, marginBottom: '8px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Source Data</div>
+              {sourceTables.length > 0 && (
+                <div style={{ fontSize: '0.68rem', color: C.textSec, marginBottom: '6px' }}>
+                  <span style={{ color: C.textMuted }}>Source table(s): </span>{sourceTables.join(', ')}
+                </div>
+              )}
+              {sourceColumns.length > 0 && (
+                <div style={{ fontSize: '0.68rem', color: C.textSec, wordBreak: 'break-word' }}>
+                  <span style={{ color: C.textMuted }}>Source column(s): </span>{sourceColumns.join(', ')}
+                </div>
+              )}
             </div>
           )}
         </div>
-      )}
+      </details>
 
       {/* Next Suggested Action */}
       {nextAction && (
@@ -4500,14 +3315,14 @@ export function ComposerResultPanel({ result, wsInput, C, onBack, onOpenReport, 
 // ─── AI Workspace — main export ───────────────────────────────────────────────
 
 export default function AIWorkspace({
-  C, S,
+  C,
   token, onSessionExpired,
   user,
   datasetList,
   selectedDatasetId, setSelectedDatasetId,
   datasetExplicit, setDatasetExplicit,
   externalResult, externalLoading, externalError,
-  setActiveNav, onOpenReport, onExportReport,
+  setActiveNav, onOpenReport,
   onUploadDataset,
   onExecutionComplete,
   contextStats,
@@ -4521,26 +3336,25 @@ export default function AIWorkspace({
   const [wsExecDurationMs,  setWsExecDurationMs]  = useState(null)
   const [wsError,           setWsError]           = useState(null)
   const [wsProposal,        setWsProposal]        = useState(null)
-  const [wsProposalLoading, setWsProposalLoading] = useState(false)
+  const [wsProposalLoading] = useState(false)
   const [wsProposalError,   setWsProposalError]   = useState(null)
   const [wsEmail,           setWsEmail]           = useState('')
-  const [dsPicker,          setDsPicker]          = useState(false)
   const [enginePlan,        setEnginePlan]        = useState(null)
   const [enginePlanLoading, setEnginePlanLoading] = useState(false)
   const [savedToolId,       setSavedToolId]       = useState(null)
   const [toolStatus,        setToolStatus]        = useState(null)
   const [engineBusy,        setEngineBusy]        = useState(null)
   const [toast,             setToast]             = useState(null)
+  // Phase 3, Step 3 — remembered_term_conflict: {sourceId, term, tableFqn,
+  // columnName, existingCanonicalTerm, requestedCanonicalTerm} or null.
+  const [rememberConflict,      setRememberConflict]      = useState(null)
+  const [rememberConflictBusy,  setRememberConflictBusy]  = useState(false)
   const [showRawJson,       setShowRawJson]       = useState(false)
   const [planDatasetId,     setPlanDatasetId]     = useState(null)
   const [backToComposer,    setBackToComposer]    = useState(false)
-  const [savedWorkflows,    setSavedWorkflows]    = useState([])
-  const [engineTools,       setEngineTools]       = useState([])
-  const [workflowSaving,    setWorkflowSaving]    = useState(false)
-  const [wsRunSource,       setWsRunSource]       = useState(null) // null | workflow title string
+  const [,                  setWsRunSource]       = useState(null) // null | workflow title string
   const [dsPendingRun,      setDsPendingRun]      = useState(null) // pending run args awaiting dataset confirmation
   const [noDsWarning,       setNoDsWarning]       = useState(false)
-  const [dsSearch,          setDsSearch]          = useState('')
   const [composerResult,    setComposerResult]    = useState(null)
   const [composerLoading,   setComposerLoading]   = useState(false)
   const [clarificationResubmitted, setClarificationResubmitted] = useState(false)
@@ -4549,13 +3363,30 @@ export default function AIWorkspace({
   const [sourcePicker,        setSourcePicker]        = useState(false)
   const [sourceSearch,        setSourceSearch]        = useState('')
 
-  useEffect(() => { if (externalLoading) { setWsResult(null); setWsError(null) } }, [externalLoading])
-  useEffect(() => { if (externalResult) setWsResult(externalResult) }, [externalResult])
-  useEffect(() => { if (externalError) setWsError(externalError) }, [externalError])
-  useEffect(() => { if (token) loadEngineTools() }, [token])
-  useEffect(() => { if (token) loadDataSources() }, [token])
-  useEffect(() => { if (!dsPicker) setDsSearch('') }, [dsPicker])
-  useEffect(() => { if (!sourcePicker) setSourceSearch('') }, [sourcePicker])
+  // Milestone M-31/M-32 — AI Analyst Agent conversation context. See
+  // frontend/src/hooks/useConversationState.js for the storage/reset
+  // contract; conversation.reset() below is the ONLY place that starts a
+  // genuinely new conversation (fresh conversation_id, no carried state).
+  const conversation = useConversationState()
+
+  const loadDataSources = useCallback(async () => {
+    try {
+      const data    = await listDataSources(token)
+      const sources = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
+      setDataSourceList(sources)
+    } catch { /* silently ignore — don't block primary UX */ }
+  }, [token])
+
+  useEffect(() => { if (externalLoading) queueMicrotask(() => { setWsResult(null); setWsError(null) }) }, [externalLoading])
+  useEffect(() => { if (externalResult) queueMicrotask(() => setWsResult(externalResult)) }, [externalResult])
+  useEffect(() => { if (externalError) queueMicrotask(() => setWsError(externalError)) }, [externalError])
+  useEffect(() => { if (token) queueMicrotask(() => void loadDataSources()) }, [token, loadDataSources])
+  useEffect(() => { if (!sourcePicker) queueMicrotask(() => setSourceSearch('')) }, [sourcePicker])
+  // Conversation context is scoped to one data source and one authenticated
+  // user — switching either means a different conversation, never a
+  // follow-up of the old one.
+  useEffect(() => { queueMicrotask(() => conversation.reset()) }, [selectedDataSourceId]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { queueMicrotask(() => conversation.reset()) }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeResult       = wsResult
   const activeLoading      = wsLoading || externalLoading
@@ -4568,40 +3399,6 @@ export default function AIWorkspace({
   const activeSource       = dataSourceList?.find(s => s.id === selectedDataSourceId) || null
   const isEmailIntent      = ['email', 'send', 'mail'].some(kw => wsInput.toLowerCase().includes(kw))
   const disabled           = wsLoading || wsProposalLoading || enginePlanLoading || composerLoading || !wsInput.trim()
-  const workflowAlreadySaved = wsInput.trim().length > 0 && savedWorkflows.some(wf => wf.intent === wsInput.trim())
-
-  // Merge session-saved workflows (rich metadata) with backend engine tools loaded on mount.
-  // Session entries take priority — they carry the original intent string.
-  const sessionToolIds = new Set(savedWorkflows.map(w => w.toolId).filter(Boolean))
-  const allWorkflows = [
-    ...savedWorkflows,
-    ...engineTools
-      .filter(t => t.status !== 'deprecated' && !sessionToolIds.has(t.tool_id))
-      .map(t => ({
-        id:           t.tool_id,
-        toolId:       t.tool_id,
-        title:        t.description || slugToTitle(t.name) || t.name || 'Saved Workflow',
-        intent:       t.description || t.name || '',
-        datasetId:    null,
-        datasetName:  null,
-        createdAt:    t.created_at || new Date().toISOString(),
-        backendSaved: true,
-      })),
-  ]
-
-  async function handleCompose() {
-    setWsProposalError(null); setWsProposal(null)
-    const trimmed = wsInput.trim()
-    if (!trimmed || trimmed.length < 5) { setWsProposalError('Please enter a task description (at least 5 characters).'); return }
-    setWsProposalLoading(true)
-    try {
-      const data = await composeIntent(trimmed, selectedDatasetId || null, token, true)
-      setWsProposal(data?.data ?? null)
-    } catch (err) {
-      if (err?.message?.startsWith('401:')) { onSessionExpired(); return }
-      setWsProposalError(err.message?.replace(/^\d+:\s*/, '') || 'Failed to compose plan.')
-    } finally { setWsProposalLoading(false) }
-  }
 
   function showToast(text, ok = true) {
     setToast({ text, ok })
@@ -4647,16 +3444,28 @@ export default function AIWorkspace({
     setClarificationResubmitted(!!clarificationPayload)
     execStartedAtRef.current = Date.now()
     try {
-      const sessionId = `ws_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-      const payload = {
-        session_id:           sessionId,
-        message:              query,
-        selected_data_source: selectedDataSourceId ?? null,
-      }
-      if (datasetId != null) payload.dataset_id = datasetId
-      if (clarificationPayload?.clarification_selection) payload.clarification_selection = clarificationPayload.clarification_selection
-      if (clarificationPayload?.cancel_clarification) payload.cancel_clarification = true
+      // Milestone M-31/M-32 — session_id doubles as the AI Analyst Agent's
+      // conversation_id, so it must stay stable across turns of the SAME
+      // conversation (conversation.conversationId only rotates on
+      // conversation.reset() — source change, auth change, or an explicit
+      // new conversation). Regenerating it per request, as before, would
+      // make every follow-up/clarification-resume request look like a
+      // brand-new, unrelated conversation to the backend's isolation check.
+      // buildComposerPayload is the one place conversation_state is attached
+      // — used identically for a fresh question, a follow-up, a
+      // clarification resume, and a clarification cancel, never a separate
+      // path per caller.
+      const payload = buildComposerPayload({
+        conversationId:          conversation.conversationId,
+        message:                 query,
+        selectedDataSourceId:    selectedDataSourceId ?? null,
+        datasetId,
+        clarificationSelection:  clarificationPayload?.clarification_selection ?? null,
+        cancelClarification:     !!clarificationPayload?.cancel_clarification,
+        conversationState:       conversation.forSource(selectedDataSourceId ?? null),
+      })
       const data = await askComposer(token, payload)
+      conversation.capture(data, selectedDataSourceId ?? null)
       setComposerResult(data)
     } catch (err) {
       if (err?.message?.startsWith('401:')) { onSessionExpired(); return }
@@ -4671,8 +3480,66 @@ export default function AIWorkspace({
   // backend is stateless: it re-derives the query plan from `message` and
   // only reads clarification_selection/cancel_clarification (no session
   // continuity required).
-  function handleClarificationResolve(selections) {
+  //
+  // Phase 2, Step 7b — when the user opted in via ClarificationCard's
+  // "remember this choice" checkbox, also promote each selection to an
+  // approved concept_table_mappings row (POST /v1/sources/{id}/concept-
+  // mappings), so a future question using the same term resolves directly
+  // instead of asking again. Best-effort and non-blocking: a failure here
+  // must never prevent the original question from being answered — it only
+  // means the choice wasn't remembered, which the user can simply redo.
+  function handleClarificationResolve(selections, remember = false) {
     handleComposerAsk(wsInput, null, { clarification_selection: selections })
+    if (remember && selectedDataSourceId != null) {
+      for (const sel of selections) {
+        promoteConceptMapping(
+          selectedDataSourceId,
+          { conceptTerm: sel.term, tableFqn: sel.table_fqn, columnName: sel.column_name, canonicalTerm: sel.label },
+          token,
+        ).then(res => {
+          // Phase 3, Step 3 — a 409 remembered_term_conflict is returned as
+          // data (see client.js), not thrown, so it lands here rather than
+          // in .catch(). Surfacing it never touches the question/answer
+          // flow above, which has already been kicked off independently.
+          if (res?.reason === 'remembered_term_conflict') {
+            setRememberConflict({
+              sourceId: selectedDataSourceId,
+              term: sel.term,
+              tableFqn: sel.table_fqn,
+              columnName: sel.column_name,
+              existingCanonicalTerm: res.existing_canonical_term,
+              requestedCanonicalTerm: res.requested_canonical_term,
+            })
+          }
+        }).catch(err => console.warn('Failed to remember clarification choice:', err))
+      }
+    }
+  }
+
+  function handleKeepExistingMeaning() {
+    // No request sent — the previously remembered meaning is left as-is.
+    setRememberConflict(null)
+  }
+
+  function handleReplaceRememberedMeaning() {
+    if (!rememberConflict) return
+    setRememberConflictBusy(true)
+    promoteConceptMapping(
+      rememberConflict.sourceId,
+      {
+        conceptTerm: rememberConflict.term,
+        tableFqn: rememberConflict.tableFqn,
+        columnName: rememberConflict.columnName,
+        canonicalTerm: rememberConflict.requestedCanonicalTerm,
+        confirmReplace: true,
+      },
+      token,
+    ).then(() => {
+      showToast(`Updated — "${rememberConflict.term}" now means "${rememberConflict.requestedCanonicalTerm}".`)
+      setRememberConflict(null)
+    }).catch(err => {
+      showToast(err.message?.replace(/^\d+:\s*/, '') || 'Failed to update remembered terminology.', false)
+    }).finally(() => setRememberConflictBusy(false))
   }
 
   function handleClarificationCancel() {
@@ -4736,7 +3603,8 @@ export default function AIWorkspace({
       return
     }
     // A selected live data source always routes through the Enterprise Composer —
-    // Composer + IntentResolver decide SQL/metadata/governance/dictionary/answer
+    // Composer routes SQL sources to the AI-first path; dataset and catalog
+    // capabilities use their dedicated application routes.
     // classification server-side; the frontend no longer pre-classifies this case
     // with a regex. Mutual exclusion in the dataset/source pickers guarantees
     // selectedDatasetId is null whenever selectedDataSourceId is set, so this
@@ -4810,177 +3678,26 @@ export default function AIWorkspace({
     setEnginePlan(null); setSavedToolId(null); setToolStatus(null)
     setEngineBusy(null); setToast(null); setShowRawJson(false); setPlanDatasetId(null); setBackToComposer(false); setWsRunSource(null)
     setComposerResult(null); setComposerLoading(false); setClarificationResubmitted(false)
-    // savedWorkflows + engineTools intentionally preserved — they are the persistent library
-  }
-
-  async function loadEngineTools() {
-    try {
-      const data  = await listEngineTools(token)
-      const tools = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
-      setEngineTools(tools)
-    } catch { /* silently ignore — don't block primary UX */ }
-  }
-
-  async function loadDataSources() {
-    try {
-      const data    = await listDataSources(token)
-      const sources = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
-      setDataSourceList(sources)
-    } catch { /* silently ignore — don't block primary UX */ }
-  }
-
-  async function handleSaveWorkflow() {
-    const intent = wsInput.trim()
-    if (!intent || workflowSaving) return
-    if (savedWorkflows.some(wf => wf.intent === intent)) return
-
-    setWorkflowSaving(true)
-    try {
-      // Step 1: generate tool definition from intent
-      const context  = selectedDatasetId ? { dataset_id: selectedDatasetId } : null
-      const planData = await planEngineTool(intent, token, context)
-      const toolDef  = planData?.data ?? planData
-
-      // Step 2: persist tool definition to engine backend
-      const scheduleType   = extractScheduleType(intent)
-      const toolDefToSave  = scheduleType
-        ? { ...toolDef, schedule: { enabled: true, schedule_type: scheduleType, timezone: 'UTC', cron: '' } }
-        : toolDef
-      const saveData = await saveEngineTool(toolDefToSave, token)
-      const saved    = saveData?.data ?? saveData
-      const toolId   = saved?.tool_id ?? null
-
-      // Step 3: add to local session list with full metadata
-      const dsRecord = datasetList?.find(d => d.id === selectedDatasetId)
-      const wf = {
-        id:           toolId || Date.now().toString(),
-        toolId,
-        title:        intel?.title || toolDef?.description || (intent.length > 60 ? intent.slice(0, 60) + '…' : intent),
-        intent,
-        datasetId:    selectedDatasetId || null,
-        datasetName:  dsRecord?.filename || null,
-        createdAt:    new Date().toISOString(),
-        backendSaved: true,
-        scheduleType: scheduleType || null,
-      }
-      setSavedWorkflows(prev => [wf, ...prev.filter(w => w.intent !== intent)])
-
-      // Step 4: refresh backend list so panel stays in sync
-      loadEngineTools()
-
-      showToast('Saved to Tools Library')
-    } catch (err) {
-      if (err?.message?.startsWith('401:')) { onSessionExpired(); return }
-      showToast(err.message?.replace(/^\d+:\s*/, '') || 'Failed to save workflow — please try again.', false)
-    } finally {
-      setWorkflowSaving(false)
-    }
-  }
-
-  async function handleRunWorkflow(wf) {
-    // Restore intent + dataset into composer for display and future edits
-    setWsInput(wf.intent)
-    if (wf.datasetId) setSelectedDatasetId(wf.datasetId)
-
-    // If no backend tool ID, fall back to intent-based rerun
-    if (!wf.toolId) {
-      handleRun(null, null, wf.intent, wf.datasetId || null)
-      return
-    }
-
-    // ── Engine tool execution path ─────────────────────────────────────────
-    setWsError(null); setWsLoading(true); setWsResult(null); setWsExecDurationMs(null)
-    setBackToComposer(false); setWsRunSource(null)
-    execStartedAtRef.current = Date.now()
-
-    async function pollRun(runId) {
-      const MAX = 30
-      for (let i = 0; i < MAX; i++) {
-        const d   = await getEngineRun(runId, token)
-        const run = d?.data ?? d
-        const s   = (run?.status ?? '').toLowerCase()
-        if (s === 'completed' || s === 'success' || s === 'done') return run
-        if (s === 'failed' || s === 'error' || s === 'cancelled') {
-          throw new Error(run?.error_message || run?.error || 'Workflow execution failed')
-        }
-        await new Promise(r => setTimeout(r, 1500))
-      }
-      throw new Error('Workflow execution timed out — please try again.')
-    }
-
-    function normalizeRun(raw) {
-      // Case 1: engine wraps the interpret result under .result
-      if (raw?.result?.dataset_report) {
-        return { ...raw.result, started_at: raw.started_at, finished_at: raw.finished_at }
-      }
-      // Case 2: .result has a status (interpret-compatible flat object)
-      if (raw?.result?.status) {
-        return {
-          ...raw.result,
-          started_at: raw.started_at ?? raw.result.started_at,
-          finished_at: raw.finished_at ?? raw.result.finished_at,
-        }
-      }
-      // Case 3: result already IS the interpret-compatible shape
-      if (raw?.dataset_report) return raw
-      // Case 1.5: report is embedded inside engine RunRecord step_results.
-      // The engine stores generate_dataset_report output in
-      // step_results[].output.report — normalizeRun must pull it out here
-      // so extractIntel() receives a dataset_report and renders the full canvas.
-      const reportStep = (raw?.step_results ?? []).find(
-        s => s.action_type === 'generate_dataset_report' && s.output?.report
-      )
-      if (reportStep) {
-        return {
-          dataset_report: reportStep.output.report,
-          status:         raw.status,
-          started_at:     raw.started_at,
-          finished_at:    raw.finished_at,
-        }
-      }
-      // Case 4: basic completion only
-      return {
-        status:     raw?.status || 'completed',
-        task_type:  'workflow_execution',
-        started_at: raw?.started_at,
-        finished_at: raw?.finished_at,
-      }
-    }
-
-    try {
-      const inputs = {}
-      if (wf.datasetId) inputs.dataset_id  = wf.datasetId
-      if (wf.intent)    inputs.intent_text = wf.intent   // forwarded so the engine report remains intent-aware
-
-      const execData = await executeEngineTool(wf.toolId, inputs, token)
-      const exec     = execData?.data ?? execData
-
-      // Handle async (run_id returned) vs synchronous (result inline) execution
-      let runResult = exec
-      const status  = (exec?.status ?? '').toLowerCase()
-      if (exec?.run_id && (status === 'running' || status === 'pending' || status === 'queued')) {
-        runResult = await pollRun(exec.run_id)
-      }
-
-      const normalized = normalizeRun(runResult)
-      setWsExecDurationMs(execStartedAtRef.current ? Date.now() - execStartedAtRef.current : null)
-      setWsResult(normalizeExecutionResult(normalized))
-      if (onExecutionComplete) onExecutionComplete()
-      setWsRunSource(wf.title)  // marks result as coming from a saved workflow
-    } catch (err) {
-      if (err?.message?.startsWith('401:')) { onSessionExpired(); return }
-      // Graceful fallback — show a message and rerun via interpretTask
-      showToast('Engine execution unavailable — running from intent…', false)
-      handleRun(null, null, wf.intent, wf.datasetId || null)
-    } finally {
-      setWsLoading(false)
-    }
+    // "New Query"/"Try Again" — the user is explicitly starting over, so the
+    // AI Analyst Agent conversation resets too (fresh conversation_id, no
+    // carried-over context). Asking a follow-up without losing context uses
+    // ComposerResultPanel's own inline follow-up box instead, which calls
+    // handleComposerAsk directly and never goes through handleReset.
+    conversation.reset()
+    // Session-saved workflow state is preserved until the page is reloaded.
   }
 
   return (
     <div style={{ fontFamily: FONT, paddingRight: '16px' }}>
       <style>{WS_STYLES}</style>
       <Toast toast={toast} />
+      <RememberConflictPanel
+        conflict={rememberConflict}
+        busy={rememberConflictBusy}
+        onKeep={handleKeepExistingMeaning}
+        onReplace={handleReplaceRememberedMeaning}
+        C={C}
+      />
 
       {/* Hidden file input */}
       <input ref={fileInputRef} type="file" accept=".csv,.xlsx,.xls,.json,.sql" style={{ display: 'none' }}
@@ -5146,117 +3863,27 @@ export default function AIWorkspace({
                   </div>
                 )}
 
-                {/* ── SELECT DATASET section ── */}
-                <div style={{ marginBottom: '20px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-                    <span style={{ fontSize: '0.63rem', fontWeight: '600', color: C.text, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Select Dataset</span>
-                  </div>
-
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                    {/* Dataset dropdown */}
-                    <div style={{ position: 'relative', flex: 1, minWidth: '180px' }}>
-                      {dsPicker && <div style={{ position: 'fixed', inset: 0, zIndex: 998 }} onClick={() => setDsPicker(false)} />}
-                      <button className="ws-ghost-btn" onClick={() => setDsPicker(o => !o)}
-                        style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', background: (activeDs && datasetExplicit) ? 'rgba(99,102,241,0.07)' : (activeDs && !datasetExplicit) ? 'rgba(245,158,11,0.07)' : C.bg, border: `1px solid ${(activeDs && datasetExplicit) ? 'rgba(99,102,241,0.35)' : (activeDs && !datasetExplicit) ? 'rgba(245,158,11,0.45)' : C.border}`, borderRadius: '10px', padding: '9px 14px', fontSize: '0.76rem', color: (activeDs && datasetExplicit) ? '#6366f1' : (activeDs && !datasetExplicit) ? '#d97706' : C.textSec, cursor: 'pointer', fontFamily: FONT, fontWeight: '400', textAlign: 'left', position: 'relative', zIndex: 999 }}>
-                        <span style={{ flex: 1 }}>{activeDs ? activeDs.filename : 'Choose an existing dataset'}</span>
-                        {activeDs && !datasetExplicit && <span style={{ fontSize: '0.60rem', fontWeight: '600', color: '#d97706', background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.30)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>confirm</span>}
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.5, flexShrink: 0 }}><path d="m6 9 6 6 6-6"/></svg>
-                      </button>
-
-                      {dsPicker && (
-                        <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 999, width: '100%', minWidth: '260px', background: C.surface, border: `1px solid ${C.borderAlt}`, borderRadius: '12px', boxShadow: '0 8px 28px rgba(0,0,0,0.16)', overflow: 'hidden', animation: 'ws-fadeup 0.15s ease' }}>
-                          {/* Search */}
-                          <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '7px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '7px', padding: '5px 9px' }}>
-                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                              <input
-                                autoFocus
-                                type="text"
-                                placeholder="Search…"
-                                value={dsSearch}
-                                onChange={e => setDsSearch(e.target.value)}
-                                style={{ flex: 1, background: 'none', border: 'none', outline: 'none', fontSize: '0.74rem', color: C.text, fontFamily: FONT, caretColor: '#6366f1' }}
-                              />
-                              {dsSearch && (
-                                <button onClick={() => setDsSearch('')} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', color: C.textMuted }}>
-                                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                          {/* List */}
-                          <div style={{ maxHeight: '240px', overflowY: 'auto', overscrollBehavior: 'contain' }}>
-                            {(() => {
-                              const q = dsSearch.toLowerCase().trim()
-                              const filtered = (datasetList || []).filter(ds => ds.filename.toLowerCase().includes(q))
-                              if (!datasetList?.length) return (
-                                <div style={{ padding: '18px', textAlign: 'center', color: C.textMuted, fontSize: '0.76rem' }}>No datasets uploaded.</div>
-                              )
-                              if (!filtered.length) return (
-                                <div style={{ padding: '18px', textAlign: 'center', color: C.textMuted, fontSize: '0.76rem' }}>No matches for "{dsSearch}"</div>
-                              )
-                              return filtered.map(ds => {
-                                const isSel = ds.id === selectedDatasetId
-                                const type  = getFileType(ds.filename)
-                                const tc    = DS_COLOR[type] || C.textSec
-                                const tbg   = DS_BG[type] || C.borderAlt
-                                return (
-                                  <div key={ds.id} onClick={() => { setSelectedDatasetId(ds.id); setSelectedDataSourceId(null); setDatasetExplicit(true); setDsPendingRun(null); setNoDsWarning(false); setDsPicker(false) }}
-                                    style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 12px', cursor: 'pointer', background: isSel ? 'rgba(99,102,241,0.08)' : 'transparent', borderBottom: `1px solid ${C.border}`, transition: 'background 0.1s' }}
-                                    onMouseEnter={e => { if (!isSel) e.currentTarget.style.background = C.borderAlt }}
-                                    onMouseLeave={e => { if (!isSel) e.currentTarget.style.background = 'transparent' }}>
-                                    <div style={{ width: '22px', height: '15px', borderRadius: '3px', background: tbg, border: `1px solid ${tc}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.48rem', fontWeight: '700', color: tc, flexShrink: 0 }}>{type.slice(0, 3)}</div>
-                                    <div style={{ flex: 1, minWidth: 0 }}>
-                                      <div style={{ fontSize: '0.75rem', fontWeight: '500', color: isSel ? '#6366f1' : C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.3 }}>{ds.filename}</div>
-                                      <div style={{ fontSize: '0.60rem', color: C.textMuted, lineHeight: 1.2 }}>{(ds.row_count || 0).toLocaleString()} rows · {ds.column_count} cols</div>
-                                    </div>
-                                    {isSel && <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>}
-                                  </div>
-                                )
-                              })
-                            })()}
-                          </div>
-                          {/* Footer */}
-                          <div onClick={() => { setDsPicker(false); setActiveNav('datasets') }}
-                            style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: '#6366f1', fontSize: '0.74rem', fontWeight: '500', borderTop: `1px solid ${C.border}`, transition: 'background 0.12s' }}
-                            onMouseEnter={e => e.currentTarget.style.background = 'rgba(99,102,241,0.07)'}
-                            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                            Manage datasets
-                          </div>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Upload New Dataset button */}
-                    <button className="ws-upload-btn" onClick={() => fileInputRef.current?.click()}
-                      style={{ display: 'flex', alignItems: 'center', gap: '6px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '10px', padding: '9px 16px', fontSize: '0.76rem', color: C.textSec, cursor: 'pointer', fontFamily: FONT, fontWeight: '400', whiteSpace: 'nowrap' }}>
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                      Upload New Dataset
-                    </button>
-                  </div>
-                </div>
-
-                {/* ── SELECT DATA SOURCE section ── */}
-                <div style={{ marginBottom: '20px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
+                {/* ── UNIFIED DATA SOURCE section ── */}
+                <div style={{ marginBottom: '14px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', width: '158px', flexShrink: 0, whiteSpace: 'nowrap' }}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                    <span style={{ fontSize: '0.63rem', fontWeight: '600', color: C.text, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Select Data Source</span>
+                    <span style={{ fontSize: '0.63rem', fontWeight: '600', color: C.text, textTransform: 'uppercase', letterSpacing: '0.11em', whiteSpace: 'nowrap' }}>Select Data Source</span>
                   </div>
 
-                  <div style={{ position: 'relative', maxWidth: '320px' }}>
+                  <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
                     {sourcePicker && <div style={{ position: 'fixed', inset: 0, zIndex: 998 }} onClick={() => setSourcePicker(false)} />}
                     <button className="ws-ghost-btn" onClick={() => setSourcePicker(o => !o)}
-                      style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', background: activeSource ? 'rgba(99,102,241,0.07)' : C.bg, border: `1px solid ${activeSource ? 'rgba(99,102,241,0.35)' : C.border}`, borderRadius: '10px', padding: '9px 14px', fontSize: '0.76rem', color: activeSource ? '#6366f1' : C.textSec, cursor: 'pointer', fontFamily: FONT, fontWeight: '400', textAlign: 'left', position: 'relative', zIndex: 999 }}>
-                      <span style={{ flex: 1 }}>{activeSource ? activeSource.display_name : 'None (catalog/dictionary only)'}</span>
+                      style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', background: (activeSource || activeDs) ? 'rgba(99,102,241,0.07)' : C.bg, border: `1px solid ${(activeSource || activeDs) ? 'rgba(99,102,241,0.35)' : C.border}`, borderRadius: '9px', padding: '8px 12px', minHeight: 36, fontSize: '0.76rem', color: (activeSource || activeDs) ? '#6366f1' : C.textSec, cursor: 'pointer', fontFamily: FONT, fontWeight: '400', textAlign: 'left', position: 'relative', zIndex: 999 }}>
+                      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeSource ? activeSource.display_name : activeDs ? activeDs.filename : 'Choose a database or uploaded dataset'}</span>
+                      {activeDs && <span style={{ fontSize: '0.58rem', color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: 4, padding: '1px 5px' }}>Dataset</span>}
+                      {activeSource && <span style={{ fontSize: '0.58rem', color: C.textMuted, border: `1px solid ${C.border}`, borderRadius: 4, padding: '1px 5px' }}>Database</span>}
                       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.5, flexShrink: 0 }}><path d="m6 9 6 6 6-6"/></svg>
                     </button>
 
                     {sourcePicker && (
-                      <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 999, width: '100%', minWidth: '260px', background: C.surface, border: `1px solid ${C.borderAlt}`, borderRadius: '12px', boxShadow: '0 8px 28px rgba(0,0,0,0.16)', overflow: 'hidden', animation: 'ws-fadeup 0.15s ease' }}>
+                      <div style={{ position: 'absolute', bottom: 'calc(100% + 7px)', left: 0, zIndex: 999, width: '100%', minWidth: '360px', background: C.surface, border: `1px solid ${C.borderAlt}`, borderRadius: '11px', boxShadow: '0 14px 40px rgba(0,0,0,0.34)', overflow: 'hidden', animation: 'ws-fadeup 0.15s ease' }}>
                         {/* Search */}
-                        <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
+                        <div style={{ padding: '7px 9px', borderBottom: `1px solid ${C.border}` }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '7px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '7px', padding: '5px 9px' }}>
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                             <input
@@ -5275,48 +3902,55 @@ export default function AIWorkspace({
                           </div>
                         </div>
                         {/* List */}
-                        <div style={{ maxHeight: '240px', overflowY: 'auto', overscrollBehavior: 'contain' }}>
+                        <div style={{ maxHeight: '310px', overflowY: 'auto', overscrollBehavior: 'contain', scrollbarWidth: 'thin' }}>
                           {/* Clear selection */}
-                          <div onClick={() => { setSelectedDataSourceId(null); setSourcePicker(false) }}
-                            style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 12px', cursor: 'pointer', background: !activeSource ? 'rgba(99,102,241,0.08)' : 'transparent', borderBottom: `1px solid ${C.border}` }}
-                            onMouseEnter={e => { if (activeSource) e.currentTarget.style.background = C.borderAlt }}
-                            onMouseLeave={e => { if (activeSource) e.currentTarget.style.background = 'transparent' }}>
-                            <div style={{ flex: 1, fontSize: '0.75rem', fontWeight: '500', color: !activeSource ? '#6366f1' : C.text }}>None (catalog/dictionary only)</div>
-                            {!activeSource && <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>}
+                          <div onClick={() => { setSelectedDataSourceId(null); setSelectedDatasetId(null); setDatasetExplicit(false); setSourcePicker(false) }}
+                            style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '7px 12px', cursor: 'pointer', background: !activeSource && !activeDs ? 'rgba(99,102,241,0.08)' : 'transparent', borderBottom: `1px solid ${C.border}` }}>
+                            <div style={{ flex: 1, fontSize: '0.75rem', fontWeight: '500', color: !activeSource && !activeDs ? '#6366f1' : C.text }}>No data source selected</div>
                           </div>
+                          <div style={{ position: 'sticky', top: 0, zIndex: 2, padding: '6px 10px 4px', background: C.surface, color: C.textMuted, fontSize: '.58rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.09em' }}>Database Connections</div>
                           {(() => {
                             const q = sourceSearch.toLowerCase().trim()
                             const filtered = (dataSourceList || []).filter(s => (s.display_name || '').toLowerCase().includes(q) || (s.source_type || '').toLowerCase().includes(q))
-                            if (!dataSourceList?.length) return (
-                              <div style={{ padding: '18px', textAlign: 'center', color: C.textMuted, fontSize: '0.76rem' }}>No data sources connected.</div>
-                            )
-                            if (!filtered.length) return (
-                              <div style={{ padding: '18px', textAlign: 'center', color: C.textMuted, fontSize: '0.76rem' }}>No matches for "{sourceSearch}"</div>
-                            )
+                            if (!filtered.length) return <div style={{ padding: '8px 12px', color: C.textMuted, fontSize: '0.7rem' }}>No matching databases.</div>
                             return filtered.map(src => {
                               const isSel = src.id === selectedDataSourceId
                               return (
                                 <div key={src.id} onClick={() => { setSelectedDataSourceId(src.id); setSelectedDatasetId(null); setSourcePicker(false) }}
-                                  style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 12px', cursor: 'pointer', background: isSel ? 'rgba(99,102,241,0.08)' : 'transparent', borderBottom: `1px solid ${C.border}`, transition: 'background 0.1s' }}
+                                  style={{ display: 'grid', gridTemplateColumns: '32px minmax(0,1fr) auto 16px', alignItems: 'center', gap: '8px', padding: '6px 10px', minHeight: 38, cursor: 'pointer', background: isSel ? 'rgba(99,102,241,0.08)' : 'transparent', borderBottom: `1px solid ${C.border}`, transition: 'background 0.1s' }}
                                   onMouseEnter={e => { if (!isSel) e.currentTarget.style.background = C.borderAlt }}
                                   onMouseLeave={e => { if (!isSel) e.currentTarget.style.background = 'transparent' }}>
-                                  <div style={{ flex: 1, minWidth: 0 }}>
-                                    <div style={{ fontSize: '0.75rem', fontWeight: '500', color: isSel ? '#6366f1' : C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.3 }}>{src.display_name}</div>
-                                    <div style={{ fontSize: '0.60rem', color: C.textMuted, lineHeight: 1.2 }}>{src.source_type}{src.status ? ` · ${src.status}` : ''}</div>
-                                  </div>
+                                  <span style={{ color: '#6366f1', fontSize: '.58rem', fontWeight: 700 }}>DB</span>
+                                  <div style={{ minWidth: 0, fontSize: '0.73rem', fontWeight: 500, color: isSel ? '#6366f1' : C.text, lineHeight: 1.25, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere' }}>{src.display_name}</div>
+                                  <span style={{ color: C.textMuted, fontSize: '.59rem', whiteSpace: 'nowrap' }}>{src.source_type}{src.source_status ? ` · ${src.source_status}` : ''}</span>
                                   {isSel && <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>}
                                 </div>
                               )
                             })
                           })()}
+                          <div style={{ position: 'sticky', top: 0, zIndex: 2, padding: '6px 10px 4px', background: C.surface, color: C.textMuted, fontSize: '.58rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.09em', borderTop: `1px solid ${C.border}` }}>Uploaded Datasets</div>
+                          {(() => {
+                            const q = sourceSearch.toLowerCase().trim()
+                            const filtered = (datasetList || []).filter(ds => (ds.filename || '').toLowerCase().includes(q))
+                            if (!filtered.length) return <div style={{ padding: '8px 12px', color: C.textMuted, fontSize: '0.7rem' }}>No matching uploaded datasets.</div>
+                            return filtered.map(ds => {
+                              const isSel = ds.id === selectedDatasetId
+                              const type = getFileType(ds.filename)
+                              const tc = DS_COLOR[type] || C.textSec
+                              return <div key={`dataset-${ds.id}`} onClick={() => { setSelectedDatasetId(ds.id); setSelectedDataSourceId(null); setDatasetExplicit(true); setDsPendingRun(null); setNoDsWarning(false); setSourcePicker(false) }}
+                                style={{ display: 'grid', gridTemplateColumns: '32px minmax(0,1fr) auto 16px', alignItems: 'center', gap: 8, padding: '6px 10px', minHeight: 38, cursor: 'pointer', background: isSel ? 'rgba(99,102,241,0.08)' : 'transparent', borderBottom: `1px solid ${C.border}` }}>
+                                <span style={{ color: tc, fontSize: '.55rem', fontWeight: 700 }}>{type.slice(0, 3)}</span>
+                                <div style={{ minWidth: 0, fontSize: '.73rem', color: isSel ? '#6366f1' : C.text, lineHeight: 1.25, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere' }}>{ds.filename}</div>
+                                <span style={{ color: C.textMuted, fontSize: '.59rem', whiteSpace: 'nowrap' }}>{(ds.row_count || 0).toLocaleString()} rows · {ds.column_count || 0} cols</span>
+                                {isSel && <span style={{ color: '#6366f1' }}>✓</span>}
+                              </div>
+                            })
+                          })()}
                         </div>
                         {/* Footer */}
-                        <div onClick={() => { setSourcePicker(false); setActiveNav('data-sources') }}
-                          style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', color: '#6366f1', fontSize: '0.74rem', fontWeight: '500', borderTop: `1px solid ${C.border}`, transition: 'background 0.12s' }}
-                          onMouseEnter={e => e.currentTarget.style.background = 'rgba(99,102,241,0.07)'}
-                          onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                          Manage data sources
+                        <div style={{ display: 'flex', borderTop: `1px solid ${C.border}` }}>
+                          <div onClick={() => { setSourcePicker(false); setActiveNav('data-sources') }} style={{ flex: 1, padding: '8px 12px', cursor: 'pointer', color: '#6366f1', fontSize: '0.7rem', fontWeight: 600 }}>Manage data sources</div>
+                          <div onClick={() => { setSourcePicker(false); fileInputRef.current?.click() }} style={{ flex: 1, padding: '8px 12px', cursor: 'pointer', color: '#6366f1', fontSize: '0.7rem', fontWeight: 600, borderLeft: `1px solid ${C.border}` }}>Upload dataset</div>
                         </div>
                       </div>
                     )}
@@ -5343,7 +3977,7 @@ export default function AIWorkspace({
                       {' '}Is this the right dataset?
                     </span>
                     <button
-                      onClick={() => { setDsPendingRun(null); setDsPicker(true) }}
+                      onClick={() => { setDsPendingRun(null); setSourcePicker(true) }}
                       style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: '7px', padding: '6px 13px', fontSize: '0.74rem', color: C.textSec, cursor: 'pointer', fontFamily: FONT, whiteSpace: 'nowrap' }}>
                       Change
                     </button>
@@ -5361,6 +3995,7 @@ export default function AIWorkspace({
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                     <span style={{ fontSize: '0.63rem', fontWeight: '600', color: C.text, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Quick Start Examples</span>
                   </div>
+                  <div style={{ marginBottom: '7px', fontSize: '0.59rem', fontWeight: '600', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em' }}>Uploaded datasets</div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
                     {QUICK_STARTS.map(qs => (
                       <div key={qs.text} className="ws-qs-card" onClick={() => setWsInput(qs.prompt)}
@@ -5369,6 +4004,19 @@ export default function AIWorkspace({
                           <QsIcon type={qs.iconType} color={qs.color} />
                         </div>
                         <div style={{ fontSize: '0.7rem', color: C.text, lineHeight: 1.45, fontWeight: '400' }}>{qs.text}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ margin: '12px 0 7px', fontSize: '0.59rem', fontWeight: '600', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.12em' }}>Database connections</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
+                    {DATABASE_QUICK_STARTS.map(qs => (
+                      <div key={qs.text} className="ws-qs-card" onClick={() => setWsInput(qs.prompt)}
+                        style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '12px', padding: '11px 12px', display: 'flex', alignItems: 'flex-start', gap: '9px', userSelect: 'none' }}>
+                        <div style={{ flexShrink: 0, width: '30px', height: '30px', borderRadius: '8px', background: `${qs.color}20`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <QsIcon type={qs.iconType} color={qs.color} />
+                        </div>
+                        <div style={{ fontSize: '0.7rem', color: C.text, lineHeight: 1.4, fontWeight: '400' }}>{qs.text}</div>
                       </div>
                     ))}
                   </div>
@@ -5388,11 +4036,6 @@ export default function AIWorkspace({
               </div>
             </div>
             </div>
-          )}
-
-          {/* ── Reusable Workflows library (composer view) ── */}
-          {showComposer && (
-            <ReusableWorkflows workflows={allWorkflows} onRunWorkflow={handleRunWorkflow} C={C} />
           )}
 
           {/* ── Engine orchestration plan (primary flow) ── */}
@@ -5440,6 +4083,9 @@ export default function AIWorkspace({
               onResolveClarification={handleClarificationResolve}
               onCancelClarification={handleClarificationCancel}
               clarificationResubmitted={clarificationResubmitted}
+              onAskFollowUp={q => { setWsInput(q); handleComposerAsk(q) }}
+              token={token}
+              onSessionExpired={onSessionExpired}
             />
           )}
 
@@ -5476,7 +4122,7 @@ export default function AIWorkspace({
         {/* ── Right column — hidden during execution or composer result (those are full-width) ── */}
         {!activeLoading && !composerLoading && !hasComposerResult && (!hasResult || backToComposer) && (
           <div style={{ width: '280px', flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
-            <EmptyAssistantPanel proposal={wsProposal} C={C} onSuggestionSelect={q => setWsInput(q)} activeDs={activeDs} wsInput={wsInput} token={token} />
+            <EmptyAssistantPanel proposal={wsProposal} C={C} onSuggestionSelect={q => setWsInput(q)} activeDs={activeDs} activeSource={activeSource} wsInput={wsInput} token={token} />
           </div>
         )}
         {!activeLoading && hasResult && !backToComposer && !hasComposerResult && (
