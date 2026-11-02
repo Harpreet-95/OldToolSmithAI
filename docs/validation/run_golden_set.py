@@ -1,3 +1,8 @@
+# ARCHIVED ARCHITECTURE (Phase 8A1): this runner drives the retired legacy agent
+# (core.orchestrator.agent). It is kept only because tests/helpers still import it.
+# For acceptance runs against the current single fast-path route use
+# docs/validation/run_acceptance_suite_fast_path.py.
+
 """
 CCPP Golden Set runner — Emergency Presentation Stabilization (2026-08-09).
 
@@ -132,7 +137,70 @@ def _grade_material_correctness(q: dict, sql_plan: dict) -> tuple[bool, list[str
             actual_cols = sorted({f"{r.get('table_fqn')}.{r.get('column_name')}" for r in rows if r.get("column_name")})
             reasons.append(f"expected column '{col}' not found in plan; plan actually used {actual_cols}")
 
+    # NEXT MILESTONE, Part 25 — GOLD-S-03 ("List classes that are not
+    # active") previously "materially passed" with IsActive = 1 in the
+    # actual WHERE clause: expected_columns only checked that a column named
+    # "IsActive" appeared SOMEWHERE in the plan, never what operator/value it
+    # was actually filtered to. A query answering the OPPOSITE condition of
+    # what was asked must never receive material_pass=True. expected_filters
+    # is opt-in (a question with none is graded exactly as before) and
+    # matches against the plan's own "where" rows -- table_fqn is only
+    # checked when the question specifies one, so a filter entry needs only
+    # {"column", "operator", "value"} at minimum. No SQL strings, no
+    # hardcoded schema list -- purely structural comparison against
+    # data.sql_planning_service.build_sql_plan's own "where" output.
+    where_rows = sql_plan.get("where") or []
+    for expected in q.get("expected_filters") or []:
+        exp_col = expected.get("column")
+        exp_op = expected.get("operator")
+        exp_val = expected.get("value")
+        exp_table = expected.get("table_fqn")
+        match = next(
+            (
+                w for w in where_rows
+                if w.get("column_name") == exp_col
+                and w.get("operator") == exp_op
+                and w.get("value") == exp_val
+                and (exp_table is None or w.get("table_fqn") == exp_table)
+            ),
+            None,
+        )
+        if match is None:
+            actual = [
+                f"{w.get('table_fqn')}.{w.get('column_name')} {w.get('operator')} {w.get('value')!r}"
+                for w in where_rows
+            ]
+            reasons.append(
+                f"expected filter {exp_col} {exp_op} {exp_val!r} not found in plan; "
+                f"plan actually filtered: {actual}"
+            )
+
     return (len(reasons) == 0, reasons)
+
+
+def _classify_execution_path(entry: dict) -> str:
+    """NEXT MILESTONE — INTERACTIVE AI Q&A COVERAGE COMPLETION + SAFETY,
+    Part 15 — a single human-readable label summarizing which of the six
+    named execution paths this question actually took, derived purely from
+    fields this runner already saves (no new state, no new agent-side
+    tracking): AI_VALID, AI_SAFE_REFUSAL (AI attempted and failed, and
+    Part 1's Unsafe Legacy Takeover Prevention correctly blocked legacy),
+    AI_ATTEMPTED_AND_FAILED_LEGACY_INVOKED (category A -- AI scope
+    boundary, legacy allowed to try), LEGACY_GENERATED_SQL, AI_NOT_ATTEMPTED
+    (flag off or upstream gate never routed to the AI), and ERROR."""
+    if entry.get("status") == "ERROR":
+        return "ERROR"
+    attempted = entry.get("ai_physical_plan_attempted")
+    valid = entry.get("ai_physical_plan_valid")
+    legacy_invoked = entry.get("legacy_semantic_fallback_used")
+    sql_generated = entry.get("sql_generated")
+    if not attempted:
+        return "AI_NOT_ATTEMPTED"
+    if valid:
+        return "AI_VALID"
+    if legacy_invoked:
+        return "LEGACY_GENERATED_SQL" if sql_generated else "AI_ATTEMPTED_AND_FAILED_LEGACY_INVOKED"
+    return "AI_SAFE_REFUSAL"
 
 
 def _answer_summary(state) -> Optional[str]:
@@ -167,6 +235,21 @@ def _grade_one(source_id: int, user_id: str, q: dict, prior_state) -> tuple[dict
         "execution_status": None, "execution_row_count": None,
         "agent_status": None, "stop_code": None, "stop_reason": None,
         "duration_ms": None,
+        # Full AI Query-Plan Control milestone — Part 9 traceability,
+        # promoted onto AgentState (core/orchestrator/agent.py) from
+        # core.orchestrator.context_builder._plan_with_autonomous_
+        # preparation's own outcome dict. Reflects the LAST replan
+        # iteration's attempt, same as selected_tables/generated_sql above.
+        "ai_physical_plan_attempted": None, "ai_physical_plan_valid": None,
+        "ai_adjudication_call_count": None, "legacy_semantic_fallback_used": None,
+        "legacy_fallback_reason": None, "sql_generated_from_ai_plan": None,
+        # NEXT MILESTONE — INTERACTIVE AI Q&A COVERAGE COMPLETION + SAFETY,
+        # Part 16 — state.perf_trace (core/orchestrator/agent.py's own
+        # StageTimer.to_dict(), already computed on every run) and
+        # state.ai_interpreter_call_count were computed but never persisted
+        # by this runner. Wired through unchanged -- no new timing system,
+        # same fields the live agent already produces.
+        "perf_trace": None, "ai_interpreter_call_count": None,
     }
 
     conversation_context = None
@@ -198,6 +281,14 @@ def _grade_one(source_id: int, user_id: str, q: dict, prior_state) -> tuple[dict
         entry["agent_status"] = state.status.value if getattr(state, "status", None) else None
         entry["stop_code"] = getattr(state, "stop_code", None)
         entry["stop_reason"] = getattr(state, "stop_reason", None)
+        entry["ai_physical_plan_attempted"] = getattr(state, "ai_physical_plan_attempted", None)
+        entry["ai_physical_plan_valid"] = getattr(state, "ai_physical_plan_valid", None)
+        entry["ai_adjudication_call_count"] = getattr(state, "ai_adjudication_call_count", None)
+        entry["legacy_semantic_fallback_used"] = getattr(state, "legacy_semantic_fallback_used", None)
+        entry["legacy_fallback_reason"] = getattr(state, "legacy_fallback_reason", None)
+        entry["sql_generated_from_ai_plan"] = getattr(state, "sql_generated_from_ai_plan", None)
+        entry["perf_trace"] = getattr(state, "perf_trace", None)
+        entry["ai_interpreter_call_count"] = getattr(state, "ai_interpreter_call_count", None)
 
         if state.execution_result is not None:
             entry["execution_status"] = state.execution_result.get("status")
@@ -226,6 +317,7 @@ def _grade_one(source_id: int, user_id: str, q: dict, prior_state) -> tuple[dict
         else:
             entry["status"] = "EXPECTED_FAILURE" if blocked else "REGRESSION"
 
+        entry["execution_path"] = _classify_execution_path(entry)
         return entry, state
 
     except Exception as exc:  # noqa: BLE001 - never let one question abort the run
@@ -233,6 +325,7 @@ def _grade_one(source_id: int, user_id: str, q: dict, prior_state) -> tuple[dict
         entry["status"] = "ERROR"
         entry["material_fail_reasons"] = [f"ERROR: {exc}"]
         entry["_traceback"] = traceback.format_exc()
+        entry["execution_path"] = _classify_execution_path(entry)
         return entry, prior_state
 
 

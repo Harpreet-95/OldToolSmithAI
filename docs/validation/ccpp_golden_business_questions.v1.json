@@ -78,6 +78,9 @@
       "expected_outcome": "SUCCESS",
       "expected_primary_table": "dbo.ADF_Class",
       "expected_columns": ["IsActive"],
+      "expected_filters": [
+        {"column": "IsActive", "table_fqn": "dbo.ADF_Class", "operator": "=", "value": 1}
+      ],
       "grounding": "dbo.ADF_Class.IsActive is a real boolean flag column (dictionary semantic_type='flag').",
       "currently_blocked_by": null
     },
@@ -263,7 +266,10 @@
       "expected_outcome": "SUCCESS",
       "expected_primary_table": "dbo.ADF_Class",
       "expected_columns": ["IsActive"],
-      "grounding": "Negated-boolean variant of GOLD-C-05, same column.",
+      "expected_filters": [
+        {"column": "IsActive", "table_fqn": "dbo.ADF_Class", "operator": "=", "value": 0}
+      ],
+      "grounding": "Negated-boolean variant of GOLD-C-05, same column. Previously material-passed with IsActive = 1 (the OPPOSITE condition) because the harness never checked filter operator/value -- expected_filters (NEXT MILESTONE, Part 25) closes that gap.",
       "currently_blocked_by": null
     },
     {

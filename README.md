@@ -1,230 +1,140 @@
 # ToolSmithAI
 
-## Overview
+ToolSmithAI lets business users ask questions about connected SQL databases or uploaded CSV/Excel datasets in plain language. It discovers and profiles metadata, retrieves relevant schema evidence with embeddings, generates read-only SQL through the AI-first fast path, validates the SQL, executes it against current data, and returns tables, KPIs, grounded insights, and charts.
 
-ToolSmithAI is a backend AI automation system that converts natural language input into structured, validated execution plans — and runs them.
+## What is included
 
-It started as a simple task interpreter and has grown into a full execution pipeline with a FastAPI layer, SQLite persistence, a Tool Registry, stored workflows, and an intelligence layer that tracks execution history and surfaces recommendations.
+- SQL Server connection, discovery, profiling, dictionary, and search
+- AI-first natural-language question answering for connected SQL sources
+- Vector/embedding retrieval for relevant schema and business evidence
+- Deterministic SQL safety validation before every execution
+- Persistent validated-plan cache; cached plans are revalidated and SQL is re-executed
+- Follow-up question context and clarification flows
+- CSV and Excel upload/report workflows
+- CSV, Excel, and PDF export
+- Optional report email delivery and scheduled workflows
+- React web interface and FastAPI backend
 
-Built as part of an AI + Data Engineering learning project.
+Runtime databases, credentials, uploaded files, exports, logs, dependency folders, backups, and generated validation results are intentionally excluded from Git.
 
----
+## Current architecture
 
-## Live Deployment
-
-The API is deployed on Render at:
-
-**Base URL:** `https://toolsmithai.onrender.com`
-
-**Health check:** `https://toolsmithai.onrender.com/v1/health`
-
-- Render provides HTTPS automatically — no certificate configuration needed.
-- This project runs on Render's free tier. Free-tier services spin down after a period of inactivity and may take 30–60 seconds to respond on the first request after waking.
-
----
-
-## Current Architecture
-
-```
-User Input (HTTP)
-  → FastAPI route (api/v1/routes.py)
-  → handle_input()                    core/input/input_handler.py
-      → interpret_task()              core/interpreter/task_interpreter.py
-          → detect_task_type()
-          → detect_frequency()
-          → build_execution_plan()
-              → validate_step() x N   core/registry/tool_registry.py
-      → run_plan()                    core/execution/execution_engine.py
-          → _dispatch() per step
-          → simulated tool handlers
-      → log_audit_event()             data/audit.py
-      → log_execution_history()       data/execution_history.py
-      → format_output()               core/output/output_formatter.py
-  → JSON response
+```text
+User question
+  -> React AI Workspace
+  -> POST /v1/composer/ask
+  -> source/dataset selection
+       SQL source
+         -> vector retrieval of schema + business evidence
+         -> one AI-first intent/schema/SQL generation call
+         -> relationship completion and deterministic validation
+         -> live read-only SQL execution
+         -> deterministic table/KPI/insight/chart formatting
+       CSV or Excel dataset
+         -> dataset report and analysis pipeline
+  -> answer, evidence, export, and follow-up state
 ```
 
-### Module Map
+The retired keyword intent router and legacy multi-agent SQL execution path are not part of the active composer route.
 
-```
-api/
-  app.py                  FastAPI app + lifespan (init_db)
-  v1/routes.py            All HTTP endpoints
+## Requirements
 
-auth/
-  api_key.py              API key validation + role enforcement
+- Python 3.11 or newer
+- Node.js 20 or newer
+- Microsoft ODBC Driver for SQL Server when connecting to SQL Server
+- An OpenAI API key for AI-first SQL question answering
 
-core/
-  config.py               Env vars and key-role map
-  input/input_handler.py  Orchestrates the full execution pipeline
-  interpreter/
-    task_interpreter.py   NLP → execution plan (rule-based)
-  registry/
-    tool_registry.py      In-memory tool + operation registry
-  execution/
-    execution_engine.py   Step dispatcher + simulated handlers
-  output/
-    output_formatter.py   Formats execution results for API response
-  workflows/
-    workflow_runner.py    Loads and runs stored workflows
+## Local setup
 
-data/
-  db.py                   SQLite connection helper
-  models.py               Schema init (all tables)
-  audit.py                Dual-write audit logger (file + SQLite)
-  execution_history.py    Execution telemetry write + intelligence queries
-  workflow_service.py     Workflow CRUD (SQLite)
+### 1. Backend
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-### Database Tables
+Edit `.env` with your own secrets and feature configuration. Never commit `.env`.
 
-| Table | Purpose |
-|---|---|
-| `users` | User records with roles |
-| `tools` | Tool config store (future use) |
-| `workflows` | Stored reusable workflow definitions (JSON) |
-| `audit_logs` | Security and access audit trail |
-| `execution_history` | Full execution telemetry for Phase 3 intelligence |
+For backend development and testing, install the additional test dependencies:
 
----
-
-## API Endpoints
-
-All endpoints require an `x-api-key` header.
-
-| Method | Route | Auth | Description |
-|---|---|---|---|
-| `POST` | `/v1/interpret` | user | Interpret input and execute a plan |
-| `POST` | `/v1/workflows/run` | user | Run a stored workflow by name |
-| `GET` | `/v1/recommendations` | user | Repeated-intent workflow suggestions |
-| `GET` | `/v1/insights` | user | Workflow success rate insights |
-| `GET` | `/v1/audit` | admin | Pageable audit log query |
-| `GET` | `/v1/health` | user | Health check |
-
----
-
-## Running Locally
-
-**Install dependencies:**
-```bash
-pip install -r requirements.txt
+```powershell
+python -m pip install -r requirements-dev.txt
 ```
 
-**Configure environment** (`.env` at project root):
-```
-APP_ENV=development
-LOG_LEVEL=DEBUG
-ADMIN_API_KEY=toolsmith-admin-key
-USER_API_KEY=toolsmith-user-key
+Start the API:
+
+```powershell
+python -m uvicorn api.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
-**Start the server:**
-```bash
-uvicorn api.app:app --reload
+The application creates its local SQLite metadata database on first startup. For a durable location outside the repository, set `TOOLSMITH_DATA_DIR` in `.env` before starting.
+
+### 2. Frontend
+
+In a second terminal:
+
+```powershell
+Set-Location frontend
+npm ci
+npm run dev
 ```
 
-The server starts at `http://127.0.0.1:8000`. The database is created automatically on first start.
+Open `http://localhost:5173`. Vite proxies `/v1` requests to the backend at `http://127.0.0.1:8000`.
 
----
+## Configuration
 
-## Running with Docker
+Use `.env.example` as the supported configuration template. At minimum, configure secure values for authentication/encryption and provide `OPENAI_API_KEY` when enabling AI functionality.
 
-**Build the image:**
-```bash
+The AI-first SQL fast path is controlled by feature flags and a source allow-list. Keep it disabled for a source until that source has completed metadata preparation and validation. Real email delivery is also disabled by default.
+
+## Tests
+
+Backend:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+Frontend:
+
+```powershell
+Set-Location frontend
+npm test
+```
+
+Tests use isolated fixtures unless a test is explicitly marked as a live integration check. Do not point automated tests at a production database.
+
+## Repository layout
+
+```text
+api/                 FastAPI routes and response adapters
+auth/                Authentication helpers
+core/sqlservice/     AI-first retrieval, generation, validation, cache, and execution
+core/answering/      Answer, insight, chart, and export formatting
+data/                Metadata persistence and datasource services
+frontend/            React/Vite web application
+migrations/          Additive SQLite metadata migrations
+tests/               Backend regression tests
+docs/                Architecture and validation documentation
+knowledge_packages/  Sanitized portable knowledge packages
+```
+
+## Data and security rules
+
+- Generated SQL is read-only and must pass deterministic validation.
+- A plan-cache hit never returns old result rows; SQL runs again against current source data.
+- Raw query rows, credentials, secrets, prompts, and vectors are not stored in the durable plan cache.
+- Local `.env`, SQLite files, logs, uploads, exports, and backups are not version controlled.
+- Permanently deleting a datasource is distinct from disconnecting it and requires explicit confirmation in the UI.
+
+## Docker
+
+```powershell
 docker build -t toolsmithai .
-```
-
-**Run the container:**
-```bash
 docker run --rm -p 8000:8000 --env-file .env -v ${PWD}/data:/app/data toolsmithai
 ```
 
-**Check the server is up:**
-```bash
-curl http://localhost:8000/v1/health -UseBasicParsing
-```
-
-**Why `--env-file .env` is required:**
-The `.env` file is excluded from the Docker image (via `.dockerignore`) to prevent secrets from being baked in. Without passing it at runtime, the container starts with no API keys, no encryption key, and no HMAC salt — causing auth and audit logging to fail immediately.
-
-**Why the volume mount (`-v ${PWD}/data:/app/data`) is used:**
-The SQLite database (`toolsmith.db`) and flat audit log (`audit.log`) are written inside the container at `/app/data`. Without a volume mount, both files are destroyed every time the container stops. Mounting the host `data/` directory keeps all data persistent across container restarts.
-
----
-
-## Example Usage
-
-**Interpret a natural language task:**
-```bash
-curl -X POST http://127.0.0.1:8000/v1/interpret \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: toolsmith-user-key" \
-  -d '{"input": "Email me a weekly report"}'
-```
-
-**Run a stored workflow:**
-```bash
-curl -X POST http://127.0.0.1:8000/v1/workflows/run \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: toolsmith-user-key" \
-  -d '{"name": "weekly_report_email"}'
-```
-
-**Get recommendations:**
-```bash
-curl http://127.0.0.1:8000/v1/recommendations \
-  -H "x-api-key: toolsmith-user-key"
-```
-
-**Get workflow insights:**
-```bash
-curl http://127.0.0.1:8000/v1/insights \
-  -H "x-api-key: toolsmith-user-key"
-```
-
----
-
-## Supported Task Types
-
-The interpreter detects these task types from natural language input:
-
-| Task Type | Example Input |
-|---|---|
-| `generate_report` | "Email me a weekly report" |
-| `send_email` | "Send a weekly email update" |
-| `set_reminder` | "Set a daily reminder" |
-| `unknown` | "Do something random" |
-
-Frequency detection: `daily`, `weekly`, `monthly`.
-
----
-
-## Build Progress
-
-### Phase 1 — Task Interpreter (complete)
-- Keyword-based task type detection with priority resolution
-- Frequency extraction
-- Structured output
-
-### Phase 2 — Execution Pipeline (complete)
-- Structured execution plan with versioned schema
-- In-memory Tool Registry with per-operation validation
-- Execution Engine with simulated tool handlers and step-level failure tracking
-- FastAPI + SQLite backend with API key auth
-- Stored workflow support (create, load, run by name or ID)
-- Dual-write audit logging (file + SQLite)
-
-### Phase 3 — Intelligence Layer (complete)
-- `execution_history` table tracking full telemetry per run
-- `trigger_source` distinguishes interpreter vs workflow API runs
-- Repeated-intent detection → workflow creation suggestions (`/v1/recommendations`)
-- Workflow success rate analysis → reliability insights (`/v1/insights`)
-
----
-
-## Phase 4 Roadmap
-
-- **Real tool integrations** — replace simulated handlers with actual email, notification, and data fetch implementations
-- **Workflow scheduling** — trigger stored workflows on a time-based schedule
-- **User-scoped history** — tie execution records to specific users for per-user recommendations
-- **Workflow creation from intent** — auto-propose and save a workflow when a repeated intent is detected
-- **Admin dashboard endpoint** — aggregate stats across task types, tools, and workflows for observability
+For production, use a dedicated persistent data directory and a proper secret-management system rather than storing credentials in the image or repository.
