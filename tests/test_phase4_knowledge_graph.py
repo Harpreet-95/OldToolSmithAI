@@ -16,6 +16,7 @@ Run from the project root:
 import json
 import os
 import sqlite3
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
@@ -29,6 +30,9 @@ from data.knowledge_graph_service import (
     explain_table,
     trace_business_path,
     knowledge_graph_summary,
+)
+from data.profiling_snapshot_resolver import (
+    get_latest_profiling_snapshot as _real_get_latest_profiling_snapshot,
 )
 
 
@@ -265,6 +269,7 @@ _SCHEMA = """
         confidence        REAL    NOT NULL DEFAULT 1.0,
         evidence_json     TEXT,
         created_at        TEXT    NOT NULL DEFAULT '2026-01-01',
+        inference_method  TEXT    NOT NULL DEFAULT 'declared_fk',
         relationship_status TEXT  NOT NULL DEFAULT 'AUTO'
     );
     CREATE UNIQUE INDEX idx_tr_uniq ON table_relationships
@@ -485,6 +490,11 @@ def test_find_business_assets_by_domain(tmp_path, monkeypatch):
     _create_db(db)
     _seed_full_scenario(db)
     monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    # Phase 2E.2: find_business_assets now calls
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # holds its own independently imported get_connection — must be patched
+    # too or it hits the real DB.
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
 
     result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
 
@@ -503,6 +513,11 @@ def test_find_business_assets_by_entity(tmp_path, monkeypatch):
     _create_db(db)
     _seed_full_scenario(db)
     monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    # Phase 2E.2: find_business_assets now calls
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # holds its own independently imported get_connection — must be patched
+    # too or it hits the real DB.
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
 
     result = find_business_assets(source_id=1, user_id="user-kg", entity="Customer")
 
@@ -518,6 +533,11 @@ def test_find_business_assets_by_term(tmp_path, monkeypatch):
     _create_db(db)
     _seed_full_scenario(db)
     monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    # Phase 2E.2: find_business_assets now calls
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # holds its own independently imported get_connection — must be patched
+    # too or it hits the real DB.
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
 
     # "invoice" appears in dbo.invoices description
     result = find_business_assets(source_id=1, user_id="user-kg", term="invoice")
@@ -538,6 +558,11 @@ def test_explain_table_full(tmp_path, monkeypatch):
     _create_db(db)
     _seed_full_scenario(db)
     monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    # Phase 2E.3: explain_table now calls
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # holds its own independently imported get_connection — must be patched
+    # too or it hits the real DB.
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
 
     result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
 
@@ -577,6 +602,11 @@ def test_explain_table_missing_metadata(tmp_path, monkeypatch):
     c.close()
 
     monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    # Phase 2E.3: explain_table now calls
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # holds its own independently imported get_connection — must be patched
+    # too or it hits the real DB.
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
 
     result = explain_table(source_id=2, user_id="user-sparse", table_fqn="dbo.orders")
 
@@ -668,6 +698,11 @@ def test_knowledge_graph_summary(tmp_path, monkeypatch):
     _create_db(db)
     _seed_full_scenario(db)
     monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    # Phase 2E.1: knowledge_graph_summary now calls
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # holds its own independently imported get_connection — must be patched
+    # too or it hits the real DB.
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
 
     result = knowledge_graph_summary(source_id=1, user_id="user-kg")
 
@@ -706,3 +741,1118 @@ def test_knowledge_graph_summary(tmp_path, monkeypatch):
 
     # Unknown source returns None
     assert knowledge_graph_summary(source_id=99, user_id="user-kg") is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2E.1 — knowledge_graph_summary() call-site migration
+#
+# Of the three production callers of the module-local _latest_profiling_snap_id()
+# wrapper (find_business_assets, explain_table, knowledge_graph_summary),
+# knowledge_graph_summary was selected as the lowest-risk first migration:
+# prof_snap_id feeds exactly one single-row, all-scalar profiling_snapshots
+# fetch (tables_profiled/columns_profiled/pii_columns_found) with no
+# graph-traversal, scoring, or evidence fan-out. The wrapper itself is left
+# untouched — find_business_assets and explain_table still call it — and
+# still runs its own inline SQL rather than delegating to the resolver.
+# ---------------------------------------------------------------------------
+
+def _seed_minimal_source(db: str, source_id: int = 1, user_id: str = "user-kg") -> None:
+    conn = _conn(db)
+    conn.execute(
+        "INSERT INTO data_source_connections (id, user_id, source_type, source_category) "
+        "VALUES (?, ?, 'mssql', 'RELATIONAL')",
+        (source_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _insert_profiling_snapshot(
+    db: str,
+    source_id: int,
+    snapshot_version: int,
+    status: str = "COMPLETE",
+    tables_profiled: int = 0,
+    columns_profiled: int = 0,
+    pii_columns_found: int = 0,
+) -> int:
+    conn = _conn(db)
+    cur = conn.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, "
+        "tables_profiled, columns_profiled, pii_columns_found) "
+        "VALUES (?, 1, ?, ?, ?, ?, ?)",
+        (source_id, snapshot_version, status, tables_profiled, columns_profiled, pii_columns_found),
+    )
+    conn.commit()
+    snap_id = cur.lastrowid
+    conn.close()
+    return snap_id
+
+
+# 1 — get_latest_profiling_snapshot() called exactly once
+def test_knowledge_graph_summary_calls_resolver_exactly_once(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_a.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    with patch(
+        "data.knowledge_graph_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    assert result is not None
+    spy.assert_called_once()
+
+
+# 2 — correct source_id passed
+def test_knowledge_graph_summary_passes_correct_source_id(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_b.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    with patch(
+        "data.knowledge_graph_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    spy.assert_called_once_with(1)
+
+
+# 3 — wrapper helper no longer exists to be called by knowledge_graph_summary()
+#
+# Phase 2E.4 deleted _latest_profiling_snap_id()'s definition outright — it
+# had zero remaining production call sites after Phases 2E.1-2E.3 moved all
+# three knowledge-graph functions onto get_latest_profiling_snapshot()
+# directly. The prior version of this test proved the wrapper wasn't called
+# by monkeypatching it to raise; that mechanism no longer works once the
+# attribute doesn't exist (monkeypatch on a missing attribute raises
+# AttributeError by default). See
+# test_knowledge_graph_service_has_no_legacy_snapshot_helper and
+# test_all_knowledge_graph_consumers_still_use_shared_resolver near the end
+# of this file for the structural replacement coverage.
+
+
+# 4 — graph response shape unchanged
+def test_knowledge_graph_summary_response_shape_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_d.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    assert result is not None
+    assert set(result.keys()) == {
+        "source_id", "source", "nodes", "edges", "domain_coverage", "entity_coverage",
+        "dictionary_coverage", "profiling_coverage", "relationship_coverage",
+        "confidence_distribution", "governance_coverage",
+    }
+    assert result["source_id"] == 1
+
+
+# 5 — enrichment (profiling_coverage) unchanged
+def test_knowledge_graph_summary_enrichment_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_e.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    assert result is not None
+    assert result["profiling_coverage"] == {
+        "tables_profiled": 5,
+        "columns_profiled": 20,
+        "pii_columns_found": 1,
+        "coverage_rate": 1.0,
+    }
+
+
+# 6 — graph metrics (nodes/edges/coverage sections independent of prof_snap_id) unchanged
+def test_knowledge_graph_summary_graph_metrics_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_f.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    assert result is not None
+    assert result["nodes"] == {"total_tables": 5, "total_views": 0, "total_columns": 20}
+    assert result["edges"]["total_relationships"] == 3
+    assert result["edges"]["tables_with_fks"] == 3
+    assert result["domain_coverage"]["tables_assigned"] == 5
+    assert result["domain_coverage"]["unique_domains"] == 2
+    assert result["entity_coverage"]["tables_assigned"] == 5
+    assert result["dictionary_coverage"]["tables_with_definitions"] == 5
+    assert result["dictionary_coverage"]["tables_approved"] == 1
+    assert result["relationship_coverage"]["tables_with_fks"] == 3
+    assert result["governance_coverage"]["approved_definitions"] == 1
+    assert result["governance_coverage"]["total_definitions"] == 5
+
+
+# 7 — no-snapshot behavior unchanged: schema/domain/entity/dict sections present, profiling zeroed
+def test_knowledge_graph_summary_no_snapshot_behavior_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_g.db")
+    _create_db(db)
+    _seed_minimal_source(db)
+    conn = _conn(db)
+    conn.execute("INSERT INTO schema_snapshots (id, source_id, table_count) VALUES (1, 1, 3)")
+    conn.commit()
+    conn.close()
+    # Deliberately no profiling_snapshots row for source_id=1
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    assert result is not None
+    assert result["nodes"]["total_tables"] == 3
+    assert result["profiling_coverage"] == {
+        "tables_profiled": 0,
+        "columns_profiled": 0,
+        "pii_columns_found": 0,
+        "coverage_rate": 0.0,
+    }
+
+
+# 8 — snapshot policy: older COMPLETE beats newer CANCELLED
+def test_knowledge_graph_summary_snapshot_policy_complete_beats_cancelled(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_h.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    _insert_profiling_snapshot(
+        db, source_id=1, snapshot_version=2, status="CANCELLED",
+        tables_profiled=99, columns_profiled=999, pii_columns_found=42,
+    )
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    # Status-aware selection: the seeded COMPLETE snapshot (version 1, id=1,
+    # tables_profiled=5/columns_profiled=20/pii_columns_found=1 from
+    # _seed_full_scenario) wins over the newer CANCELLED snapshot (version
+    # 2) — a newer non-COMPLETE snapshot must never shadow older, usable
+    # COMPLETE evidence.
+    assert result["profiling_coverage"]["tables_profiled"] == 5
+    assert result["profiling_coverage"]["columns_profiled"] == 20
+    assert result["profiling_coverage"]["pii_columns_found"] == 1
+
+
+# 9 — snapshot policy: older COMPLETE beats newer RUNNING
+def test_knowledge_graph_summary_snapshot_policy_complete_beats_running(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_i.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    _insert_profiling_snapshot(
+        db, source_id=1, snapshot_version=2, status="RUNNING",
+        tables_profiled=77, columns_profiled=777, pii_columns_found=7,
+    )
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    # Status-aware selection: the seeded COMPLETE snapshot (version 1, id=1)
+    # wins over the newer RUNNING snapshot (version 2).
+    assert result["profiling_coverage"]["tables_profiled"] == 5
+    assert result["profiling_coverage"]["columns_profiled"] == 20
+    assert result["profiling_coverage"]["pii_columns_found"] == 1
+
+
+# 10 — read-only behavior preserved
+def test_knowledge_graph_summary_read_only_preserved(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_j.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    def _dump(table: str) -> list[dict]:
+        conn = _conn(db)
+        rows = [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
+        conn.close()
+        return rows
+
+    tables = (
+        "data_source_connections", "schema_snapshots", "profiling_snapshots",
+        "profiling_table_profiles", "profiling_column_profiles",
+        "table_relationships", "domain_assignments", "entity_assignments",
+        "data_dictionary_tables",
+    )
+    before = {t: _dump(t) for t in tables}
+
+    knowledge_graph_summary(source_id=1, user_id="user-kg")
+    knowledge_graph_summary(source_id=999, user_id="user-kg")  # not-found path too
+
+    after = {t: _dump(t) for t in tables}
+
+    assert before == after
+
+
+# 11 — resolver connection count preserved: 1 service + 1 resolver = 2 total
+def test_knowledge_graph_summary_connection_count_preserved(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e1_k.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+
+    counters = {"service_conn": 0, "resolver_conn": 0}
+
+    def counting_service_conn():
+        counters["service_conn"] += 1
+        return _conn(db)
+
+    def counting_resolver_conn():
+        counters["resolver_conn"] += 1
+        return _conn(db)
+
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", counting_service_conn)
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", counting_resolver_conn)
+
+    result = knowledge_graph_summary(source_id=1, user_id="user-kg")
+
+    assert result is not None
+    assert counters["service_conn"] == 1
+    assert counters["resolver_conn"] == 1
+    assert counters["service_conn"] + counters["resolver_conn"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2E.2 — find_business_assets() call-site migration
+#
+# The second of the two remaining production callers of the module-local
+# _latest_profiling_snap_id() wrapper. prof_snap_id here gates a single
+# query against profiling_column_profiles (PII columns matching the
+# search-qualified table set) — it does not affect domain/entity/term
+# matching, table/column/relationship inclusion, or business_definitions,
+# all of which are dictionary/domain/entity-derived and profiling-independent.
+#
+# Deduplication note: find_business_assets has no row-level dedup step: its
+# only "merge" behavior is the `qualified: set[str]` union across the
+# domain/entity/term filters (test 8 below exercises this — a table matching
+# two filters must still appear exactly once). The wrapper is left
+# untouched — explain_table still calls it.
+# ---------------------------------------------------------------------------
+
+def _insert_pii_column(
+    db: str, snapshot_id: int, source_id: int, table_fqn: str, column_name: str,
+) -> None:
+    conn = _conn(db)
+    conn.execute(
+        "INSERT INTO profiling_column_profiles "
+        "(profiling_snapshot_id, source_id, table_fqn, column_name, data_type, "
+        "pii_name_heuristic, pii_confirmed) "
+        "VALUES (?, ?, ?, ?, 'TEXT', 1, 0)",
+        (snapshot_id, source_id, table_fqn, column_name),
+    )
+    conn.commit()
+    conn.close()
+
+
+# 1 — get_latest_profiling_snapshot() called exactly once
+def test_find_business_assets_calls_resolver_exactly_once(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_a.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    with patch(
+        "data.knowledge_graph_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    assert result is not None
+    spy.assert_called_once()
+
+
+# 2 — correct source_id passed
+def test_find_business_assets_passes_correct_source_id(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_b.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    with patch(
+        "data.knowledge_graph_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    spy.assert_called_once_with(1)
+
+
+# 3 — wrapper helper no longer exists to be called by find_business_assets()
+#
+# See the equivalent note above test 3 in the Phase 2E.1
+# knowledge_graph_summary section: this was one of the last production
+# callers of the now-deleted wrapper. Structural replacement coverage lives
+# in test_knowledge_graph_service_has_no_legacy_snapshot_helper and
+# test_all_knowledge_graph_consumers_still_use_shared_resolver near the end
+# of this file.
+
+
+# 4 — response shape unchanged
+def test_find_business_assets_response_shape_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_d.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    assert result is not None
+    assert set(result.keys()) == {
+        "source_id", "filters", "tables", "columns", "relationships",
+        "pii_assets", "business_definitions", "total_assets", "total_tables",
+        "total_columns", "total_relationships", "total_pii_columns",
+    }
+    assert result["source_id"] == 1
+    assert result["filters"] == {"domain": "Finance", "entity": None, "term": None}
+
+
+# 5 — result membership unchanged
+def test_find_business_assets_result_membership_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_e.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    assert result is not None
+    table_fqns = {t["table_fqn"] for t in result["tables"]}
+    assert table_fqns == {"dbo.invoices", "dbo.payments"}
+    assert result["total_tables"] == 2
+    rel_fqns = {r["from_table_fqn"] for r in result["relationships"]} | {
+        r["to_table_fqn"] for r in result["relationships"]
+    }
+    assert "dbo.invoices" in rel_fqns
+    def_fqns = {d["table_fqn"] for d in result["business_definitions"]}
+    assert def_fqns == {"dbo.invoices", "dbo.payments"}
+
+
+# 6 — filtering unchanged: domain/entity/term matching independent of profiling
+def test_find_business_assets_filtering_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_f.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+    fqns = {t["table_fqn"] for t in result["tables"]}
+    assert "dbo.orders" not in fqns
+    assert "dbo.customers" not in fqns
+
+    result_term = find_business_assets(source_id=1, user_id="user-kg", term="Customer ID")
+    assert "dbo.orders" in {t["table_fqn"] for t in result_term["tables"]}
+
+
+# 7 — ordering unchanged: tables by (schema_name, table_name); pii_assets by (table_fqn, column_name)
+def test_find_business_assets_ordering_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_g.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Sales")
+
+    assert result is not None
+    assert [t["table_fqn"] for t in result["tables"]] == [
+        "dbo.customers", "dbo.orders", "dbo.products",
+    ]
+
+
+# 8 — deduplication (set-union merge across filters) unchanged
+def test_find_business_assets_deduplication_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_h.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    # domain="Finance" matches {invoices, payments}; entity="Invoice" matches
+    # {invoices} again — invoices must appear exactly once, not duplicated.
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance", entity="Invoice")
+
+    assert result is not None
+    fqns = [t["table_fqn"] for t in result["tables"]]
+    assert fqns.count("dbo.invoices") == 1
+    assert set(fqns) == {"dbo.invoices", "dbo.payments"}
+    assert result["total_tables"] == 2
+
+
+# 9 — PII-derived results unchanged
+def test_find_business_assets_pii_results_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_i.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    assert result is not None
+    assert result["total_pii_columns"] == 1
+    assert len(result["pii_assets"]) == 1
+    pii = result["pii_assets"][0]
+    assert pii["table_fqn"] == "dbo.invoices"
+    assert pii["column_name"] == "billing_address"
+    assert pii["pii_name_heuristic"] == 1
+    assert pii["pii_confirmed"] == 0
+
+
+# 10 — no-snapshot behavior unchanged: search results present, PII section empty
+def test_find_business_assets_no_snapshot_behavior_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_j.db")
+    _create_db(db)
+    _seed_minimal_source(db)
+    conn = _conn(db)
+    conn.execute(
+        "INSERT INTO domain_assignments (source_id, profiling_snapshot_id, table_fqn, domain, confidence) "
+        "VALUES (1, 1, 'dbo.foo', 'Ops', 0.5)"
+    )
+    conn.commit()
+    conn.close()
+    # Deliberately no schema_snapshots or profiling_snapshots row for source_id=1
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Ops")
+
+    assert result is not None
+    assert {t["table_fqn"] for t in result["tables"]} == {"dbo.foo"}
+    assert result["relationships"] == []
+    assert result["pii_assets"] == []
+    assert result["total_pii_columns"] == 0
+
+
+# 11 — snapshot policy: older COMPLETE beats newer CANCELLED
+def test_find_business_assets_snapshot_policy_complete_beats_cancelled(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_k.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    cancelled_id = _insert_profiling_snapshot(db, source_id=1, snapshot_version=2, status="CANCELLED")
+    _insert_pii_column(db, cancelled_id, source_id=1, table_fqn="dbo.payments", column_name="card_number")
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    # Status-aware selection: the seeded COMPLETE snapshot (version 1, id=1)
+    # wins over the newer CANCELLED snapshot (version 2) — a newer
+    # non-COMPLETE snapshot must never shadow older, usable COMPLETE
+    # evidence, so only the PII column tied to snapshot 1
+    # (invoices.billing_address) is visible; the new snapshot's
+    # payments.card_number (tied to the CANCELLED snapshot) is not.
+    assert len(result["pii_assets"]) == 1
+    assert result["pii_assets"][0]["table_fqn"] == "dbo.invoices"
+    assert result["pii_assets"][0]["column_name"] == "billing_address"
+
+
+# 12 — snapshot policy: older COMPLETE beats newer RUNNING
+def test_find_business_assets_snapshot_policy_complete_beats_running(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_l.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    running_id = _insert_profiling_snapshot(db, source_id=1, snapshot_version=2, status="RUNNING")
+    _insert_pii_column(db, running_id, source_id=1, table_fqn="dbo.payments", column_name="cvv")
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    # Status-aware selection: the seeded COMPLETE snapshot (version 1, id=1)
+    # wins over the newer RUNNING snapshot (version 2).
+    assert len(result["pii_assets"]) == 1
+    assert result["pii_assets"][0]["table_fqn"] == "dbo.invoices"
+    assert result["pii_assets"][0]["column_name"] == "billing_address"
+
+
+# 13 — read-only behavior preserved
+def test_find_business_assets_read_only_preserved(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_m.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    def _dump(table: str) -> list[dict]:
+        conn = _conn(db)
+        rows = [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
+        conn.close()
+        return rows
+
+    tables = (
+        "data_source_connections", "schema_snapshots", "profiling_snapshots",
+        "profiling_table_profiles", "profiling_column_profiles",
+        "table_relationships", "domain_assignments", "entity_assignments",
+        "data_dictionary_tables", "data_dictionary_columns",
+    )
+    before = {t: _dump(t) for t in tables}
+
+    find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+    find_business_assets(source_id=999, user_id="user-kg", domain="Finance")  # not-found path too
+
+    after = {t: _dump(t) for t in tables}
+
+    assert before == after
+
+
+# 14 — resolver connection count preserved: 1 service + 1 resolver = 2 total
+def test_find_business_assets_connection_count_preserved(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e2_n.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+
+    counters = {"service_conn": 0, "resolver_conn": 0}
+
+    def counting_service_conn():
+        counters["service_conn"] += 1
+        return _conn(db)
+
+    def counting_resolver_conn():
+        counters["resolver_conn"] += 1
+        return _conn(db)
+
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", counting_service_conn)
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", counting_resolver_conn)
+
+    result = find_business_assets(source_id=1, user_id="user-kg", domain="Finance")
+
+    assert result is not None
+    assert counters["service_conn"] == 1
+    assert counters["resolver_conn"] == 1
+    assert counters["service_conn"] + counters["resolver_conn"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2E.3 — explain_table() call-site migration (final Knowledge Graph caller)
+#
+# The last production caller of the module-local _latest_profiling_snap_id()
+# wrapper. prof_snap_id here gates a single-row profiling_table_profiles
+# fetch (table_profile) that feeds nearly every profiling-derived output:
+# classification, the profiling/pii subdicts, the importance score/label
+# (4 of 5 score components derive from table_profile), evidence lines, one
+# gap line, and two governance flags. Expected values below were computed
+# by hand from the _seed_full_scenario fixture:
+#   dbo.customers: score = 0.06(ref=1) + 0.20(root) + 0.20(Master) + 0.10(dict
+#     approved) = 0.56 -> label "HIGH"; governance_score 4/4 = 1.0
+#   dbo.products:  score = 0.20(root) + 0.12(Reference) = 0.32 (no ref-count,
+#     no PII, no dict approval) -> label "MEDIUM" — a distinct component mix
+#     used to verify the score formula isn't collapsed to a single case.
+#   dbo.invoices:  pii_column_count=1, confirmed_pii_count=0 ->
+#     pii.review_needed True, governance.dictionary_approved False (not
+#     approved in the fixture) -> governance_score 3/4 = 0.75.
+#   dbo.orders:    dict entry present but not approved -> gaps ==
+#     ["Dictionary entry not yet human-approved"] (domain/entity/profiling/
+#     relationships are all otherwise present for orders).
+# ---------------------------------------------------------------------------
+
+def _insert_table_profile_row(
+    db: str,
+    snapshot_id: int,
+    source_id: int,
+    table_fqn: str,
+    table_name: str,
+    table_class: str,
+    classification_confidence: float,
+    referenced_by_count: int = 0,
+    is_root_table: int = 0,
+    pii_column_count: int = 0,
+    confirmed_pii_count: int = 0,
+) -> None:
+    conn = _conn(db)
+    conn.execute(
+        """INSERT INTO profiling_table_profiles
+           (profiling_snapshot_id, source_id, table_fqn, table_name, schema_name,
+            table_class, classification_confidence, referenced_by_count,
+            is_root_table, pii_column_count, confirmed_pii_count, profiling_status)
+           VALUES (?, ?, ?, ?, 'dbo', ?, ?, ?, ?, ?, ?, 'COMPLETE')""",
+        (snapshot_id, source_id, table_fqn, table_name, table_class,
+         classification_confidence, referenced_by_count, is_root_table,
+         pii_column_count, confirmed_pii_count),
+    )
+    conn.commit()
+    conn.close()
+
+
+# 1 — get_latest_profiling_snapshot() called exactly once
+def test_explain_table_calls_resolver_exactly_once(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_a.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    with patch(
+        "data.knowledge_graph_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    spy.assert_called_once()
+
+
+# 2 — correct source_id passed
+def test_explain_table_passes_correct_source_id(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_b.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    with patch(
+        "data.knowledge_graph_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    spy.assert_called_once_with(1)
+
+
+# 3 — wrapper helper no longer exists to be called by explain_table()
+#
+# See the equivalent note above test 3 in the Phase 2E.1
+# knowledge_graph_summary section: this was the last production caller of
+# the now-deleted wrapper. Structural replacement coverage lives in
+# test_knowledge_graph_service_has_no_legacy_snapshot_helper and
+# test_all_knowledge_graph_consumers_still_use_shared_resolver near the end
+# of this file.
+
+
+# 4 — response shape unchanged
+def test_explain_table_response_shape_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_d.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert set(result.keys()) == {
+        "source_id", "table_fqn", "table_name", "schema_name", "business_purpose",
+        "business_domain", "business_entity", "business_name", "grain",
+        "classification", "classification_confidence", "profiling", "pii",
+        "relationships", "business_importance", "governance", "governance_score",
+        "evidence", "gaps", "domain_confidence", "entity_confidence",
+    }
+    assert set(result["profiling"].keys()) == {
+        "row_count", "row_count_tier", "fk_count", "referenced_by",
+        "is_root_table", "is_leaf_table", "is_junction_table",
+        "completeness_score", "profiling_depth",
+    }
+    assert set(result["pii"].keys()) == {"pii_column_count", "confirmed_pii_count", "review_needed"}
+    assert set(result["relationships"].keys()) == {"outbound", "inbound"}
+    assert set(result["business_importance"].keys()) == {"score", "label"}
+    assert set(result["governance"].keys()) == {
+        "dictionary_approved", "domain_assigned", "entity_assigned",
+        "profiling_complete", "pii_review_needed",
+    }
+
+
+# 5 — profiling fields unchanged
+def test_explain_table_profiling_fields_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_e.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert result["profiling"] == {
+        "row_count": None,
+        "row_count_tier": None,
+        "fk_count": 0,
+        "referenced_by": 1,
+        "is_root_table": True,
+        "is_leaf_table": False,
+        "is_junction_table": False,
+        "completeness_score": None,
+        "profiling_depth": "STRUCTURAL_ONLY",
+    }
+
+
+# 6 — PII fields unchanged (dbo.invoices: 1 unconfirmed PII column)
+def test_explain_table_pii_fields_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_f.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.invoices")
+
+    assert result is not None
+    assert result["pii"] == {
+        "pii_column_count": 1,
+        "confirmed_pii_count": 0,
+        "review_needed": True,
+    }
+
+
+# 7 — classification fields unchanged
+def test_explain_table_classification_fields_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_g.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert result["classification"] == "Master"
+    assert result["classification_confidence"] == 0.90
+
+
+# 8 — importance score unchanged (exact formula output)
+def test_explain_table_importance_score_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_h.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    # 0.06 (ref_count=1) + 0.20 (root) + 0.20 (Master) + 0.10 (dict approved) = 0.56
+    assert result["business_importance"]["score"] == 0.56
+
+
+# 9 — importance label unchanged
+def test_explain_table_importance_label_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_i.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert result["business_importance"]["label"] == "HIGH"
+
+
+# 10 — score components unchanged: a distinct component mix (root + classification
+# only, no ref-count/PII/dict-approval terms) for dbo.products
+def test_explain_table_score_components_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_j.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.products")
+
+    assert result is not None
+    # 0.20 (root) + 0.12 (Reference) = 0.32; no referenced_by, no PII, dict not approved
+    assert result["business_importance"]["score"] == 0.32
+    assert result["business_importance"]["label"] == "MEDIUM"
+
+
+# 11 — evidence list unchanged (exact order and content)
+def test_explain_table_evidence_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_k.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert result["evidence"] == [
+        "Dictionary business name: Customer",
+        "Dictionary entry approved by human reviewer",
+        "Domain: Sales (90% confidence)",
+        "Entity: Customer (92% confidence)",
+        "Classification: Master (90%)",
+        "Root table: no incoming FKs — primary business entity",
+        "Referenced by 1 other table(s) via FK",
+        "Referenced by FK from: dbo.orders",
+    ]
+
+
+# 12 — gaps list unchanged (dbo.orders: dictionary entry exists but unapproved;
+# domain/entity/profiling/relationships all otherwise present)
+def test_explain_table_gaps_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_l.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.orders")
+
+    assert result is not None
+    assert result["gaps"] == ["Dictionary entry not yet human-approved"]
+
+
+# 13 — governance flags unchanged (dbo.invoices: unapproved dict + unconfirmed PII)
+def test_explain_table_governance_flags_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_m.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.invoices")
+
+    assert result is not None
+    assert result["governance"] == {
+        "dictionary_approved": False,
+        "domain_assigned": True,
+        "entity_assigned": True,
+        "profiling_complete": True,
+        "pii_review_needed": True,
+    }
+    assert result["governance_score"] == 0.75
+
+
+# 14 — relationship context unchanged
+def test_explain_table_relationship_context_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_n.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert result["relationships"]["outbound"] == []
+    assert len(result["relationships"]["inbound"]) == 1
+    assert result["relationships"]["inbound"][0]["from_table_fqn"] == "dbo.orders"
+    assert result["relationships"]["inbound"][0]["from_column"] == "customer_id"
+
+
+# 15 — no-snapshot behavior unchanged: dictionary/domain/entity/relationships
+# present, profiling-derived fields absent/None
+def test_explain_table_no_snapshot_behavior_unchanged(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_o.db")
+    _create_db(db)
+    _seed_minimal_source(db)
+    conn = _conn(db)
+    conn.execute("INSERT INTO schema_snapshots (id, source_id, table_count) VALUES (1, 1, 2)")
+    conn.execute(
+        "INSERT INTO domain_assignments (source_id, profiling_snapshot_id, table_fqn, domain, confidence) "
+        "VALUES (1, 1, 'dbo.orders', 'Sales', 0.8)"
+    )
+    conn.execute(
+        "INSERT INTO table_relationships "
+        "(source_id, snapshot_id, from_schema, from_table, from_table_fqn, "
+        "from_column, to_schema, to_table, to_table_fqn, to_column, "
+        "relationship_name, relationship_type, confidence) "
+        "VALUES (1, 1, 'dbo', 'orders', 'dbo.orders', 'customer_id', "
+        "'dbo', 'customers', 'dbo.customers', 'id', 'FK_orders_customers', 'FOREIGN_KEY', 1.0)"
+    )
+    conn.commit()
+    conn.close()
+    # Deliberately no profiling_snapshots row for source_id=1
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.orders")
+
+    assert result is not None
+    assert result["business_domain"] == "Sales"
+    assert result["classification"] is None
+    assert result["classification_confidence"] is None
+    assert result["profiling"] == {
+        "row_count": None, "row_count_tier": None, "fk_count": None,
+        "referenced_by": None, "is_root_table": None, "is_leaf_table": None,
+        "is_junction_table": None, "completeness_score": None, "profiling_depth": None,
+    }
+    assert result["pii"] == {"pii_column_count": 0, "confirmed_pii_count": 0, "review_needed": False}
+    assert len(result["relationships"]["outbound"]) == 1
+    assert "Not profiled — run structural profiling" in result["gaps"]
+
+
+# 16 — snapshot policy: older COMPLETE beats newer CANCELLED
+def test_explain_table_snapshot_policy_complete_beats_cancelled(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_p.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    cancelled_id = _insert_profiling_snapshot(db, source_id=1, snapshot_version=2, status="CANCELLED")
+    _insert_table_profile_row(
+        db, cancelled_id, source_id=1, table_fqn="dbo.customers", table_name="customers",
+        table_class="Transactional", classification_confidence=0.55,
+        referenced_by_count=9, is_root_table=0, pii_column_count=3, confirmed_pii_count=1,
+    )
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    # Status-aware selection: the seeded COMPLETE snapshot (version 1, id=1
+    # — table_class="Master", classification_confidence=0.90,
+    # referenced_by_count=1, pii_column_count=0, from _seed_full_scenario)
+    # wins over the newer CANCELLED snapshot (version 2) — a newer
+    # non-COMPLETE snapshot must never shadow older, usable COMPLETE
+    # evidence.
+    assert result["classification"] == "Master"
+    assert result["classification_confidence"] == 0.90
+    assert result["profiling"]["referenced_by"] == 1
+    assert result["pii"]["pii_column_count"] == 0
+
+
+# 17 — snapshot policy: older COMPLETE beats newer RUNNING
+def test_explain_table_snapshot_policy_complete_beats_running(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_q.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    running_id = _insert_profiling_snapshot(db, source_id=1, snapshot_version=2, status="RUNNING")
+    _insert_table_profile_row(
+        db, running_id, source_id=1, table_fqn="dbo.customers", table_name="customers",
+        table_class="Reference", classification_confidence=0.44,
+        referenced_by_count=4, is_root_table=0, pii_column_count=2, confirmed_pii_count=2,
+    )
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    # Status-aware selection: the seeded COMPLETE snapshot (version 1, id=1)
+    # wins over the newer RUNNING snapshot (version 2).
+    assert result["classification"] == "Master"
+    assert result["classification_confidence"] == 0.90
+    assert result["profiling"]["referenced_by"] == 1
+    assert result["pii"]["pii_column_count"] == 0
+
+
+# 18 — read-only behavior preserved
+def test_explain_table_read_only_preserved(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_r.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", lambda: _conn(db))
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", lambda: _conn(db))
+
+    def _dump(table: str) -> list[dict]:
+        conn = _conn(db)
+        rows = [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
+        conn.close()
+        return rows
+
+    tables = (
+        "data_source_connections", "schema_snapshots", "profiling_snapshots",
+        "profiling_table_profiles", "profiling_column_profiles",
+        "table_relationships", "domain_assignments", "entity_assignments",
+        "data_dictionary_tables", "data_dictionary_columns",
+    )
+    before = {t: _dump(t) for t in tables}
+
+    explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+    explain_table(source_id=999, user_id="user-kg", table_fqn="dbo.customers")  # not-found path too
+
+    after = {t: _dump(t) for t in tables}
+
+    assert before == after
+
+
+# 19 — resolver connection count preserved: 1 service + 1 resolver = 2 total
+def test_explain_table_connection_count_preserved(tmp_path, monkeypatch):
+    db = str(tmp_path / "kg_p2e3_s.db")
+    _create_db(db)
+    _seed_full_scenario(db)
+
+    counters = {"service_conn": 0, "resolver_conn": 0}
+
+    def counting_service_conn():
+        counters["service_conn"] += 1
+        return _conn(db)
+
+    def counting_resolver_conn():
+        counters["resolver_conn"] += 1
+        return _conn(db)
+
+    monkeypatch.setattr("data.knowledge_graph_service.get_connection", counting_service_conn)
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", counting_resolver_conn)
+
+    result = explain_table(source_id=1, user_id="user-kg", table_fqn="dbo.customers")
+
+    assert result is not None
+    assert counters["service_conn"] == 1
+    assert counters["resolver_conn"] == 1
+    assert counters["service_conn"] + counters["resolver_conn"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2E.4 — Knowledge Graph wrapper retirement
+#
+# _latest_profiling_snap_id() had zero remaining production call sites after
+# Phases 2E.1-2E.3 moved all three knowledge-graph functions
+# (knowledge_graph_summary, find_business_assets, explain_table) onto
+# get_latest_profiling_snapshot() directly. This phase deletes the dead
+# wrapper's definition outright. Mirrors the Phase 2B.8 precedent in
+# tests/test_phase6_semantic.py, the Phase 2C.3 precedent in
+# tests/test_phase3_business_knowledge.py, and the Phase 2D.6 precedent in
+# tests/test_phase5_lineage.py for the identically-named (but separately
+# scoped) wrappers in those modules.
+# ---------------------------------------------------------------------------
+
+# 1 — knowledge_graph_service_has_no_legacy_snapshot_helper
+def test_knowledge_graph_service_has_no_legacy_snapshot_helper():
+    import data.knowledge_graph_service as kg_module
+    assert not hasattr(kg_module, "_latest_profiling_snap_id")
+
+
+# 2 — knowledge_graph_service_source_has_no_legacy_helper_reference
+def test_knowledge_graph_service_source_has_no_legacy_helper_reference():
+    import inspect
+    import data.knowledge_graph_service as kg_module
+
+    source = inspect.getsource(kg_module)
+    assert "_latest_profiling_snap_id" not in source
+
+
+# 3 — all_knowledge_graph_consumers_still_use_shared_resolver
+#
+# Narrow inventory assertion (not a duplicate of every prior delegation
+# test): confirms, via source inspection, that each of the three migrated
+# functions still references the shared resolver by name. Full behavioral
+# delegation coverage (spy call counts, correct source_id, snapshot policy,
+# etc.) already exists per-function earlier in this file — this test only
+# guards against a future edit silently reverting one of the three call
+# sites back to the deleted local helper without any test noticing.
+def test_all_knowledge_graph_consumers_still_use_shared_resolver():
+    import inspect
+    import data.knowledge_graph_service as kg_module
+
+    migrated = [
+        kg_module.knowledge_graph_summary,
+        kg_module.find_business_assets,
+        kg_module.explain_table,
+    ]
+    for fn in migrated:
+        source = inspect.getsource(fn)
+        assert "get_latest_profiling_snapshot(" in source, (
+            f"{fn.__name__} no longer appears to call the shared resolver"
+        )
+        assert "_latest_profiling_snap_id(" not in source, (
+            f"{fn.__name__} appears to reference the retired local helper"
+        )

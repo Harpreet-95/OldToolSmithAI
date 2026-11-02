@@ -46,6 +46,13 @@ _SCHEMA = """
         created_at TEXT NOT NULL DEFAULT '2026-01-01',
         updated_at TEXT NOT NULL DEFAULT '2026-01-01'
     );
+    CREATE TABLE profiling_snapshots (
+        id INTEGER PRIMARY KEY,
+        source_id INTEGER NOT NULL,
+        snapshot_version INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'COMPLETE',
+        schema_snapshot_id INTEGER
+    );
     CREATE TABLE profiling_table_profiles (
         id INTEGER PRIMARY KEY,
         profiling_snapshot_id INTEGER NOT NULL DEFAULT 1,
@@ -141,6 +148,7 @@ def _seed(conn: sqlite3.Connection) -> None:
 
     conn.execute("INSERT INTO data_source_connections (id, display_name) VALUES (1, 'CCPP SQL Server')")
     conn.execute("INSERT INTO data_source_connections (id, display_name) VALUES (2, 'Finance DW')")
+    conn.execute("INSERT INTO profiling_snapshots (id, source_id, snapshot_version) VALUES (1, 1, 1)")
 
     # Tables
     conn.execute("INSERT INTO profiling_table_profiles (source_id, table_fqn, table_name, schema_name, table_class, pii_column_count) VALUES (1, 'dbo.Projects', 'Projects', 'dbo', 'TRANSACTION', 0)")

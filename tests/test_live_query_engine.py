@@ -2,8 +2,7 @@
 Enterprise Live Query Engine (Phase 7) — tests.
 
 Covers query_validator (read-only enforcement), query_limits (clamping),
-LiveQueryEngine (execution, pagination, payload cap, timeout, cancel), and
-orchestrator integration via EnterpriseOrchestrator.run_live_query(). No
+LiveQueryEngine (execution, pagination, payload cap, timeout, cancel). No
 real SQL Server / PostgreSQL / Oracle / MySQL instance is reachable in this
 environment, so execution scenarios use a fake DBAPI2 connection/cursor.
 
@@ -37,8 +36,6 @@ from core.live.query_limits import (
 )
 from core.live.query_result import QueryStatus
 from core.live.query_validator import validate as validate_sql
-from core.orchestrator import EnterpriseOrchestrator, IntentType, OrchestratorRequest
-from core.orchestrator.registry import ServiceRegistry
 import data.datasource_service as datasource_service
 
 
@@ -236,7 +233,6 @@ class TestLiveQueryEngineExecute:
         assert len(result.rows) == 3
         assert result.columns[0]["name"] == "id"
         assert fake_conn.closed is True
-
     def test_row_limit_truncation(self, monkeypatch):
         monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
         description = [("id",)]
@@ -382,6 +378,63 @@ class TestLiveQueryEngineExecute:
         result = LiveQueryEngine().execute(1, "user-1", "SELECT 1")
         assert result.status == QueryStatus.RATE_LIMITED
 
+    def test_default_execution_kind_still_enforces_user_rate_limit(self, monkeypatch):
+        # Day 4, Capability 2 — regression guard: the new execution_kind
+        # parameter must not weaken the 2-second collision window for any
+        # existing caller (none of which pass it, so they all keep
+        # execution_kind="user_query" implicitly).
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+        import data.query_execution_service as qes
+        monkeypatch.setattr(qes, "_check_user_rate_limit", lambda user_id: True)
+
+        result = LiveQueryEngine().execute(1, "user-1", "SELECT 1", execution_kind="user_query")
+        assert result.status == QueryStatus.RATE_LIMITED
+
+    def test_non_user_query_kind_exempt_from_user_rate_limit(self, monkeypatch):
+        # Day 4, Capability 2 — a bounded, same-turn supplementary query
+        # (data.insight_service's period comparison) must never be blocked
+        # by the primary query's own just-written log row. Mirrors the
+        # existing investigation-probe exemption pattern.
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+        description = [("id",)]
+        fake_conn = _FakeConnection(_FakeCursor(description, [(1,)]))
+        monkeypatch.setattr(SQLServerConnector, "open_connection", lambda self, config: fake_conn)
+        import data.query_execution_service as qes
+        monkeypatch.setattr(qes, "_check_user_rate_limit", lambda user_id: True)
+
+        result = LiveQueryEngine().execute(1, "user-1", "SELECT 1", execution_kind="insight_comparison")
+        assert result.status == QueryStatus.SUCCESS
+
+    def test_non_user_query_kind_still_enforces_daily_limit(self, monkeypatch):
+        # Day 4, Capability 2 — only the tight per-user collision window is
+        # exempt; daily/source-rate safeguards must keep counting every
+        # execution_kind, so real query volume is still throttled.
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+        import data.query_execution_service as qes
+        monkeypatch.setattr(qes, "_check_daily_limit", lambda user_id: qes.DAILY_LIMIT)
+
+        result = LiveQueryEngine().execute(1, "user-1", "SELECT 1", execution_kind="insight_comparison")
+        assert result.status == QueryStatus.RATE_LIMITED
+
+    def test_execution_kind_is_recorded_on_log_query_execution(self, monkeypatch):
+        # Day 4, Capability 2 — the comparison query must be logged under
+        # its own kind (audit/observability), not silently as "user_query".
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+        description = [("id",)]
+        fake_conn = _FakeConnection(_FakeCursor(description, [(1,)]))
+        monkeypatch.setattr(SQLServerConnector, "open_connection", lambda self, config: fake_conn)
+        import data.query_execution_service as qes
+        recorded = {}
+        original = qes.log_query_execution
+
+        def _spy(*args, **kwargs):
+            recorded["execution_kind"] = kwargs.get("execution_kind")
+            return original(*args, **kwargs)
+        monkeypatch.setattr(qes, "log_query_execution", _spy)
+
+        LiveQueryEngine().execute(1, "user-1", "SELECT 1", execution_kind="insight_comparison")
+        assert recorded["execution_kind"] == "insight_comparison"
+
     def test_no_credentials_or_raw_sql_in_result(self, monkeypatch):
         monkeypatch.setattr(
             datasource_service, "get_connection_config",
@@ -393,6 +446,93 @@ class TestLiveQueryEngineExecute:
 
         result = LiveQueryEngine().execute(1, "user-1", "SELECT id FROM secret_table")
         assert "hunter2" not in str(result.to_dict())
+
+
+class TestPIIMasking:
+    """
+    Security-hardening regression: LiveQueryEngine.execute() used to hardcode
+    the PII-alias set to an empty set() at query_engine.py:196, so confirmed-PII
+    columns were returned unmasked regardless of governance state. The fix adds
+    an explicit pii_aliases param, sourced by callers (core.orchestrator.agent)
+    from the existing data.query_execution_service._governance_recheck() —
+    the same mechanism the legacy execute_generated_query() path already used.
+    """
+
+    def _fake_ctx_batch_confirmed_pii(self, source_id, user_id, columns):
+        return {
+            (table_fqn, column_name): {
+                "dictionary": {"pii_risk": True, "is_approved": True},
+                "profiling": {"pii_name_heuristic": True, "pii_confirmed": True},
+            }
+            for table_fqn, column_name in columns
+        }
+
+    def test_confirmed_pii_column_is_returned_unmasked_for_standard_identity_data(self, monkeypatch):
+        """2026-08-24 "remove standard-PII blocking" milestone superseded
+        the masking behavior this test used to cover: ordinary business
+        identity/contact data (names, emails, ...) is no longer masked for
+        any requester — core.governance.pii_access_policy.decide_pii_access
+        returns ALLOW, not MASK (MASK is no longer a reachable outcome at
+        all). Only a restricted category (ssn/password/credential/token/...)
+        still blocks, regardless of confirmed-PII/role state — see
+        tests/test_pii_access_policy.py for that coverage."""
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+
+        import data.query_execution_service as qes
+        # Day 4, Capability 6 (Task 3) — _governance_recheck now calls the
+        # batched get_column_business_contexts_batch (one call for every
+        # selected column) instead of get_column_business_context per column.
+        monkeypatch.setattr(qes, "get_column_business_contexts_batch", self._fake_ctx_batch_confirmed_pii)
+
+        sql_plan = {"select": [{"table_fqn": "dbo.customers", "column_name": "last_name", "alias": "last_name"}]}
+        blocked_cols, pii_aliases, gov_warnings = qes._governance_recheck(1, "user-1", sql_plan)
+        # Never masked, never blocked — standard business identity data.
+        assert pii_aliases == set()
+        assert blocked_cols == []
+        assert any(w["type"] == "pii_standard_access" for w in gov_warnings)
+
+        description = [("last_name",)]
+        rows = [("Smith",)]
+        fake_conn = _FakeConnection(_FakeCursor(description, rows))
+        monkeypatch.setattr(SQLServerConnector, "open_connection", lambda self, config: fake_conn)
+
+        result = LiveQueryEngine().execute(
+            1, "user-1", "SELECT last_name FROM customers", pii_aliases=pii_aliases,
+        )
+
+        assert result.status == QueryStatus.SUCCESS
+        assert result.columns[0]["pii"] is False, "never masked under the current standard-identity policy"
+        assert result.rows[0]["last_name"] == "Smith", "standard business identity data returned unmasked"
+
+    def test_non_pii_column_unaffected_by_masking(self, monkeypatch):
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+        description = [("id",), ("name",)]
+        rows = [(1, "Acme Corp")]
+        fake_conn = _FakeConnection(_FakeCursor(description, rows))
+        monkeypatch.setattr(SQLServerConnector, "open_connection", lambda self, config: fake_conn)
+
+        result = LiveQueryEngine().execute(
+            1, "user-1", "SELECT id, name FROM customers", pii_aliases={"ssn"},
+        )
+
+        assert result.columns[0]["pii"] is False
+        assert result.columns[1]["pii"] is False
+        assert result.rows[0]["id"] == 1
+        assert result.rows[0]["name"] == "Acme Corp"
+
+    def test_no_aliases_passed_defaults_to_unmasked(self, monkeypatch):
+        # Backward-compatible default: a caller that does not know about PII
+        # (or passes nothing) gets the pre-fix behavior, not a hard failure.
+        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
+        description = [("ssn",)]
+        rows = [("123-45-6789",)]
+        fake_conn = _FakeConnection(_FakeCursor(description, rows))
+        monkeypatch.setattr(SQLServerConnector, "open_connection", lambda self, config: fake_conn)
+
+        result = LiveQueryEngine().execute(1, "user-1", "SELECT ssn FROM customers")
+
+        assert result.columns[0]["pii"] is False
+        assert result.rows[0]["ssn"] == "123-45-6789"
 
 
 class TestCancel:
@@ -426,70 +566,3 @@ class TestCancel:
 
         t.join(timeout=5)
         assert fake_conn.closed is True
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator integration
-# ---------------------------------------------------------------------------
-
-class TestOrchestratorIntegration:
-    def test_registry_has_at_least_the_live_query_service(self):
-        # Exact count is asserted in tests/test_semantic_query_planner.py,
-        # which tracks the current total (17, after Phase 8 added
-        # "semantic_query_plan"). This test only pins the Phase 7 addition
-        # so it doesn't need updating every time a later phase registers
-        # another service.
-        service_ids = [s.service_id for s in ServiceRegistry().get_all()]
-        assert "live_query" in service_ids
-
-    def test_run_live_query_selects_live_query_service(self, monkeypatch):
-        monkeypatch.setattr(datasource_service, "get_connection_config", lambda sid, uid: _mssql_record())
-        description = [("id",)]
-        fake_conn = _FakeConnection(_FakeCursor(description, [(1,)]))
-        monkeypatch.setattr(SQLServerConnector, "open_connection", lambda self, config: fake_conn)
-
-        req = OrchestratorRequest(
-            query="run this SQL", source_id=1, user_id="user-1",
-            params={"sql": "SELECT id FROM orders"},
-        )
-        package = EnterpriseOrchestrator().run_live_query(req)
-
-        assert package.intent.intent_type == IntentType.SQL_REQUEST
-        service_ids = [c.service_id for c in package.service_calls]
-        assert "live_query" in service_ids
-        live_item = next(e for e in package.evidence if e.source_service == "live_query")
-        assert live_item.data["status"] == "success"
-
-    def test_process_nl_path_unaffected_by_live_query_addition(self):
-        # Regression: the ordinary NL path must not accidentally select
-        # live_query for an unrelated dictionary question.
-        req = OrchestratorRequest(query="show me the dictionary definitions", source_id=None, user_id="user-1")
-        package = EnterpriseOrchestrator().process(req)
-        service_ids = [c.service_id for c in package.service_calls]
-        assert "live_query" not in service_ids
-
-    def test_live_query_adapter_returns_none_without_sql(self, tmp_path, monkeypatch):
-        # Phase A1.2: without an explicit "sql" param, the adapter now treats
-        # req.query as a business question and runs semantic resolution
-        # (data.query_planning_service.plan_business_query) first. Point that
-        # at an isolated, source-less temp DB so this stays a fast, isolated
-        # unit test rather than touching the real project DB — with no
-        # source_id=1 row to resolve, plan_business_query returns None and
-        # the adapter still returns None before any SQL is generated or run.
-        import sqlite3
-        import data.db as db_module
-        import data.models as models
-
-        db_path = str(tmp_path / "no_source.db")
-        monkeypatch.setattr(db_module, "DB_PATH", db_path)
-        models.init_db()
-
-        def _conn():
-            c = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
-            c.row_factory = sqlite3.Row
-            return c
-        monkeypatch.setattr("data.query_planning_service.get_connection", _conn)
-
-        from core.orchestrator.context_builder import _live_query
-        req = OrchestratorRequest(query="anything", source_id=1, user_id="user-1", params={})
-        assert _live_query(req) is None

@@ -18,7 +18,9 @@ Run from the project root:
 """
 from __future__ import annotations
 
+import ast
 import dataclasses
+import inspect
 import json
 import os
 import sqlite3
@@ -34,6 +36,7 @@ os.environ.setdefault("USER_ID_SALT",   "test-salt-dict-service")
 
 from core.connectors.schema import ColumnInfo, SchemaInfo, SchemaSnapshot, TableInfo
 from data.dictionary_service import generate_and_save_dictionary
+from data.profiling_snapshot_resolver import ProfilingSnapshotRef, get_latest_profiling_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +229,15 @@ def _make_db() -> sqlite3.Connection:
 
 @pytest.fixture()
 def db():
-    """Fresh in-memory DB.  Patches get_connection in both service modules."""
+    """Fresh in-memory DB.  Patches get_connection in data.dictionary_service
+    and, as of Phase 2G.3, data.profiling_snapshot_resolver — added ahead of
+    a future migration of the profiling-snapshot lookup onto the shared
+    resolver (mirrors the Relationship Service approach from Phase 2F.3).
+    The resolver isn't called by production code here yet."""
     conn = _make_db()
     wrapper = _NoClose(conn)
-    with patch("data.dictionary_service.get_connection", return_value=wrapper):
+    with patch("data.dictionary_service.get_connection", return_value=wrapper), \
+         patch("data.profiling_snapshot_resolver.get_connection", return_value=wrapper):
         yield conn
     conn.close()
 
@@ -289,11 +297,13 @@ def _seed_schema_snapshot(db: sqlite3.Connection, source_id: int, snap: SchemaSn
     return cur.lastrowid
 
 
-def _seed_profiling_snapshot(db: sqlite3.Connection, source_id: int) -> int:
+def _seed_profiling_snapshot(
+    db: sqlite3.Connection, source_id: int, *, snapshot_version: int = 1, status: str = "COMPLETE"
+) -> int:
     cur = db.execute(
-        "INSERT INTO profiling_snapshots (source_id, schema_snapshot_id, snapshot_version) "
-        "VALUES (?, 1, 1)",
-        (source_id,),
+        "INSERT INTO profiling_snapshots (source_id, schema_snapshot_id, snapshot_version, status) "
+        "VALUES (?, 1, ?, ?)",
+        (source_id, snapshot_version, status),
     )
     db.commit()
     return cur.lastrowid
@@ -370,6 +380,306 @@ def test_no_profiling_snapshot_uses_rule_based_behaviour(db):
     assert entry["semantic_type"] == "id"
     assert "identifier" in entry["meaning"].lower()
     assert entry["generation_method"] == "rule_based"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2G.3 — pre-migration behavioral baseline for the inline
+# "latest profiling snapshot" lookup inside generate_and_save_dictionary().
+# Mirrors the Relationship Service baseline (Phase 2F.3) ahead of a future
+# migration to data.profiling_snapshot_resolver.get_latest_profiling_snapshot().
+#
+# Discriminating signal: generation_method. Empirically verified (not just
+# assumed) that for this test column, semantic_type resolves to 'metric'
+# under pure rule-based classification too, so it cannot distinguish which
+# snapshot was read — but generation_method reliably reflects whether a
+# matching profiling_column_profiles row was found for (table_fqn,
+# column_name) in the *resolved* snapshot: 'rule_based+profiling' if found,
+# 'rule_based' if not (identical to the true no-snapshot case). In each test
+# below, the "wrong" snapshot (the one the resolver must NOT select) is
+# seeded with zero matching column-profile rows, so an incorrect resolution
+# is observable as 'rule_based' instead of 'rule_based+profiling'.
+# ---------------------------------------------------------------------------
+
+def test_older_complete_profiling_snapshot_wins_over_newer_cancelled(db):
+    source_id = _seed_source(db)
+    tables = [_table("dbo", "payments", [_col("val", "INTEGER")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+
+    # Older COMPLETE snapshot carries the column-profile evidence — the
+    # resolver must select it despite a newer, non-COMPLETE snapshot
+    # existing, per the status-aware policy in
+    # data.profiling_snapshot_resolver (a newer CANCELLED/RUNNING snapshot
+    # must never shadow older, usable COMPLETE evidence).
+    older_id = _seed_profiling_snapshot(db, source_id, snapshot_version=1, status="COMPLETE")
+    _seed_col_profile(
+        db, older_id, source_id, "dbo.payments", "val",
+        semantic_type="AMOUNT", semantic_confidence=0.85,
+    )
+
+    # Newer CANCELLED snapshot has no column-profile row at all for this
+    # column — if it were wrongly selected, profiling_context would find no
+    # match and generation_method would stay 'rule_based'.
+    _seed_profiling_snapshot(db, source_id, snapshot_version=2, status="CANCELLED")
+
+    result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    entry = _get_col_entry(db, source_id, "dbo.payments", "val")
+    assert entry["generation_method"] == "rule_based+profiling"
+    assert result["generation_method"] == "rule_based+profiling"
+
+
+def test_older_complete_profiling_snapshot_wins_over_newer_running(db):
+    source_id = _seed_source(db)
+    tables = [_table("dbo", "payments", [_col("val", "INTEGER")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+
+    # Older COMPLETE snapshot carries the column-profile evidence — the
+    # resolver must select it despite a newer, non-COMPLETE snapshot
+    # existing (see policy note above).
+    older_id = _seed_profiling_snapshot(db, source_id, snapshot_version=1, status="COMPLETE")
+    _seed_col_profile(
+        db, older_id, source_id, "dbo.payments", "val",
+        semantic_type="AMOUNT", semantic_confidence=0.85,
+    )
+
+    # Newer RUNNING snapshot has no column-profile row at all for this
+    # column — if it were wrongly selected, profiling_context would find no
+    # match and generation_method would stay 'rule_based'.
+    _seed_profiling_snapshot(db, source_id, snapshot_version=2, status="RUNNING")
+
+    result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    entry = _get_col_entry(db, source_id, "dbo.payments", "val")
+    assert entry["generation_method"] == "rule_based+profiling"
+    assert result["generation_method"] == "rule_based+profiling"
+
+
+def test_highest_snapshot_version_wins(db):
+    """Both snapshots COMPLETE — isolates version as the only distinguishing
+    factor, separate from the CANCELLED/RUNNING precedence tests above."""
+    source_id = _seed_source(db)
+    tables = [_table("dbo", "payments", [_col("val", "INTEGER")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+
+    _seed_profiling_snapshot(db, source_id, snapshot_version=1, status="COMPLETE")
+
+    newer_id = _seed_profiling_snapshot(db, source_id, snapshot_version=2, status="COMPLETE")
+    _seed_col_profile(
+        db, newer_id, source_id, "dbo.payments", "val",
+        semantic_type="AMOUNT", semantic_confidence=0.85,
+    )
+
+    result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    entry = _get_col_entry(db, source_id, "dbo.payments", "val")
+    assert entry["generation_method"] == "rule_based+profiling"
+    assert result["generation_method"] == "rule_based+profiling"
+
+
+def test_profiling_snapshot_source_scoping(db):
+    """source_id has no profiling snapshot at all — the true, already-proven
+    no-snapshot baseline (see test_no_profiling_snapshot_uses_rule_based_behaviour).
+    other_source_id has a far-newer snapshot carrying the AMOUNT override for
+    the SAME table/column names; if source scoping ever broke, it would leak
+    in and flip generation_method to 'rule_based+profiling'."""
+    source_id = _seed_source(db)
+    other_source_id = _seed_source(db)
+    tables = [_table("dbo", "payments", [_col("val", "INTEGER")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+    # source_id itself has NO profiling snapshot.
+
+    other_id = _seed_profiling_snapshot(db, other_source_id, snapshot_version=99, status="COMPLETE")
+    _seed_col_profile(
+        db, other_id, other_source_id, "dbo.payments", "val",
+        semantic_type="AMOUNT", semantic_confidence=0.85,
+    )
+
+    result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    entry = _get_col_entry(db, source_id, "dbo.payments", "val")
+    assert entry["generation_method"] == "rule_based"
+    assert result["generation_method"] == "rule_based"
+
+
+class _CountingConnWrapper:
+    """Wraps the shared in-memory connection: close() is a no-op (the DB
+    must survive across the whole test) while each instance is still a
+    distinguishable object per get_connection() call — used to prove how
+    many separate logical connections handle the profiling-snapshot lookup
+    and its dependent profiling_column_profiles read."""
+
+    def __init__(self, conn, snapshot_lookup_conns: list, col_profile_read_conns: list) -> None:
+        self._conn = conn
+        self._snapshot_lookup_conns = snapshot_lookup_conns
+        self._col_profile_read_conns = col_profile_read_conns
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str):
+            if "FROM profiling_snapshots" in sql and "WHERE source_id = ?" in sql:
+                self._snapshot_lookup_conns.append(self)
+            elif "FROM profiling_column_profiles" in sql and "WHERE profiling_snapshot_id = ?" in sql:
+                self._col_profile_read_conns.append(self)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def close(self) -> None:
+        pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def test_dictionary_service_connection_count_baseline(db):
+    """Pre-migration connection model for the profiling-snapshot lookup
+    block: exactly one Dictionary-Service-owned connection handles both the
+    snapshot lookup and its dependent profiling_column_profiles read, and
+    the shared resolver's own get_connection is never called (the resolver
+    isn't wired into production here yet). Written to remain meaningful
+    after a future migration to conn=conn, where the resolver-owned count
+    should still be 0."""
+    source_id = _seed_source(db)
+    tables = [_table("dbo", "payments", [_col("val", "INTEGER")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+    prof_id = _seed_profiling_snapshot(db, source_id)
+    _seed_col_profile(
+        db, prof_id, source_id, "dbo.payments", "val",
+        semantic_type="AMOUNT", semantic_confidence=0.85,
+    )
+
+    snapshot_lookup_conns: list = []
+    col_profile_read_conns: list = []
+
+    def _counting_get_connection():
+        return _CountingConnWrapper(db, snapshot_lookup_conns, col_profile_read_conns)
+
+    with patch("data.dictionary_service.get_connection", side_effect=_counting_get_connection), \
+         patch("data.profiling_snapshot_resolver.get_connection") as mock_resolver_get_connection:
+        result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    assert len(snapshot_lookup_conns) == 1
+    assert len(col_profile_read_conns) == 1
+    assert snapshot_lookup_conns[0] is col_profile_read_conns[0]  # same connection reused
+    assert mock_resolver_get_connection.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2G.4 — migration proof: generate_and_save_dictionary() now delegates
+# to the shared resolver instead of running its own inline SQL.
+# ---------------------------------------------------------------------------
+
+def test_dictionary_none_path_uses_shared_resolver_with_caller_connection(db):
+    """True no-snapshot baseline. Proves: the resolver is called exactly
+    once, with source_id and the exact connection object
+    generate_and_save_dictionary() itself opened for this block (not a new
+    one), the resolver never opens its own connection, and the no-snapshot
+    success path still works after migration."""
+    source_id = _seed_source(db)
+    tables = [_table("dbo", "orders", [_col("order_id", pk=True), _col("status")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+    # No profiling snapshot seeded.
+
+    opened_connections: list = []
+
+    def _tracking_get_connection():
+        c = _NoClose(db)
+        opened_connections.append(c)
+        return c
+
+    resolver_calls: list = []
+    real_resolver = get_latest_profiling_snapshot
+
+    def _tracking_resolver(source_id_arg, conn=None):
+        # Captured at call time — the function goes on to open more
+        # connections later (_upsert_dictionary, coverage, AI suggestions),
+        # so comparing against opened_connections' final state after the
+        # whole call finishes would compare against the wrong connection.
+        most_recently_opened = opened_connections[-1] if opened_connections else None
+        resolver_calls.append((source_id_arg, conn, most_recently_opened))
+        return real_resolver(source_id_arg, conn=conn)
+
+    with patch("data.dictionary_service.get_connection", side_effect=_tracking_get_connection), \
+         patch("data.dictionary_service.get_latest_profiling_snapshot", side_effect=_tracking_resolver), \
+         patch("data.profiling_snapshot_resolver.get_connection") as mock_resolver_get_connection:
+        result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    assert result["generation_method"] == "rule_based"
+
+    assert len(resolver_calls) == 1
+    called_source_id, called_conn, most_recently_opened_at_call_time = resolver_calls[0]
+    assert called_source_id == source_id
+    # The resolver call is the statement immediately after this block's own
+    # `conn = get_connection()`, with nothing else opening a connection in
+    # between — so the connection most recently opened at the moment of the
+    # call must be the exact object the resolver received.
+    assert called_conn is most_recently_opened_at_call_time
+    assert mock_resolver_get_connection.call_count == 0
+
+
+def test_dictionary_resolver_result_drives_profile_lookup(db):
+    """Patches the resolver symbol imported into dictionary_service to
+    return a controlled ProfilingSnapshotRef whose id has NO corresponding
+    row in profiling_snapshots at all (no real profiling snapshot is ever
+    seeded for source_id). If the function still ran the removed inline
+    SELECT, it would find nothing and stay purely rule-based; seeing the
+    profiling override applied instead proves the function now uses
+    snapshot.id from the resolver's return value directly."""
+    source_id = _seed_source(db)
+    tables = [_table("dbo", "payments", [_col("val", "INTEGER")])]
+    _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
+
+    fake_snapshot_id = 999
+    _seed_col_profile(
+        db, fake_snapshot_id, source_id, "dbo.payments", "val",
+        semantic_type="AMOUNT", semantic_confidence=0.85,
+    )
+    fake_ref = ProfilingSnapshotRef(
+        id=fake_snapshot_id, source_id=source_id, snapshot_version=1,
+        status="COMPLETE", schema_snapshot_id=1,
+    )
+
+    with patch("data.dictionary_service.get_latest_profiling_snapshot", return_value=fake_ref):
+        result = generate_and_save_dictionary(source_id, "user-1")
+
+    assert result is not None
+    entry = _get_col_entry(db, source_id, "dbo.payments", "val")
+    assert entry["generation_method"] == "rule_based+profiling"
+    assert result["generation_method"] == "rule_based+profiling"
+
+
+def test_dictionary_service_has_no_inline_latest_profiling_snapshot_sql():
+    source = inspect.getsource(generate_and_save_dictionary)
+    assert "FROM profiling_snapshots" not in source
+    assert "SELECT id FROM profiling_snapshots" not in source
+
+
+def test_dictionary_service_uses_shared_resolver_with_conn():
+    """Narrow AST check scoped to generate_and_save_dictionary()'s own
+    source only: exactly one get_latest_profiling_snapshot(...) call, with
+    source_id passed positionally and conn=conn passed by keyword."""
+    source = inspect.getsource(generate_and_save_dictionary)
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "get_latest_profiling_snapshot"
+    ]
+    assert len(calls) == 1, "expected exactly one get_latest_profiling_snapshot(...) call"
+
+    call = calls[0]
+    positional_names = [a.id for a in call.args if isinstance(a, ast.Name)]
+    assert "source_id" in positional_names
+
+    keyword_values = {kw.arg: kw.value for kw in call.keywords}
+    assert "conn" in keyword_values
+    conn_value = keyword_values["conn"]
+    assert isinstance(conn_value, ast.Name) and conn_value.id == "conn"
 
 
 # ---------------------------------------------------------------------------

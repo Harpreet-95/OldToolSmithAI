@@ -70,7 +70,9 @@ _QEL_DDL = """
         status               TEXT    NOT NULL,
         error_code           TEXT,
         executed_at          TEXT    NOT NULL,
-        created_at           TEXT    NOT NULL
+        created_at           TEXT    NOT NULL,
+        execution_kind       TEXT    NOT NULL DEFAULT 'user_query',
+        pipeline_trace_encrypted TEXT
     )
 """
 
@@ -193,6 +195,7 @@ def _no_governance(*_a, **_kw):
 def _patch_exec_deps(monkeypatch, db_conn=None, governance_fn=None):
     """Patch execution-layer deps for execute_generated_query tests."""
     _conn = db_conn or _make_db_conn(_make_cursor([], []))
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", lambda s, u: (_conn, "mssql"))
     monkeypatch.setattr(svc, "_governance_recheck", governance_fn or _no_governance)
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
@@ -522,10 +525,11 @@ def test_log_called_on_safety_gate_block(monkeypatch, log_db):
 
 def test_log_called_on_pii_governance_block(monkeypatch, log_db):
     """PII block → log_query_execution called with error_code='pii_blocked'."""
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", lambda s, u: (MagicMock(), "mssql"))
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
 
-    def _pii_blocked(sid, uid, plan):
+    def _pii_blocked(sid, uid, plan, **_kw):
         return ["dbo.t.ssn"], set(), []
 
     monkeypatch.setattr(svc, "_governance_recheck", _pii_blocked)
@@ -547,6 +551,7 @@ def test_log_called_on_pii_governance_block(monkeypatch, log_db):
 
 def test_log_called_on_connection_failure(monkeypatch, log_db):
     """Connection failure → log_query_execution called with error_code='connection_failed'."""
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_governance_recheck", _no_governance)
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
 
@@ -574,6 +579,7 @@ def test_log_called_on_connection_failure(monkeypatch, log_db):
 def test_log_called_on_timeout(monkeypatch, log_db):
     """Timeout → log_query_execution called with status='timeout', error_code='timeout'."""
     monkeypatch.setattr(svc, "DEFAULT_QUERY_TIMEOUT_S", 1)
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_governance_recheck", _no_governance)
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
 

@@ -14,6 +14,7 @@ from core.profiling.sql.mssql import (
     build_date_range_query as _date_range_fn,
     build_histogram_query as _histogram_fn,
     build_percentile_query as _percentile_fn,
+    build_referential_overlap_query as _referential_overlap_fn,
     build_row_count_query as _row_count_fn,
     build_sample_values_query as _sample_values_fn,
     build_top_values_query as _top_values_fn,
@@ -92,6 +93,15 @@ class MssqlProfilingQueryBuilder(ProfilingQueryBuilder):
             f"SELECT COUNT_BIG(DISTINCT {c}) AS distinct_count\n"
             f"FROM {t} WITH (NOLOCK)"
         )
+
+    def build_referential_overlap_query(
+        self,
+        from_table_fqn: str,
+        from_column: str,
+        to_table_fqn: str,
+        to_column: str,
+    ) -> str:
+        return _referential_overlap_fn(from_table_fqn, from_column, to_table_fqn, to_column)
 
     def quote_identifier(self, identifier: str) -> str:
         return _q(identifier)
@@ -183,7 +193,7 @@ class SQLServerConnector(DataSourceConnector):
         database = params.get("database", "?")
         return f"mssql://{host}:{port}/{database}"
 
-    def open_connection(self, config: DataSourceConfig):
+    def open_connection(self, config: DataSourceConfig, timeout_s: int | None = None):
         if not _PYODBC_AVAILABLE:
             raise RuntimeError(
                 "pyodbc is not installed. Cannot open a live SQL Server connection."
@@ -194,7 +204,7 @@ class SQLServerConnector(DataSourceConnector):
             raise ValueError(
                 f"Invalid SQL Server connection configuration: missing parameter {exc}"
             ) from exc
-        return pyodbc.connect(conn_str, timeout=30)
+        return pyodbc.connect(conn_str, timeout=timeout_s if timeout_s is not None else 30)
 
     def get_query_builder(self) -> MssqlProfilingQueryBuilder:
         return MssqlProfilingQueryBuilder()
@@ -206,6 +216,7 @@ class SQLServerConnector(DataSourceConnector):
                 source_type=self.source_type,
                 discovered_at=datetime.now(timezone.utc).isoformat(),
                 warnings=["pyodbc is not installed. Cannot discover schema."],
+                discovery_succeeded=False,
             )
 
         warnings_list: list[str] = []
@@ -220,6 +231,7 @@ class SQLServerConnector(DataSourceConnector):
                 source_type=self.source_type,
                 discovered_at=datetime.now(timezone.utc).isoformat(),
                 warnings=[f"Invalid connection configuration: {exc}"],
+                discovery_succeeded=False,
             )
 
         try:
@@ -391,7 +403,7 @@ class SQLServerConnector(DataSourceConnector):
                 warnings=warnings_list,
             )
 
-        except Exception:
+        except Exception as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             logger.error("mssql schema discovery failed")
             return SchemaSnapshot(
@@ -399,7 +411,11 @@ class SQLServerConnector(DataSourceConnector):
                 source_type=self.source_type,
                 discovered_at=datetime.now(timezone.utc).isoformat(),
                 discovery_duration_ms=elapsed_ms,
-                warnings=["Schema discovery failed. Check connection parameters and server availability."],
+                warnings=[
+                    "Schema discovery failed. Check connection parameters and server availability.",
+                    str(exc),
+                ],
+                discovery_succeeded=False,
             )
 
         finally:

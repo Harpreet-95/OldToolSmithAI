@@ -21,6 +21,7 @@ import logging
 from collections import deque
 
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +43,6 @@ def _verify_source(conn, source_id: int, user_id: str):
 def _latest_schema_snap_id(conn, source_id: int) -> int | None:
     row = conn.execute(
         "SELECT id FROM schema_snapshots WHERE source_id = ? "
-        "ORDER BY snapshot_version DESC LIMIT 1",
-        (source_id,),
-    ).fetchone()
-    return row["id"] if row else None
-
-
-def _latest_profiling_snap_id(conn, source_id: int) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM profiling_snapshots WHERE source_id = ? "
         "ORDER BY snapshot_version DESC LIMIT 1",
         (source_id,),
     ).fetchone()
@@ -269,7 +261,8 @@ def get_upstream_lineage(
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         if not snap_id:
             return _empty_lineage(source_id, table_fqn, "upstream")
@@ -318,7 +311,8 @@ def get_downstream_lineage(
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         if not snap_id:
             return _empty_lineage(source_id, table_fqn, "downstream")
@@ -381,7 +375,8 @@ def impact_analysis(
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         if not snap_id:
             return _empty_impact(source_id, table_fqn, column_name)
@@ -512,7 +507,8 @@ def critical_asset_analysis(source_id: int, user_id: str) -> dict | None:
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         if not snap_id:
             return {
@@ -651,7 +647,8 @@ def lineage_summary(source_id: int, user_id: str) -> dict | None:
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         # Total schema table count
         snap_meta = conn.execute(

@@ -9,18 +9,31 @@ class LifecycleTrigger(str, Enum):
     (no cron is implemented in this phase) — run_autonomous_lifecycle() takes
     a trigger value as a plain argument so wiring a scheduler later requires
     no changes to this module.
+
+    PROFILING_COMPLETE fires when a FULL/batch profiling run transitions to
+    status==COMPLETE with no accompanying schema change — the automatic
+    downstream-semantic-refresh trigger (dictionary/vocabulary/domain/
+    entity/relationships) for profiling/classification evidence that
+    changed without a schema diff to hang off of. See
+    data.profiling_service.continue_batch_profiling, the single choke point
+    every profiling-advance path (scheduler tick, resumed run, manual
+    "continue" API call) already goes through.
     """
-    SCAN_COMPLETE     = "scan_complete"
-    MANUAL            = "manual"
-    SCHEDULED_NIGHTLY = "scheduled_nightly"
-    SCHEDULED_HOURLY  = "scheduled_hourly"
+    SCAN_COMPLETE       = "scan_complete"
+    MANUAL              = "manual"
+    PROFILING_COMPLETE  = "profiling_complete"
+    SCHEDULED_NIGHTLY   = "scheduled_nightly"
+    SCHEDULED_HOURLY    = "scheduled_hourly"
 
 
 class WorkflowStep(str, Enum):
     CHANGE_DETECTION         = "change_detection"
     REFRESH_DICTIONARY       = "refresh_dictionary"
+    CLASSIFY_PII             = "classify_pii"
     REFRESH_DOMAINS          = "refresh_domains"
     REFRESH_ENTITIES         = "refresh_entities"
+    GOVERNANCE_AUTO_MATURATION = "governance_auto_maturation"
+    REFRESH_VOCABULARY       = "refresh_vocabulary"
     REFRESH_RELATIONSHIPS    = "refresh_relationships"
     REFRESH_KNOWLEDGE_GRAPH  = "refresh_knowledge_graph"
     DETECT_GOVERNANCE_IMPACT = "detect_governance_impact"
@@ -89,8 +102,11 @@ class LifecycleRunResult:
     steps: list[StepResult] = field(default_factory=list)
     change_set: ChangeSet | None = None
     dictionary_summary: dict | None = None
+    curation_summary: dict | None = None
+    pii_summary: dict | None = None
     domain_summary: dict | None = None
     entity_summary: dict | None = None
+    vocabulary_summary: dict | None = None
     relationship_summary: dict | None = None
     review_tasks_created: int = 0
     notifications_sent: int = 0
@@ -126,8 +142,11 @@ class LifecycleRunResult:
                 else None
             ),
             "dictionary_summary": self.dictionary_summary,
+            "curation_summary": self.curation_summary,
+            "pii_summary": self.pii_summary,
             "domain_summary": self.domain_summary,
             "entity_summary": self.entity_summary,
+            "vocabulary_summary": self.vocabulary_summary,
             "relationship_summary": self.relationship_summary,
             "review_tasks_created": self.review_tasks_created,
             "notifications_sent": self.notifications_sent,

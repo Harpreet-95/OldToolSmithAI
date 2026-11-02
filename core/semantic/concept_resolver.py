@@ -4,7 +4,6 @@ import re
 from datetime import date, timedelta
 
 from core.dictionary.rule_classifier import _tokenize
-from core.semantic.execution_plan import ConceptMatch, ConceptStatus
 
 # Small, deterministic stopword set for splitting a raw business question into
 # candidate concept/measure/dimension terms. Deliberately mirrors the same
@@ -36,9 +35,16 @@ _STOPWORDS = frozenset({
     "made", "make", "worked", "linked", "added", "most", "performing",
     "to", "s", "still", "so", "number", "we", "i", "you", "they", "it",
     "active", "inactive", "open", "closed", "cancelled", "canceled", "completed", "pending",
-    "latest", "newest", "earliest", "oldest", "current", "recent", "top", "bottom",
+    "latest", "newest", "earliest", "oldest", "current", "recent", "recently", "top", "bottom",
     "distinct", "unique",
     "total", "average", "highest", "lowest", "sum", "percent", "percentage", "compare",
+    # Phase 4, Milestone 1 (Enterprise Semantic Accuracy) additions — same
+    # imperative-instruction category as the "show"/"list"/"display"/"give"/
+    # "get"/"find"/"tell" entries above, just missing until this milestone's
+    # failure audit found them leaking into concept/measure search as their
+    # own bogus term (e.g. "Sort clients by name" searching for a column
+    # named "sort").
+    "sort", "sorted", "return",
     # Day 2C follow-up ("material qualifier policy") — "database" is a
     # generic, self-referential word ("how many students are in the
     # database?") that never names a real business concept and predictably
@@ -80,12 +86,20 @@ _STOPWORDS = frozenset({
     "created", "create", "registered", "inserted", "insert",
     "ended", "end", "complete", "finished", "finish",
     "updated", "update", "modified", "modify",
+    # FINISH INTERACTIVE AI Q&A WIRING milestone, Part 7 — "trend"/"trends"
+    # ("Show enrollment trend by month") is the identical imperative/
+    # analytical-request category as "show"/"list"/"compare" above: it
+    # names HOW to present the answer (a time series), never a business
+    # entity, column, or table a resolver could ever legitimately match.
+    # Live-confirmed against real CCPP: left unstopped, it survived
+    # extraction as a genuine leftover concept/measure term and tripped
+    # attempt_ai_physical_plan's extra_term_implies_attribute_request_out_
+    # of_stage1_scope safety net (correctly, since that check has no way to
+    # know "trend" isn't a real requested column) -- the actual fix is
+    # here, at the source, not a new exemption in that already-general
+    # check.
+    "trend", "trends",
 })
-
-# A term counts as "ambiguous" when the top two distinct-table search results
-# score within this margin of each other on search_metadata's relevance scale.
-_AMBIGUITY_MARGIN = 15.0
-
 
 def extract_terms(question: str) -> tuple[list[str], list[str], list[str]]:
     """Split a NL question into (concepts, measure_terms, dimension_terms).
@@ -129,13 +143,29 @@ def extract_terms(question: str) -> tuple[list[str], list[str], list[str]]:
     for _phrase in _extract_status_enumeration(question or ""):
         _status_enum_words.update(_tokenize(_phrase))
 
-    # "on file" / "on record" — see _IDIOM_PHRASES' own docstring. Only the
-    # words of a phrase that actually matched are removed, same discipline
-    # as _date_phrase_words above.
+    # "on file" / "on record" / "has an email" / "missing a phone number" —
+    # see _IDIOM_PHRASES' own docstring. Only the words of a phrase that
+    # actually matched are removed, same discipline as _date_phrase_words
+    # above — the idiom's SUBJECT word (e.g. "email") is never in the
+    # stripped label, so it stays a real term for concept/column search.
     _idiom_phrase_words: set[str] = set()
-    for _label, _pattern in _IDIOM_PHRASES:
+    for _label, _pattern, _polarity in _IDIOM_PHRASES:
         if _pattern.search(question or ""):
             _idiom_phrase_words.update(_tokenize(_label.replace("_", " ")))
+
+    # CURRENT-STATE MILESTONE, Part 2 — "currently enrolled"/"still active"/
+    # "current status" is a MATERIAL semantic constraint
+    # (extract_query_intent's current_state_required), not a business
+    # concept/column name to search for. Unlike the idiom phrases above,
+    # BOTH words of the matched phrase are stripped (not just the modifier)
+    # — "enrolled"/"active"/"employed"/"subscribed" have no meaning here as
+    # a standalone searchable term either; they only ever named a state
+    # together with "currently"/"still". Same "only the words of a phrase
+    # that actually matched are removed" discipline as _date_phrase_words.
+    _current_state_words: set[str] = set()
+    _cs_required, _cs_phrase, _cs_subject = _detect_current_state(question or "")
+    if _cs_required and _cs_phrase:
+        _current_state_words.update(_tokenize(_cs_phrase))
 
     # A bare numeral ("10") is never a business concept/measure/dimension
     # name — it is always either a LIMIT (already parsed separately by
@@ -146,7 +176,7 @@ def extract_terms(question: str) -> tuple[list[str], list[str], list[str]]:
     words = [
         w for w in _tokenize(question or "")
         if w and w not in _date_phrase_words and w not in _status_enum_words
-        and w not in _idiom_phrase_words and not w.isdigit()
+        and w not in _idiom_phrase_words and w not in _current_state_words and not w.isdigit()
     ]
     try:
         by_idx = words.index("by")
@@ -293,12 +323,16 @@ _SUM_RE        = re.compile(r"\btotal\b|\bsum of\b", re.IGNORECASE)
 _AVG_RE        = re.compile(r"\baverage\b|\bavg\b|\bmean\b", re.IGNORECASE)
 _MIN_RE        = re.compile(r"\blowest\b|\bsmallest\b|\bminimum\b|\bmin\b", re.IGNORECASE)
 # "most" is a MAX-equivalent ranking word ("the most classes", "the most
-# workflows") except when it precedes "recent"/"current" — that phrasing is
-# reserved for _LATEST_RE's date-ordering signal below, not an aggregation
-# (mirrors the existing _LEADING_FIRST_RE "not immediately followed by
-# 'name'" guard further down in this file for the same kind of collision).
+# workflows") except when it precedes "recent(ly)"/"current" — that phrasing
+# is reserved for _LATEST_RE's date-ordering signal below, not an
+# aggregation (mirrors the existing _LEADING_FIRST_RE "not immediately
+# followed by 'name'" guard further down in this file for the same kind of
+# collision). The lookahead must match "recently" too, not just "recent" —
+# a bare "\brecent\b" left "most recently added" incorrectly matching MAX
+# (the word-boundary after "recent" never lands inside "recently"),
+# misclassifying an entity-count/list question as a scalar MAX aggregate.
 _MAX_RE        = re.compile(
-    r"\bhighest\b|\blargest\b|\bmaximum\b|\bmax\b|\bbiggest\b|\bmost\b(?!\s+(?:recent|current)\b)",
+    r"\bhighest\b|\blargest\b|\bmaximum\b|\bmax\b|\bbiggest\b|\bmost\b(?!\s+(?:recent(?:ly)?|current)\b)",
     re.IGNORECASE,
 )
 
@@ -310,8 +344,22 @@ _MAX_RE        = re.compile(
 # detector above rather than duplicating that word list. Only used by
 # extract_terms() when no "by" clause is present, so it never touches the
 # existing "measure by dimension" path.
+# FINAL PRE-37 MILESTONE, Part 3 — "Which category has the FEWEST products?"
+# is the same WH-ranking grammatical shape as the MAX case above, just the
+# opposite direction. Kept as its own word set rather than added to _MIN_RE
+# itself: "fewest"/"least" specifically mean "smallest COUNT of rows", never
+# a scalar MIN of a stored numeric column (unlike "lowest"/"smallest"/
+# "minimum", which _MIN_RE already covers for the bare-scalar-aggregate
+# case elsewhere) — conflating the two would risk misclassifying an
+# unrelated bare scalar-MIN question.
+_WH_RANKING_MIN_WORDS_RE = re.compile(
+    r"\blowest\b|\bsmallest\b|\bminimum\b|\bmin\b|\bfewest\b|\bleast\b",
+    re.IGNORECASE,
+)
 _WH_RANKING_RE = re.compile(
-    rf"^\s*(?:which|what)\s+(?P<entity>.+?)\s+\w+\s+(?:the\s+)?(?:{_MAX_RE.pattern})\s+(?P<measure>.+?)\s*\??\s*$",
+    rf"^\s*(?:which|what)\s+(?P<entity>.+?)\s+\w+\s+(?:the\s+)?"
+    rf"(?P<rankword>{_MAX_RE.pattern}|{_WH_RANKING_MIN_WORDS_RE.pattern})"
+    rf"\s+(?P<measure>.+?)\s*\??\s*$",
     re.IGNORECASE,
 )
 
@@ -336,7 +384,13 @@ _DISTINCT_RE   = re.compile(r"\bdistinct\b|\bunique\b", re.IGNORECASE)
 
 _TOP_N_RE      = re.compile(r"\btop\s+(\d+)\b", re.IGNORECASE)
 _BOTTOM_N_RE   = re.compile(r"\bbottom\s+(\d+)\b", re.IGNORECASE)
-_LATEST_RE     = re.compile(r"\b(latest|newest|recent|current)\b", re.IGNORECASE)
+# "10 most recently added" / "10 most recent" — an explicit row count named
+# WITHOUT the literal word "top" (_TOP_N_RE requires "top" immediately before
+# the digits, so it never matches this phrasing). Checked ahead of the bare
+# _LATEST_RE branch below so the question's own explicit number wins over
+# the generic default limit.
+_N_MOST_RECENT_RE = re.compile(r"\b(\d+)\s+most\s+recent(?:ly)?\b", re.IGNORECASE)
+_LATEST_RE     = re.compile(r"\b(latest|newest|recent(?:ly)?|current)\b", re.IGNORECASE)
 # Phase 6.4 (Enterprise Semantic Accuracy) note: "recent"/"current" added as
 # LATEST-equivalent synonyms. Milestone M-1 only wired "latest"/"newest"
 # here; Phase 6.3 separately added "current"/"recent" to the Intent
@@ -350,14 +404,63 @@ _LATEST_RE     = re.compile(r"\b(latest|newest|recent|current)\b", re.IGNORECASE
 _EARLIEST_RE   = re.compile(r"\b(earliest|oldest)\b", re.IGNORECASE)
 _LEADING_FIRST_RE = re.compile(r"^\s*first\b(?!\s+name)", re.IGNORECASE)
 
+# Bare singular superlative ranking with no countable "top N" phrasing
+# ("Who is the top performing recruiter?", "What is the best client?") — the
+# same no-count, entity-plus-implicit-measure shape _LATEST_RE/_EARLIEST_RE
+# above already handle for date ranking, generalized to a non-date measure.
+# Root-caused live against real CCPP (Portable Business Learning Layer
+# milestone, Part 0 ground-truth verification): "Who is the top performing
+# recruiter?" has no digit after "top", so _TOP_N_RE never matched, `order`
+# stayed None, and the downstream AI Physical Planner's own comment
+# ("ai_interpretation.sorting is ignored in favor of the deterministic
+# query_intent['order']") meant the AI Interpreter's own correctly-detected
+# sorting intent (measures=["performance"], sorting={"by":"performance",
+# "limit":1}) was silently discarded entirely -- producing an unfiltered
+# bare list of every row instead of a ranking, a resolvable-uncertainty
+# investigation, or a safe refusal. limit defaults to 1 (singular "the top
+# X"/"the best X"), not _DEFAULT_ORDER_LIMIT (10, a LATEST/EARLIEST-style
+# multi-row listing default) -- matches the AI interpreter's own
+# independently-derived limit for this exact phrasing.
+_BARE_TOP_SUPERLATIVE_RE = re.compile(r"\b(?:top|best)\b(?!\s*\d)", re.IGNORECASE)
+_BARE_BOTTOM_SUPERLATIVE_RE = re.compile(r"\bworst\b(?!\s*\d)", re.IGNORECASE)
+
 # Default row cap for TOP/BOTTOM/LATEST/EARLIEST when the question doesn't
 # name an explicit number (e.g. "latest invoices" vs "top 10 clients").
 _DEFAULT_ORDER_LIMIT = 10
 
-_STATUS_VALUES = ("active", "inactive", "open", "closed", "completed", "cancelled", "pending")
+_STATUS_VALUES = (
+    "active", "inactive", "open", "closed", "completed", "cancelled", "pending",
+    # NEXT MILESTONE, Part 1/4 — generic antonym-pair status words. Not
+    # CCPP-specific: these are common business status vocabulary (the same
+    # closed-list style as the original 7 words above), added so the
+    # inherently-negative pole of a pair ("unpaid", "disabled") is matched
+    # exactly like "inactive" already was, and so _STATUS_NEGATION_CUE_RE
+    # below has a positive-pole word ("paid", "enabled") to negate via
+    # "not paid"/"not enabled".
+    "paid", "unpaid", "enabled", "disabled",
+)
 _STATUS_ALIASES = {"canceled": "cancelled"}
 _STATUS_RE = re.compile(
     r"\b(" + "|".join(_STATUS_VALUES) + "|" + "|".join(_STATUS_ALIASES) + r")\b",
+    re.IGNORECASE,
+)
+
+# NEXT MILESTONE, Part 1 — root cause of "List classes that are not active"
+# incorrectly generating IsActive = 1: _STATUS_RE above matches the bare word
+# "active" inside "not active" (the word boundary before "active" is still
+# satisfied), and nothing downstream ever looked at what came before the
+# match — the "not" was silently discarded. This regex detects a negation
+# cue occupying the text IMMEDIATELY (whitespace-only) before a status-word
+# match: applied to the prefix substring via search()+"$"-anchoring, so it
+# only fires when the cue directly precedes the matched word, never when a
+# negation appears earlier in an unrelated clause ("Students who are not in
+# the active program" would not — deliberately conservative, see the
+# adjacent-word discipline _raw_adjacent already uses elsewhere in this
+# file). Deliberately generic — no CCPP-specific status list, works for any
+# word _STATUS_RE matches (active/paid/completed/cancelled/enabled/...).
+_STATUS_NEGATION_CUE_RE = re.compile(
+    r"\b(?:not|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|"
+    r"doesn't|doesnt|don't|dont|didn't|didnt|no\s+longer|never)\s*$",
     re.IGNORECASE,
 )
 
@@ -408,10 +511,84 @@ _BETWEEN_DATES_RE = re.compile(
 # Phrase-scoped (like _DATE_LABEL_PATTERNS/_extract_status_enumeration
 # below) so only the words of a MATCHED idiom are dropped — "file"/"record"
 # used as genuine business nouns elsewhere are never globally banned.
-_IDIOM_PHRASES = (
-    ("on_file", re.compile(r"\bon file\b", re.IGNORECASE)),
-    ("on_record", re.compile(r"\bon record\b", re.IGNORECASE)),
+#
+# NEXT MILESTONE — INTERACTIVE AI Q&A COVERAGE COMPLETION + SAFETY, Part 3 —
+# widened from the original on_file/on_record pair to the general class of
+# EXISTENCE/NULL business idioms ("has an email", "missing a phone number",
+# "without an email", "where X exists") and each entry now also carries its
+# POLARITY: "not_null" (the idiom asserts the subject attribute IS
+# populated) or "null" (the idiom asserts it is ABSENT). Every entry is
+# still phrase-scoped exactly like on_file/on_record above — the SUBJECT
+# word after the idiom (e.g. "email") is never part of the stripped label,
+# so it always survives as a real term for the caller to resolve to a
+# column. Deliberately does NOT include a bare "with a/an X" pattern: "with"
+# is used for genuine attribute=value filters too often in real business
+# questions ("clients with open job orders", "students with an F grade") to
+# treat as an unconditional existence signal from a regex alone — that
+# shape is left to the AI interpreter's own (per-question, semantically
+# aware) filter extraction instead, never guessed deterministically here.
+# The has/have pattern excludes a following past-participle/gerund word
+# ("have graduated", "have enrolled") via negative lookahead, since that is
+# a status/relationship statement, not an existence qualifier.
+_IDIOM_PHRASES: tuple[tuple[str, "re.Pattern[str]", str], ...] = (
+    ("on_file", re.compile(r"\bon file\b", re.IGNORECASE), "not_null"),
+    ("on_record", re.compile(r"\bon record\b", re.IGNORECASE), "not_null"),
+    # FINAL PRE-37 MILESTONE, Part 2 — excludes a bare "the" immediately
+    # after has/have (no "a"/"an" article) from the existence-idiom match.
+    # Live-confirmed against real CCPP: "Which location HAS THE most
+    # classes?" was matching this idiom ("has" + no article + "the", which
+    # the un-narrowed \w+ happily captured) and being treated as an
+    # existence check ("does location have a 'the'?"), not the ranking
+    # question it actually is. "has the X" is not a genuine English
+    # existence idiom in the first place — the definite article "the"
+    # signals a specific/already-known reference (ranking superlatives,
+    # comparisons, ordinary entity mentions), never "does X exist at all"
+    # (that reading uses "a"/"an" or a bare noun: "has an email"/"has
+    # email"). Scoped to exactly this one word so genuine idioms with an
+    # indefinite article ("has a phone number") or no article at all ("has
+    # email on file") are completely unaffected.
+    ("has_have", re.compile(
+        r"\b(?:has|have)\s+(?:an?\s+)?(?!\w+(?:ed|ing)\b)(?!the\b)\w+", re.IGNORECASE,
+    ), "not_null"),
+    ("without", re.compile(r"\bwithout\s+(?:an?\s+)?", re.IGNORECASE), "null"),
+    ("missing", re.compile(r"\bmissing\s+(?:an?\s+)?", re.IGNORECASE), "null"),
+    ("lacking", re.compile(r"\blacking\s+(?:an?\s+)?", re.IGNORECASE), "null"),
+    ("is_are_missing", re.compile(r"\b(?:is|are)\s+missing\b", re.IGNORECASE), "null"),
+    ("where_exists", re.compile(r"\bwhere\s+\w+\s+exists?\b", re.IGNORECASE), "not_null"),
 )
+
+# CURRENT-STATE MILESTONE, Part 2 — "currently"/"still X"/"current X" names a
+# MATERIAL current-state constraint (active/non-cancelled/non-ended/still-
+# in-force), never a decorative word to search for as a business term.
+# Deliberately generic — no CCPP-specific vocabulary, and no assumption here
+# about WHICH column satisfies it; that schema-driven discovery lives in
+# core.answering.current_state_semantics, reached only after this function
+# has already told the caller a current-state requirement exists at all.
+# `subject` (group 1) is the word the modifier attaches to ("enrolled" in
+# "currently enrolled", "active" in "still active") when the phrasing names
+# one — checked first, since it is the more specific/informative match, the
+# same "more specific pattern wins" discipline _DATE_LABEL_PATTERNS already
+# documents. The bare fallback (no following word, e.g. "Are they currently
+# still?" — rare) still sets the flag with subject=None rather than losing
+# the signal entirely.
+_CURRENT_STATE_SUBJECT_RE = re.compile(
+    r"\b(?:currently|still|current)\s+([a-z]+)\b", re.IGNORECASE,
+)
+_CURRENT_STATE_BARE_RE = re.compile(r"\b(?:currently|still)\b", re.IGNORECASE)
+
+
+def _detect_current_state(question: str) -> tuple[bool, str | None, str | None]:
+    """(required, phrase, subject) for extract_query_intent's own
+    current_state_required/current_state_phrase/current_state_subject
+    fields — see that function's docstring."""
+    q = question or ""
+    m = _CURRENT_STATE_SUBJECT_RE.search(q)
+    if m:
+        return True, m.group(0), m.group(1).lower()
+    m = _CURRENT_STATE_BARE_RE.search(q)
+    if m:
+        return True, m.group(0), None
+    return False, None, None
 
 # Ordered so more specific phrases ("this week") are checked before anything
 # that could partially overlap a less specific one.
@@ -499,6 +676,58 @@ def _compute_date_range(label: str, today: date | None = None) -> dict | None:
     return {"label": label, "start": start.isoformat(), "end": end.isoformat()}
 
 
+# ---------------------------------------------------------------------------
+# Aggregation Semantics / Composed Ranking milestone, Part 2 — ranking
+# DIRECTION as a signal fully independent of aggregation FUNCTION.
+#
+# extract_query_intent()'s own `order` field intentionally stays narrow (top
+# N / bottom N / N-most-recent / latest / earliest / bare "top"|"best"|
+# "worst" — see _BARE_TOP_SUPERLATIVE_RE's docstring above for why that carve
+# -out exists and why it deliberately excludes highest/largest/most/lowest/
+# smallest/fewest/maximum/minimum: those words are ALSO the vocabulary
+# extract_query_intent uses to pick the aggregation FUNCTION for a bare
+# scalar superlative ("the highest salary" -> MAX(salary), no grouping, no
+# ranking needed at all). Folding them into `order` too would make every
+# bare "highest X" question ALSO carry a synthetic order/limit, which is
+# wrong for that shape and — verified against
+# core.orchestrator.ai_physical_planning's own ranking-gate ("a ranking
+# request with no dimension to group by is disqualified, never guessed") —
+# would turn "largest single order" from a valid bare MAX into a safe
+# refusal. That is a real, different shape from "highest TOTAL cost" (a
+# GROUP BY + aggregate + rank-and-take-top-1 request), and the two must not
+# be conflated by widening `order` itself.
+#
+# This function is the deliberately SEPARATE signal: it answers "does this
+# question's wording carry ranking direction," with no opinion on whether
+# ranking actually applies (that decision needs to know whether a grouping
+# dimension exists, which only the caller — a bare-superlative-vs-grouped-
+# aggregate branch in the physical planner — actually knows). Reuses the
+# exact same vetted word lists already defined above (_MAX_RE/
+# _WH_RANKING_MIN_WORDS_RE/_BARE_TOP_SUPERLATIVE_RE/
+# _BARE_BOTTOM_SUPERLATIVE_RE) rather than a new, divergent word list.
+# ---------------------------------------------------------------------------
+
+def detect_ranking_direction(question: str) -> str | None:
+    """Returns "DESC" for a top/highest/largest/most/best-shaped superlative,
+    "ASC" for a bottom/lowest/smallest/fewest/least/worst-shaped one, or None
+    when the question carries no ranking-direction wording at all.
+
+    Deliberately independent of aggregation-function detection (a caller
+    that also needs SUM/AVG/COUNT/MIN/MAX should call extract_query_intent
+    separately — the two are two distinct fields by design, never
+    conflated: a question's ranking direction and its aggregation function
+    are orthogonal, see this milestone's fix to extract_query_intent's own
+    aggregation priority order above for the bug this exact conflation
+    caused). No AI/LLM, deterministic regex only.
+    """
+    q = question or ""
+    if _MAX_RE.search(q) or _BARE_TOP_SUPERLATIVE_RE.search(q):
+        return "DESC"
+    if _WH_RANKING_MIN_WORDS_RE.search(q) or _BARE_BOTTOM_SUPERLATIVE_RE.search(q):
+        return "ASC"
+    return None
+
+
 def extract_query_intent(question: str, *, today: date | None = None) -> dict:
     """Detect the SHAPE of a business question — aggregation, distinct,
     ranking/ordering, date range, status value — from the raw NL text.
@@ -518,21 +747,44 @@ def extract_query_intent(question: str, *, today: date | None = None) -> dict:
           "order": {"direction": "ASC"|"DESC", "limit": int} | None,
           "date_range": {"label": str, "start": iso, "end": iso} | None,
           "status_value": "Active"|"Inactive"|...|None,
+          "status_negated": bool,  # True for "not active"/"isn't active"/...
           "null_check_requested": bool,
+          "null_check_polarity": "not_null"|"null"|None,
+          "current_state_required": bool,  # "currently"/"still X"/"current X" — see _detect_current_state
+          "current_state_phrase": str | None,  # the literal matched phrase, e.g. "currently enrolled"
+          "current_state_subject": str | None,  # the word it modifies, e.g. "enrolled"; None for a bare match
         }
     """
     q = question or ""
 
+    # Aggregation Semantics / Composed Ranking milestone, Part 1/2 — SUM
+    # (and AVG, already correctly ordered before this fix) must win over a
+    # bare superlative word (highest/largest/most/lowest/smallest/...) when
+    # BOTH appear in the same question. Live-confirmed root cause (Fixture
+    # E, "Which depot has the highest total maintenance cost?"): the old
+    # order below was COUNT, AVG, MIN, MAX, SUM — an elif chain, so once
+    # _MAX_RE matched "highest" the scan never reached "total" at all, and
+    # aggregation came back "MAX" (a scalar max of ONE work order's cost)
+    # instead of "SUM" (the actual "total" the question asked for).
+    # "total"/"sum of" is an explicit, unambiguous aggregation-function
+    # QUALIFIER — it must always beat a superlative word that is doing
+    # RANKING work, not aggregation-function work, in the same sentence
+    # (see detect_ranking_direction() below, which independently recovers
+    # the ranking direction those same superlative words also carry, so
+    # nothing is lost by no longer letting them win the aggregation-function
+    # vote). SUM is deliberately placed in the same position AVG already
+    # occupied (ahead of MIN/MAX) rather than merely swapped with MAX, so
+    # "highest total X" and "highest average X" are now handled identically.
     if _COUNT_RE.search(q):
         aggregation = "COUNT"
     elif _AVG_RE.search(q):
         aggregation = "AVG"
+    elif _SUM_RE.search(q):
+        aggregation = "SUM"
     elif _MIN_RE.search(q):
         aggregation = "MIN"
     elif _MAX_RE.search(q):
         aggregation = "MAX"
-    elif _SUM_RE.search(q):
-        aggregation = "SUM"
     else:
         aggregation = None
 
@@ -541,14 +793,21 @@ def extract_query_intent(question: str, *, today: date | None = None) -> dict:
     order: dict | None = None
     top_match = _TOP_N_RE.search(q)
     bottom_match = _BOTTOM_N_RE.search(q)
+    n_recent_match = _N_MOST_RECENT_RE.search(q)
     if top_match:
         order = {"direction": "DESC", "limit": int(top_match.group(1))}
     elif bottom_match:
         order = {"direction": "ASC", "limit": int(bottom_match.group(1))}
+    elif n_recent_match:
+        order = {"direction": "DESC", "limit": int(n_recent_match.group(1)), "target": "date"}
     elif _LATEST_RE.search(q):
         order = {"direction": "DESC", "limit": _DEFAULT_ORDER_LIMIT, "target": "date"}
     elif _EARLIEST_RE.search(q) or _LEADING_FIRST_RE.search(q):
         order = {"direction": "ASC", "limit": _DEFAULT_ORDER_LIMIT, "target": "date"}
+    elif _BARE_TOP_SUPERLATIVE_RE.search(q):
+        order = {"direction": "DESC", "limit": 1}
+    elif _BARE_BOTTOM_SUPERLATIVE_RE.search(q):
+        order = {"direction": "ASC", "limit": 1}
 
     date_range = None
     between_match = _BETWEEN_DATES_RE.search(q)
@@ -566,10 +825,23 @@ def extract_query_intent(question: str, *, today: date | None = None) -> dict:
 
     status_match = _STATUS_RE.search(q)
     status_value = None
+    status_negated = False
     if status_match:
         raw = status_match.group(1).lower()
         canonical = _STATUS_ALIASES.get(raw, raw)
         status_value = canonical.capitalize()
+        # NEXT MILESTONE, Part 1 — status_value stays the LITERAL matched
+        # word (unchanged from before this milestone): "inactive" still
+        # produces status_value="Inactive", not a normalized "Active"+
+        # negated=True. Normalizing inherently-negative words would be
+        # unsafe for a real TEXT status column with >2 values (e.g. Active/
+        # Inactive/Pending) — "!= 'Active'" would wrongly include Pending
+        # rows that "= 'Inactive'" correctly excludes. status_negated is
+        # purely an ADDITIONAL signal for the "not <word>" phrasing case,
+        # where no literal negative-pole word exists in the question at
+        # all — see _typed_status_filter_value's own docstring downstream
+        # for how the two combine.
+        status_negated = bool(_STATUS_NEGATION_CUE_RE.search(q[:status_match.start()]))
 
     # "are stalled, active, graduated, or not started" — a genuine
     # multi-value status/category ENUMERATION (grouped-count shape),
@@ -589,7 +861,25 @@ def extract_query_intent(question: str, *, today: date | None = None) -> dict:
     # silently counted every client). Surfaced here as a plain bool;
     # data.query_planning_service pairs it with whichever single
     # already-resolved column the idiom's subject term maps to.
-    null_check_requested = any(pattern.search(q) for _label, pattern in _IDIOM_PHRASES)
+    #
+    # NEXT MILESTONE — Part 3 — null_check_requested now also fires for the
+    # wider existence-idiom class (has/without/missing/lacking/where X
+    # exists), and null_check_polarity names which direction the FIRST
+    # matching idiom asserts ("not_null" or "null") — callers that only
+    # ever supported the not_null case (on_file/on_record) must check
+    # polarity == "not_null" before acting, so they are never silently
+    # handed a "null" idiom they'd apply with the wrong sign. When more
+    # than one idiom matches the same question (rare, e.g. a contradictory
+    # phrasing), the first match in _IDIOM_PHRASES' own declared order wins
+    # — same "more specific/earlier entry wins" discipline _DATE_LABEL_
+    # PATTERNS already documents above.
+    null_check_requested = False
+    null_check_polarity: str | None = None
+    for _label, _pattern, _polarity in _IDIOM_PHRASES:
+        if _pattern.search(q):
+            null_check_requested = True
+            null_check_polarity = _polarity
+            break
 
     # Milestone Phase 6.2 — Aggregation Shape Correctness. A pure relabeling
     # of the aggregation/distinct signals already detected above — no new
@@ -616,6 +906,8 @@ def extract_query_intent(question: str, *, today: date | None = None) -> dict:
     else:
         aggregation_target = None
 
+    current_state_required, current_state_phrase, current_state_subject = _detect_current_state(q)
+
     return {
         "aggregation": aggregation,
         "aggregation_target": aggregation_target,
@@ -624,7 +916,12 @@ def extract_query_intent(question: str, *, today: date | None = None) -> dict:
         "date_range": date_range,
         "status_value": status_value,
         "status_values": status_values,
+        "status_negated": status_negated,
         "null_check_requested": null_check_requested,
+        "null_check_polarity": null_check_polarity,
+        "current_state_required": current_state_required,
+        "current_state_phrase": current_state_phrase,
+        "current_state_subject": current_state_subject,
     }
 
 
@@ -792,6 +1089,17 @@ def derive_analytics_intent(question: str, *, today: date | None = None) -> dict
         else:
             aggregation = "COUNT"
             aggregation_target = "distinct_entity_count" if query_intent["distinct"] else "entity_count"
+    elif question_type == "trend" and not query_intent["aggregation"]:
+        # A trend question naming no explicit numeric aggregation verb
+        # ("total"/"average"/...) means "count of records per time bucket"
+        # (e.g. "enrollment trend by month" = count of enrollments per
+        # month) — the same count-of-records default `ranking` above
+        # already applies when its own measure phrase names no explicit
+        # aggregation. query_intent["aggregation"] (a whole-question SUM/
+        # AVG/COUNT scan) still wins first, so "total enrollment trend by
+        # month" correctly stays SUM.
+        aggregation = "COUNT"
+        aggregation_target = "distinct_entity_count" if query_intent["distinct"] else "entity_count"
     else:
         aggregation = query_intent["aggregation"]
         aggregation_target = query_intent["aggregation_target"]
@@ -801,13 +1109,41 @@ def derive_analytics_intent(question: str, *, today: date | None = None) -> dict
         ordering = order["direction"]
         top_n = order.get("limit")
     elif question_type == "ranking":
-        ordering = "DESC"
+        # FINAL PRE-37 MILESTONE, Part 3 — direction follows the actual
+        # matched rank word ("fewest"/"lowest"/... -> ASC) rather than
+        # always defaulting to DESC; only wh_ranking carries a captured
+        # rankword (top_n_by's "top/bottom N" phrasing already set `order`
+        # above via extract_query_intent, so this branch is wh_ranking-only
+        # in practice).
+        if wh_is_real_ranking and _WH_RANKING_MIN_WORDS_RE.search(wh_match.group("rankword") or ""):
+            ordering = "ASC"
+        else:
+            ordering = "DESC"
+        # Existing, already-tested contract (test_analytics_intent_layer.py):
+        # a bare "which X has the most Y" with no explicit number still
+        # returns up to _DEFAULT_ORDER_LIMIT (10) ranked rows, not a forced
+        # single row — ties are common in real data, and the caller can
+        # always read just the first row for "the" winner. An explicit
+        # "top 5 locations by classes" still goes through extract_query_
+        # intent's own order/limit detection above and never reaches this
+        # branch.
         top_n = _DEFAULT_ORDER_LIMIT
     else:
         ordering = None
         top_n = None
 
     if entity and measure:
+        confidence = "high"
+    elif measure and question_type == "trend":
+        # A bare calendar-grain trend ("<measure> trend by month/year/...")
+        # has no separate business entity to group by — the time bucket
+        # itself is the grouping, resolved later via the calendar-grain
+        # dimension fallback, not through `entity` here (entity_candidates
+        # is expected to be empty once trend words like "month" are
+        # stripped from it above). Requiring `entity` too would permanently
+        # cap every such question at "medium", so query_planning_service's
+        # high-confidence gap-fill (including the aggregation default just
+        # above) would never reach it.
         confidence = "high"
     elif entity or measure:
         confidence = "medium"
@@ -828,64 +1164,89 @@ def derive_analytics_intent(question: str, *, today: date | None = None) -> dict
     }
 
 
-def _table_ref(result: dict) -> str:
-    schema = result.get("schema_name") or ""
-    table = result.get("table_name") or ""
-    return f"{schema}.{table}" if schema or table else ""
+# ---------------------------------------------------------------------------
+# EDP AI-Native Phase 1 — Comparison baseline detection.
+#
+# derive_analytics_intent() above already classifies question_type=="comparison"
+# via _COMPARISON_RE ("compare"/"comparison"/"versus"/"vs"/"difference
+# between"), but that regex alone can't tell a caller WHICH prior period to
+# compare against, and doesn't match the "compared to"/"YoY"/"previous
+# period" phrasing this milestone specifically needs (verified: \bcompare\b
+# requires the exact word "compare", not "compared" — "compared to last
+# month" does not match _COMPARISON_RE at all). This function adds baseline
+# extraction only; it does not change _COMPARISON_RE, question_type, or any
+# existing derive_analytics_intent() behavior, and every existing caller of
+# derive_analytics_intent is unaffected. Deterministic regex only, no AI/LLM,
+# same collision-checked-narrow style as the rest of this file.
+#
+# "MoM"/"WoW" bare acronyms are deliberately NOT matched (unlike "YoY"/"QoQ")
+# — "mom" and "wow" collide with common English words ("mom" = mother, "wow"
+# = exclamation) and would false-positive on ordinary questions. The spelled-
+# out "month-over-month"/"week-over-week" forms are still covered.
+# ---------------------------------------------------------------------------
+
+_YOY_RE = re.compile(r"\byear[\s-]over[\s-]year\b|\byoy\b", re.IGNORECASE)
+_QOQ_RE = re.compile(r"\bquarter[\s-]over[\s-]quarter\b|\bqoq\b", re.IGNORECASE)
+_MOM_SPELLED_RE = re.compile(r"\bmonth[\s-]over[\s-]month\b", re.IGNORECASE)
+_WOW_SPELLED_RE = re.compile(r"\bweek[\s-]over[\s-]week\b", re.IGNORECASE)
+
+# "vs/versus/compared to/compared with (the) prior|previous|last <grain>" —
+# captures which time grain the comparison is against. Two capture groups
+# (not one alternation) because the "compared to the previous month" and
+# bare "previous month" shapes have different leading context; group index
+# tells the caller nothing extra, so detect_comparison_intent() below just
+# takes whichever one matched.
+_PRIOR_GRAIN_RE = re.compile(
+    r"\b(?:vs\.?|versus|compared to|compared with)\s+(?:the\s+)?(?:prior|previous|last)\s+(year|quarter|month|week)\b"
+    r"|\b(?:prior|previous)\s+(year|quarter|month|week)\b",
+    re.IGNORECASE,
+)
+_GENERIC_PRIOR_PERIOD_RE = re.compile(r"\b(?:prior|previous)\s+period\b", re.IGNORECASE)
 
 
-def resolve_concepts(source_id: int, user_id: str, terms: list[str]) -> list[ConceptMatch]:
+def detect_comparison_intent(question: str) -> dict | None:
+    """Detect a period-over-period comparison request and, where the text
+    supports it, which baseline/grain to compare against.
+
+    Returns None when the question carries no comparison language at all.
+    Otherwise returns {"requested": True, "baseline": ..., "grain": ...}
+    where baseline is one of "year_over_year"/"quarter_over_quarter"/
+    "month_over_month"/"week_over_week"/"previous_period"/"unspecified", and
+    grain (when known) is "year"|"quarter"|"month"|"week". "unspecified" is
+    the fallback for _COMPARISON_RE's own generic words ("compare X and Y",
+    a same-period comparison with no time baseline at all) — surfaced so a
+    caller can still flag requires_insights without inventing a baseline it
+    can't support.
     """
-    For each term, search existing metadata (dictionary/domain/entity/schema)
-    for what it actually matches on this source. Never invents a match —
-    every matched table/column/domain/entity comes straight from
-    data.search_service.search_metadata's own results.
-    """
-    from data.search_service import search_metadata
+    q = question or ""
+    if _YOY_RE.search(q):
+        return {"requested": True, "baseline": "year_over_year", "grain": "year"}
+    if _QOQ_RE.search(q):
+        return {"requested": True, "baseline": "quarter_over_quarter", "grain": "quarter"}
+    if _MOM_SPELLED_RE.search(q):
+        return {"requested": True, "baseline": "month_over_month", "grain": "month"}
+    if _WOW_SPELLED_RE.search(q):
+        return {"requested": True, "baseline": "week_over_week", "grain": "week"}
 
-    matches: list[ConceptMatch] = []
-    for term in terms:
-        try:
-            result = search_metadata(term, source_id=source_id, limit=10)
-        except Exception:  # noqa: BLE001
-            result = {"results": []}
+    grain_match = _PRIOR_GRAIN_RE.search(q)
+    if grain_match:
+        grain = (grain_match.group(1) or grain_match.group(2) or "").lower() or None
+        return {"requested": True, "baseline": "previous_period", "grain": grain}
 
-        results = result.get("results") or []
-        if not results:
-            matches.append(ConceptMatch(term=term, status=ConceptStatus.UNKNOWN))
-            continue
+    if _GENERIC_PRIOR_PERIOD_RE.search(q):
+        return {"requested": True, "baseline": "previous_period", "grain": None}
 
-        tables = list(dict.fromkeys(_table_ref(r) for r in results if _table_ref(r)))
-        columns = [
-            {"table_fqn": _table_ref(r), "column_name": r["column_name"]}
-            for r in results if r.get("asset_type") == "column" and r.get("column_name")
-        ]
-        domains = sorted({r["domain"] for r in results if r.get("domain")})
-        entities = sorted({r["entity"] for r in results if r.get("entity")})
+    if _COMPARISON_RE.search(q):
+        return {"requested": True, "baseline": "unspecified", "grain": None}
 
-        top_score = results[0]["relevance_score"]
-        distinct_table_scores = list(dict.fromkeys(
-            (r["relevance_score"], _table_ref(r)) for r in results
-        ))
-        distinct_tables_seen = {t for _, t in distinct_table_scores}
+    return None
 
-        status = ConceptStatus.RESOLVED
-        if len(distinct_tables_seen) >= 2:
-            scores_by_table: dict[str, float] = {}
-            for score, table in distinct_table_scores:
-                scores_by_table.setdefault(table, score)
-            ranked = sorted(scores_by_table.values(), reverse=True)
-            if len(ranked) >= 2 and (ranked[0] - ranked[1]) < _AMBIGUITY_MARGIN:
-                status = ConceptStatus.AMBIGUOUS
 
-        matches.append(ConceptMatch(
-            term=term,
-            status=status,
-            matched_tables=tables,
-            matched_columns=columns,
-            matched_domains=domains,
-            matched_entities=entities,
-            confidence=round(min(1.0, top_score / 100.0), 4),
-        ))
-
-    return matches
+# FINAL LEGACY SIDE-CHANNEL RETIREMENT MILESTONE — _table_ref and
+# resolve_concepts (the raw-term-to-metadata resolver backing the now-deleted
+# core.semantic.planner.SemanticQueryPlanner) were removed here: zero
+# remaining callers anywhere in the codebase once SemanticQueryPlanner itself
+# was deleted. extract_terms/extract_query_intent/derive_analytics_intent
+# above are unrelated and unaffected — they remain the shared deterministic
+# primitives the AI-first pipeline and plan_business_query's own deterministic
+# construction still use.

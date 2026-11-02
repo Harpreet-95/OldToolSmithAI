@@ -122,7 +122,17 @@ def _select_entries(
             continue
         column_name = sel.get("column_name")
         time_grain = sel.get("time_grain")
-        if column_name is None:
+        derived_case = sel.get("derived_case")
+        if derived_case:
+            # AI-FIRST CAPABILITY HARDENING milestone, Part 4 — a business
+            # concept with no literal column (e.g. "status" derived from
+            # CancelID/EndDate nullability) renders as a CASE WHEN
+            # expression, not a raw column reference. Aliased on the
+            # requested concept term itself (e.g. "status"), mirroring how a
+            # calendar-grain dimension aliases on its grain rather than the
+            # raw column — the returned rows only ever contain this alias.
+            alias = re.sub(r"\W+", "_", entry["term"].strip().lower()).strip("_") or "derived_status"
+        elif column_name is None:
             alias = "row_count"
         elif time_grain:
             # Calendar-grain dimension ("each year" -> YEAR(StartDate)) —
@@ -139,6 +149,7 @@ def _select_entries(
             "aggregation": aggregation,
             "distinct":    bool((distinct or sel.get("distinct")) and aggregation and column_name is not None),
             "time_grain":  time_grain,
+            "derived_case": derived_case,
         })
     return rows, unresolved
 
@@ -278,15 +289,23 @@ def _build_group_by(select: list[dict]) -> list[dict]:
     has_measure = any(row["aggregation"] for row in select)
     if not has_measure:
         return []
-    return [
-        (
-            {"table_fqn": row["table_fqn"], "column_name": row["column_name"],
-             "time_grain": row["time_grain"], "alias": row["alias"]}
-            if row.get("time_grain") else
-            {"table_fqn": row["table_fqn"], "column_name": row["column_name"], "alias": row["alias"]}
-        )
-        for row in select if not row["aggregation"]
-    ]
+    rows = []
+    for row in select:
+        if row["aggregation"]:
+            continue
+        if row.get("derived_case"):
+            rows.append({
+                "table_fqn": row["table_fqn"], "column_name": row["column_name"],
+                "derived_case": row["derived_case"], "alias": row["alias"],
+            })
+        elif row.get("time_grain"):
+            rows.append({
+                "table_fqn": row["table_fqn"], "column_name": row["column_name"],
+                "time_grain": row["time_grain"], "alias": row["alias"],
+            })
+        else:
+            rows.append({"table_fqn": row["table_fqn"], "column_name": row["column_name"], "alias": row["alias"]})
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -309,38 +328,78 @@ def _check_pii_and_approval(
     business_knowledge_service.get_column_business_context — precise flags,
     not a parse of query_plan's free-text warning strings. Bounded to the
     columns actually selected (never the full candidate set).
+
+    2026-08-24 "remove standard-PII blocking for live SQL" milestone — only
+    a restricted-category column (authentication/cryptographic secrets —
+    core.dictionary.pii_detector.is_restricted_category) blocks planning
+    now, and unconditionally (allow_unconfirmed_pii never overrides a
+    restricted column — there is no bypass for credential/secret data
+    anywhere in this codebase). Ordinary business identity/contact PII
+    (confirmed or not) is never blocked here; data.query_execution_service.
+    _governance_recheck applies the identical policy again at execution
+    time, so this is defense-in-depth, not the only gate.
     """
     pii_blocks: list[str] = []
     warnings: list[dict] = []
     for row in select:
-        ctx = get_column_business_context(source_id, user_id, row["table_fqn"], row["column_name"])
-        if ctx is None:
-            continue
-        dic = ctx.get("dictionary")
-        prof = ctx.get("profiling")
-
-        if not dic or not dic.get("is_approved"):
-            warnings.append({
-                "type": "metadata_not_approved", "severity": "LOW",
-                "message": f"{row['table_fqn']}.{row['column_name']} has no approved dictionary entry.",
-            })
-
-        if _is_pii_flagged(dic, prof):
-            confirmed  = bool(prof and prof.get("pii_confirmed"))
-            aggregation = row.get("aggregation")
-            warnings.append({
-                "type": "pii_involved", "severity": "MEDIUM" if confirmed else "HIGH",
-                "message": (
-                    f"{row['table_fqn']}.{row['column_name']} may contain PII "
-                    f"({'confirmed' if confirmed else 'unconfirmed'})."
-                ),
-            })
-            # Aggregated columns (COUNT/SUM/AVG/etc.) never return raw cell values —
-            # the PII flag on the source column does not apply to the aggregate output.
-            if not aggregation and not confirmed and not allow_unconfirmed_pii:
-                pii_blocks.append(f"{row['table_fqn']}.{row['column_name']} (unconfirmed PII)")
-
+        # AI-FIRST CAPABILITY HARDENING milestone, Part 4 — a derived_case
+        # dimension has no single "the" column: its CASE expression reads
+        # from every condition column across every category. Each of those
+        # real columns must clear the SAME PII/approval gate a plainly-
+        # selected column would, never just the representative column_name
+        # this row happens to carry for alias/known-column bookkeeping.
+        columns_to_check = (
+            [(row["table_fqn"], c) for c in row["derived_case"]["referenced_columns"]]
+            if row.get("derived_case") else
+            [(row["table_fqn"], row["column_name"])]
+        )
+        for check_table_fqn, check_column_name in columns_to_check:
+            _check_one_column_pii_and_approval(
+                source_id, user_id, check_table_fqn, check_column_name,
+                row.get("aggregation"), pii_blocks, warnings,
+            )
     return pii_blocks, warnings
+
+
+def _check_one_column_pii_and_approval(
+    source_id: int, user_id: str, table_fqn: str, column_name: str,
+    aggregation: str | None, pii_blocks: list[str], warnings: list[dict],
+) -> None:
+    from core.dictionary.pii_detector import is_restricted_category
+
+    ctx = get_column_business_context(source_id, user_id, table_fqn, column_name)
+    if ctx is None:
+        return
+    dic = ctx.get("dictionary")
+    prof = ctx.get("profiling")
+
+    if not dic or not dic.get("is_approved"):
+        warnings.append({
+            "type": "metadata_not_approved", "severity": "LOW",
+            "message": f"{table_fqn}.{column_name} has no approved dictionary entry.",
+        })
+
+    if _is_pii_flagged(dic, prof):
+        confirmed  = bool(prof and prof.get("pii_confirmed"))
+        restricted = is_restricted_category(column_name)
+        warnings.append({
+            "type": "pii_involved", "severity": "HIGH" if restricted else "LOW",
+            "message": (
+                f"{table_fqn}.{column_name} is a restricted category "
+                "(authentication/cryptographic secret)."
+                if restricted else
+                f"{table_fqn}.{column_name} is standard business "
+                f"identity/contact data ({'confirmed' if confirmed else 'unclassified'} PII) — "
+                "queryable under the current product access policy."
+            ),
+        })
+        # Aggregated columns (COUNT/SUM/AVG/etc.) never return raw cell values —
+        # exempt even a restricted column, mirroring core.governance.
+        # pii_access_policy.decide_pii_access's own precedence (aggregation
+        # checked before the restricted-category gate) exactly, so the two
+        # layers never disagree about the same column/aggregation pair.
+        if restricted and not aggregation:
+            pii_blocks.append(f"{table_fqn}.{column_name} (restricted category)")
 
 
 # Priority tiers for auto-selected bare-entity-list columns — lower sorts
@@ -352,9 +411,24 @@ _LIST_ENTITY_TIER_STATUS = 2
 _LIST_ENTITY_TIER_DATE = 3
 _LIST_ENTITY_TIER_DIMENSION = 4
 _LIST_ENTITY_TIER_OTHER = 5
+# Persistence Consistency milestone, Part 7/8/10 -- a column with NO
+# dictionary/profiling/schema evidence of being a genuine business
+# attribute (no business_label, not status/date/dimension-shaped) AND
+# whose own schema shape is a bare, non-PK numeric column is the classic
+# "surrogate ID / internal FK" pattern (CancelID, MarketingID, PathOrderID,
+# PrePathID, ... — real, live-observed CCPP examples). Real profiled
+# dimension-eligible TEXT/DATETIME/BOOLEAN columns still land in
+# _LIST_ENTITY_TIER_DIMENSION via _is_dimension_column's OWN schema-only
+# fallback below, reused unchanged — this tier only ever catches what that
+# function would never promote (its schema-only fallback explicitly
+# excludes non-TEXT/DATETIME/BOOLEAN data types), so a genuinely useful but
+# not-yet-dictionary-tagged text/date column is never demoted here.
+_LIST_ENTITY_TIER_LIKELY_SURROGATE_ID = 6
 
 
-def _list_entity_column_tier(dic: dict | None, schema: dict | None) -> int:
+def _list_entity_column_tier(col: dict) -> int:
+    dic = col.get("dictionary")
+    schema = col.get("schema")
     if (schema and schema.get("is_primary_key")) or (dic and dic.get("is_id")):
         return _LIST_ENTITY_TIER_IDENTIFIER
     if dic and dic.get("business_label"):
@@ -365,6 +439,19 @@ def _list_entity_column_tier(dic: dict | None, schema: dict | None) -> int:
         return _LIST_ENTITY_TIER_DATE
     if dic and dic.get("is_dimension"):
         return _LIST_ENTITY_TIER_DIMENSION
+    from data.query_planning_service import _is_dimension_column
+
+    if _is_dimension_column(col):
+        return _LIST_ENTITY_TIER_DIMENSION
+    if (
+        dic is None
+        and not col.get("profiling")
+        and schema
+        and not schema.get("is_primary_key")
+        and not schema.get("is_identity")
+        and (schema.get("data_type") or "").upper() in ("INTEGER", "DECIMAL", "FLOAT", "NUMERIC", "BIGINT", "SMALLINT")
+    ):
+        return _LIST_ENTITY_TIER_LIKELY_SURROGATE_ID
     return _LIST_ENTITY_TIER_OTHER
 
 
@@ -382,22 +469,37 @@ def _select_safe_list_entity_columns(
     module. Preference order: identifier, business label, status, date,
     other dimensions, then any other safe column — ties keep known_columns'
     original order. Capped at _MAX_LIST_ENTITY_COLUMNS, same as before.
-    """
+
+    Persistence Consistency milestone, Part 7/8/10 — columns classified
+    _LIST_ENTITY_TIER_LIKELY_SURROGATE_ID (a bare, non-PK numeric column
+    with no dictionary/profiling evidence at all — the classic undocumented
+    internal FK/surrogate-ID shape) are EXCLUDED from the result by
+    default, not merely sorted last: on a small table (most tables have
+    well under _MAX_LIST_ENTITY_COLUMNS columns), sorting alone changes
+    nothing because there is no cap pressure to trim them, which is exactly
+    the live-confirmed CCPP regression this fix closes ("Show students and
+    their programs" selecting every raw internal column — CancelID,
+    MarketingID, PathOrderID, PrePathID, URLKey, ... — because none of them
+    were ever excluded, only reordered). Included ONLY as a last resort
+    when excluding them would leave zero columns for this table (never
+    silently return nothing when a bare surrogate ID is genuinely the only
+    column available)."""
     ctx = get_table_business_context(source_id, user_id, table_fqn)
     col_ctx_by_name = {c["column_name"]: c for c in (ctx.get("columns") or [])} if ctx else {}
 
     safe: list[tuple[int, int, str]] = []
     for idx, col_name in enumerate(known_column_names):
-        col_ctx = col_ctx_by_name.get(col_name)
-        dic = col_ctx.get("dictionary") if col_ctx else None
-        prof = col_ctx.get("profiling") if col_ctx else None
-        schema = col_ctx.get("schema") if col_ctx else None
+        col_ctx = col_ctx_by_name.get(col_name) or {}
+        dic = col_ctx.get("dictionary")
+        prof = col_ctx.get("profiling")
         if _is_pii_flagged(dic, prof):
             continue
-        safe.append((_list_entity_column_tier(dic, schema), idx, col_name))
+        safe.append((_list_entity_column_tier(col_ctx), idx, col_name))
 
     safe.sort(key=lambda t: (t[0], t[1]))
-    return [col_name for _, _, col_name in safe[:_MAX_LIST_ENTITY_COLUMNS]]
+    preferred = [t for t in safe if t[0] != _LIST_ENTITY_TIER_LIKELY_SURROGATE_ID]
+    result = preferred if preferred else safe
+    return [col_name for _, _, col_name in result[:_MAX_LIST_ENTITY_COLUMNS]]
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +592,27 @@ def build_sql_plan(
             ]
             if intent.get("type") == "joined_detail_list":
                 select += dimension_rows
+            # Automatic Descriptor Enrichment — query_planning_service.
+            # plan_business_query's own additive-only `descriptor_enrichment`
+            # field (populated only when list_entity_table has no genuine
+            # display attribute of its own — see that field's population
+            # comment). Appended here, never replacing the entity's own safe
+            # columns just built above, so a bare "Show recent students"
+            # keeps intent.type=="list_entities" and its own StudentID/
+            # StartDate/... columns while ALSO surfacing a real name/contact
+            # descriptor pulled in via a trusted relationship — same
+            # dedup-by-(table,column) discipline as every other additive
+            # merge in this module.
+            _already_selected = {(r["table_fqn"], r["column_name"]) for r in select}
+            for _desc in query_plan.get("descriptor_enrichment") or []:
+                _key = (_desc["table_fqn"], _desc["column_name"])
+                if _key in _already_selected:
+                    continue
+                _already_selected.add(_key)
+                select.append({
+                    "table_fqn": _desc["table_fqn"], "column_name": _desc["column_name"],
+                    "alias": _desc["column_name"], "aggregation": None, "distinct": False,
+                })
             if raw_known_columns and not safe_column_names:
                 warnings.append({
                     "type": "no_safe_columns_available", "severity": "LOW",
@@ -762,6 +885,40 @@ def build_sql_plan(
     if rejected_filters:
         blocking_reasons.append(f"Invalid filter(s) rejected: {'; '.join(rejected_filters)}.")
 
+    # --- Step 5a: semantic-completeness — status filter POLARITY ---------
+    # NEXT MILESTONE, Part 2 — negation is material meaning. A plan for
+    # "classes that are NOT active" whose actual WHERE clause asserts
+    # active=true (or any other bare positive restatement of the requested
+    # word) must be rejected as semantically incomplete/contradictory, not
+    # silently executed. query_plan["intent"]["status_negated"] is the
+    # question's own requested polarity (core.semantic.concept_resolver.
+    # extract_query_intent, carried through both the legacy planner's
+    # _build_intent and the AI physical planner's `intent = dict(query_intent)`
+    # — see those two call sites' own comments); each status-attribute entry
+    # in query_plan["filters"] is tagged filter_kind="status" with its own
+    # actually-emitted "polarity" (data.query_planning_service's status-
+    # filter block and core.orchestrator.ai_physical_planning's mirror of
+    # it, the only two producers of a status filter on any live path).
+    # Comparing the two catches a REGRESSION at either producer — if a
+    # future change reintroduces the "not" being silently dropped, this
+    # still trips, rather than trusting the fix above never regresses.
+    status_negated = bool(intent.get("status_negated"))
+    status_filter_entries = [f for f in (query_plan.get("filters") or []) if f.get("filter_kind") == "status"]
+    mismatched_polarity = [
+        f for f in status_filter_entries
+        if f.get("resolved") and f.get("polarity") != ("negative" if status_negated else "positive")
+    ]
+    checks["status_polarity_consistent"] = not mismatched_polarity
+    if mismatched_polarity:
+        requested_polarity_desc = "negative (not/isn't)" if status_negated else "positive"
+        blocking_reasons.append(
+            "Semantic completeness check failed: the question requested a "
+            f"{requested_polarity_desc} status condition for '{intent.get('status_value')}', but "
+            f"the generated filter's polarity ({mismatched_polarity[0].get('polarity')}) "
+            "contradicts it — refusing to run a plan whose status filter has the opposite "
+            "meaning of what was asked."
+        )
+
     # --- Step 6a: requested date/status filter that couldn't be located ------
     # query_planning_service emits date_column_not_found/status_column_not_found
     # as an informational warning when the question explicitly asked for a
@@ -868,11 +1025,15 @@ def build_sql_plan(
             source_id, user_id, select, allow_unconfirmed_pii
         )
         warnings.extend(pii_warnings)
+    # Key name kept stable (core.orchestrator.agent reads it by this exact
+    # name) even though its meaning narrowed on 2026-08-24: True now means
+    # "no restricted-category (credential/secret) column was blocked" —
+    # ordinary business identity/contact PII never sets this False.
     checks["no_unconfirmed_pii"] = not pii_blocks
     if pii_blocks:
         blocking_reasons.append(
-            f"Unconfirmed PII column(s) blocked (pass allow_unconfirmed_pii=True to override): "
-            f"{', '.join(pii_blocks)}."
+            f"Restricted-category column(s) blocked (authentication/cryptographic "
+            f"secrets — no override exists): {', '.join(pii_blocks)}."
         )
 
     checks["read_only"] = True  # structural guarantee — this layer has no write concept
@@ -943,6 +1104,15 @@ def build_sql_plan(
         # resolved semantic context rather than only isolated table
         # candidates. Pure passthrough — does not affect select/joins/where.
         "semantic_context": query_plan.get("concepts", []),
+        # Reconnect Reliability milestone, Part 14 — pure passthrough of the
+        # already-resolved intent (type/aggregation/aggregation_target/
+        # order/status_value/status_negated) query_plan carried in, same
+        # discipline as semantic_context/aggregation_plan above: does not
+        # affect select/joins/where/validation, exists so downstream
+        # observability (core.observability.pipeline_trace) doesn't need a
+        # second, parallel intent-tracking structure — this IS the resolved
+        # intent every other consumer of query_plan already trusts.
+        "intent": query_plan.get("intent"),
         # Milestone Phase 6.2 — Aggregation Shape Correctness: explicit,
         # traceable record of the aggregation-shape decision (entity vs.
         # measure count, counted table/column, key tier/confidence/reason,

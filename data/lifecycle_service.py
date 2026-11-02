@@ -82,6 +82,29 @@ def get_latest_two_snapshots(
     return prev, latest
 
 
+def get_table_classifications(source_id: int, profiling_snapshot_id: int | None) -> dict[str, str | None]:
+    """{table_fqn: table_class} for every table profiled in one profiling
+    snapshot. table_class is None for a table that was visited but not
+    successfully classified (e.g. FAILED during profiling) — still a real
+    row, distinct from a table absent entirely (never profiled in this
+    snapshot). Returns {} when profiling_snapshot_id is None.
+
+    Feeds core.lifecycle.diff.diff_profiling_classification — the profiling-
+    side counterpart of get_latest_two_snapshots + diff_snapshots."""
+    if profiling_snapshot_id is None:
+        return {}
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT table_fqn, table_class FROM profiling_table_profiles "
+            "WHERE source_id = ? AND profiling_snapshot_id = ?",
+            (source_id, profiling_snapshot_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {r["table_fqn"]: r["table_class"] for r in rows}
+
+
 def get_pii_flags(source_id: int, table_fqns: list[str]) -> dict[tuple[str, str], bool]:
     """{(table_fqn, column_name): pii_risk} for the given tables' current dictionary columns."""
     if not table_fqns:
@@ -133,6 +156,65 @@ def get_entity_values(source_id: int, table_fqns: list[str]) -> dict[str, str]:
     return {r["table_fqn"]: r["entity"] for r in rows}
 
 
+def find_duplicate_lifecycle_run(
+    source_id: int,
+    trigger_event: str,
+    old_snapshot_id: int | None,
+    new_snapshot_id: int | None,
+    prof_old_snapshot_id: int | None,
+    prof_new_snapshot_id: int | None,
+) -> dict | None:
+    """Return the most recent COMPLETE run already covering this exact
+    (source_id, trigger_event, schema old/new pair, profiling old/new pair)
+    tuple, or None. Used by core.lifecycle.runner.run_autonomous_lifecycle
+    as a self-defending idempotency guard: any caller — a scheduler tick, a
+    retried request, a future connect-time auto-trigger — that invokes the
+    lifecycle twice for a state it has already fully processed gets a cheap
+    no-op instead of a second full run. Root-caused 2026-08-22:
+    run_autonomous_lifecycle itself had no such guard and trusted every
+    caller to invoke it at most once per real change; continue_batch_
+    profiling's own one-time-per-transition guard is correct but only
+    protects its own call site, not the function overall.
+
+    Both the schema pair AND the profiling pair must match — the schema
+    pair alone is not fine-grained enough: two runs can share an unchanged
+    schema pair while differing in PROFILING evidence (a re-profile with no
+    schema change), which must NOT be treated as a duplicate. See
+    tests/test_lifecycle_profiling_trigger.py::
+    test_idempotent_no_duplicate_vocabulary_rows for the exact scenario this
+    was verified against.
+
+    Every NULL id (no prior schema/profiling snapshot, or first-ever scan)
+    is matched with IS, not =, since SQLite's = never matches NULL.
+    """
+    def _eq(col: str, val: int | None) -> tuple[str, list]:
+        return (f"{col} IS NULL", []) if val is None else (f"{col} = ?", [val])
+
+    clauses = ["source_id = ?", "trigger_event = ?", "status = 'COMPLETE'"]
+    params: list = [source_id, trigger_event]
+    for col, val in (
+        ("old_snapshot_id", old_snapshot_id),
+        ("new_snapshot_id", new_snapshot_id),
+        ("prof_old_snapshot_id", prof_old_snapshot_id),
+        ("prof_new_snapshot_id", prof_new_snapshot_id),
+    ):
+        clause, clause_params = _eq(col, val)
+        clauses.append(clause)
+        params.extend(clause_params)
+
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            f"""SELECT id, completed_at FROM metadata_lifecycle_runs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY id DESC LIMIT 1""",
+            params,
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
 def record_lifecycle_run_start(
     source_id: int,
     user_id: str,
@@ -140,6 +222,8 @@ def record_lifecycle_run_start(
     trigger_event: str,
     old_snapshot_id: int | None,
     new_snapshot_id: int | None,
+    prof_old_snapshot_id: int | None = None,
+    prof_new_snapshot_id: int | None = None,
 ) -> int:
     now = _now()
     conn = get_connection()
@@ -147,9 +231,13 @@ def record_lifecycle_run_start(
         cursor = conn.execute(
             """INSERT INTO metadata_lifecycle_runs
                (source_id, job_id, user_id, trigger_event, status,
-                old_snapshot_id, new_snapshot_id, started_at, created_at)
-               VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?)""",
-            (source_id, job_id, user_id, trigger_event, old_snapshot_id, new_snapshot_id, now, now),
+                old_snapshot_id, new_snapshot_id,
+                prof_old_snapshot_id, prof_new_snapshot_id, started_at, created_at)
+               VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?)""",
+            (
+                source_id, job_id, user_id, trigger_event, old_snapshot_id, new_snapshot_id,
+                prof_old_snapshot_id, prof_new_snapshot_id, now, now,
+            ),
         )
         conn.commit()
         return cursor.lastrowid

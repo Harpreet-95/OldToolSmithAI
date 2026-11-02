@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from core.domains.rules import detect_table_domain
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -143,19 +144,15 @@ def analyze_rule_refinement(source_id: int, user_id: str) -> dict | None:
             (source_id,),
         ).fetchall()
 
-        snap_row = conn.execute(
-            "SELECT id FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
+        snapshot = get_latest_profiling_snapshot(source_id, conn=conn)
 
         profile_map: dict[str, dict] = {}
-        if snap_row:
+        if snapshot is not None:
             for r in conn.execute(
                 "SELECT table_fqn, table_name, schema_name, table_class, "
                 "pii_column_count, confirmed_pii_count, fk_count, referenced_by_count "
                 "FROM profiling_table_profiles WHERE profiling_snapshot_id = ?",
-                (snap_row["id"],),
+                (snapshot.id,),
             ).fetchall():
                 profile_map[r["table_fqn"]] = dict(r)
 

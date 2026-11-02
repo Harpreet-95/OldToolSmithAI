@@ -54,15 +54,39 @@ class RequestMetadataSession:
             ...
     """
 
-    def __init__(self, source_id: int, user_id: str):
+    def __init__(
+        self, source_id: int, user_id: str, *,
+        shared_constants: Optional[dict] = None,
+        shared_search_cache: Optional[dict] = None,
+        shared_lock: Optional[threading.Lock] = None,
+    ):
+        """shared_constants/shared_search_cache/shared_lock (Data Analyst
+        Agent V1.6, Part 5/7) — when given (all three together; see
+        core.analysis.data_analyst_agent's own report-level cache), this
+        session's CACHE reads/writes go into those externally-owned dict
+        objects instead of fresh per-instance ones, so several sessions —
+        each with their OWN private sqlite3.Connection, never a shared one
+        — can still share cache HITS across a multi-question report run.
+        The connection itself is NEVER shared this way: sqlite3 connections
+        are not safe for concurrent use from multiple threads without
+        serializing every call through a lock spanning the whole codebase
+        (out of scope, and a much larger blast radius than this needed) —
+        live-confirmed against real CCPP that sharing one connection across
+        this codebase's bounded 4-worker concurrent task execution produces
+        `sqlite3.InterfaceError: bad parameter or other API misuse` from
+        code elsewhere that calls session.conn.execute(...) directly
+        (e.g. data.search_service/data.relationship_service). Every
+        existing caller (every one — normal Q&A never passes these) keeps
+        today's exact behavior: a fresh, private connection AND fresh,
+        private cache dicts per session."""
         self.source_id = source_id
         self.user_id = user_id
         self.conn = get_connection()
         self.connections_opened = 1  # this session's own connection
 
-        self._lock = threading.Lock()
-        self._constants: dict[str, object] = {}
-        self._search_cache: dict[tuple, object] = {}
+        self._lock = shared_lock if shared_lock is not None else threading.Lock()
+        self._constants: dict[str, object] = shared_constants if shared_constants is not None else {}
+        self._search_cache: dict[tuple, object] = shared_search_cache if shared_search_cache is not None else {}
         self._closed = False
 
         # Task 2 instrumentation — request-scoped constant lookups.
@@ -91,6 +115,31 @@ class RequestMetadataSession:
             # Another thread may have raced this fill in; keep the first
             # value written so every caller in this request sees the same
             # constant, matching "request-scoped constant data".
+            if key not in self._constants:
+                self._constants[key] = value
+            else:
+                self.request_context_hits += 1
+                return self._constants[key]  # type: ignore[return-value]
+            self.request_context_misses += 1
+        return value
+
+    def get_or_compute_unless_none(self, key: tuple, compute_fn: Callable[[], Optional[T]]) -> Optional[T]:
+        """Same contract as get_or_compute, except a None result is never
+        stored — the next call with the same key recomputes instead of
+        replaying the miss. For memoizing a call whose None means "this
+        attempt failed/was unavailable" (e.g. core.semantic.
+        candidate_adjudicator.adjudicate_candidates, fail-closed on any AI
+        error) rather than "this is the real, cacheable answer" — a
+        transient failure must not be pinned for the rest of the request the
+        way a genuine result should be."""
+        with self._lock:
+            if key in self._constants:
+                self.request_context_hits += 1
+                return self._constants[key]  # type: ignore[return-value]
+        value = compute_fn()
+        if value is None:
+            return None
+        with self._lock:
             if key not in self._constants:
                 self._constants[key] = value
             else:

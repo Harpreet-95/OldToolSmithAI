@@ -94,6 +94,7 @@ _MEDIUM_SCORE_TAIL_TOKEN = 0.55
 _MEDIUM_SCORE_COMPOUND_PHRASE = 0.5
 _MEDIUM_SCORE_CURATED_SYNONYM = 0.45
 _MEDIUM_SCORE_COLUMN = 0.4
+_MEDIUM_SCORE_COLUMN_TOKEN = 0.35
 _MEDIUM_SCORE_DICTIONARY = 0.55
 _MEDIUM_SCORE_ASSIGNMENT = 0.5
 _LOW_SCORE = 0.2
@@ -254,6 +255,38 @@ def _derive_table_terms(table_fqn: str, table_name: str, column_names: list[str]
             "evidence": [{"type": "column_name", "table_fqn": table_fqn, "column_name": column_name}],
         })
 
+        # Per-token column evidence — same principle as the table-name path
+        # above (a compound table name like "StudentsPlacements" surfaces
+        # "placements" as its own term, not just the joined phrase), applied
+        # to compound COLUMN names. Without this, a business word can be
+        # sitting right there in a column name (e.g. "ProgramType") and
+        # still never surface under the bare business term "program" —
+        # only the whole normalized column name ("program type") is a
+        # candidate today, which a business user asking about "program"
+        # never types verbatim. Only fires for genuinely compound column
+        # names (>1 cleaned token); a single-token column name already IS
+        # its own whole-column term, produced above. Deliberately scored
+        # below the whole-column-name term (a single word out of a compound
+        # column name is weaker, more inferential evidence than the column's
+        # own full name) and never promoted past MEDIUM/column-scope — this
+        # is additive candidate evidence, not an auto-select signal by
+        # itself (same discipline as every other MEDIUM row here).
+        if len(col_tokens) > 1:
+            for tok in col_tokens:
+                if tok in _GENERIC_NOISE_TOKENS:
+                    continue
+                tok_term = _term_from_tokens([tok])
+                if not tok_term or tok_term in table_terms:
+                    continue
+                candidates.append({
+                    "term": tok_term, "column_name": column_name, "tier": "MEDIUM",
+                    "score": _MEDIUM_SCORE_COLUMN_TOKEN,
+                    "evidence": [{
+                        "type": "column_name_token", "table_fqn": table_fqn,
+                        "column_name": column_name, "of": col_tokens,
+                    }],
+                })
+
     return candidates
 
 
@@ -284,12 +317,34 @@ def _dictionary_and_assignment_evidence(conn, source_id: int, table_fqn: str) ->
     candidate rows in the same shape as _derive_table_terms()."""
     extra: list[dict] = []
 
+    # Business Learning Candidate Discovery milestone, Part 6 — double-
+    # counting prevention. A row written by core.orchestrator.
+    # business_learning's connect-time bounded discovery pass
+    # (generation_method='rule_based_preliminary' on data_dictionary_tables/
+    # data_dictionary_columns; assignment_source='preliminary_connect_time'
+    # on domain_assignments/entity_assignments — all from the SAME single
+    # bounded LLM call, see the Trust Hardening milestone) must not ALSO
+    # feed generated_business_vocabulary as if it were independently-
+    # validated evidence: get_generated_vocabulary's rows are read both by
+    # this module's own additive candidate-set merge (semantic_retrieval_
+    # service._retrieve) AND by data.query_planning_service._resolve_concept
+    # for actual candidate SCORING/selection — a preliminary row reaching
+    # scoring through this back door would let one unvalidated guess count
+    # as two independent corroborating signals (this vocabulary-derived
+    # score, plus this milestone's own explicitly-tagged preliminary
+    # candidate source) for the same underlying LLM call. Excluded here,
+    # at the single shared derivation point, rather than taught to every
+    # downstream reader separately.
     try:
         row = conn.execute(
-            "SELECT business_name FROM data_dictionary_tables WHERE source_id = ? AND table_fqn = ?",
+            "SELECT business_name, generation_method FROM data_dictionary_tables "
+            "WHERE source_id = ? AND table_fqn = ?",
             (source_id, table_fqn),
         ).fetchone()
-        if row and row["business_name"]:
+        if (
+            row and row["business_name"]
+            and not str(row["generation_method"] or "").endswith("_preliminary")
+        ):
             term = _term_from_tokens(_clean_tokens(row["business_name"]))
             if term:
                 extra.append({
@@ -306,11 +361,14 @@ def _dictionary_and_assignment_evidence(conn, source_id: int, table_fqn: str) ->
     ):
         try:
             row = conn.execute(
-                f"SELECT {field_name}, confidence FROM {assignment_table} "
+                f"SELECT {field_name}, confidence, assignment_source FROM {assignment_table} "
                 f"WHERE source_id = ? AND table_fqn = ?",
                 (source_id, table_fqn),
             ).fetchone()
-            if row and row[field_name] and (row["confidence"] or 0.0) >= 0.5:
+            if (
+                row and row[field_name] and (row["confidence"] or 0.0) >= 0.5
+                and row["assignment_source"] != "preliminary_connect_time"
+            ):
                 term = _term_from_tokens(_clean_tokens(row[field_name]))
                 if term:
                     extra.append({
@@ -408,6 +466,75 @@ def bootstrap_vocabulary(source_id: int, user_id: str) -> VocabularyBootstrapRes
         logger.warning("bootstrap_vocabulary: failed for source_id=%s", source_id, exc_info=True)
         result.failed = "vocabulary bootstrap failed"
         return result
+    finally:
+        conn.close()
+
+
+def record_investigated_term(
+    source_id: int, user_id: str, term: str, table_fqn: str, *,
+    column_name: str = "", tier: str = "MEDIUM", score: float = _MEDIUM_SCORE_ASSIGNMENT,
+    evidence: list[dict] | None = None,
+) -> bool:
+    """Additive, single-row upsert into generated_business_vocabulary —
+    Agentic Database Investigation Loop milestone, Part 12 ("persist
+    validated source-specific learning ... using EXISTING stores").
+
+    Deliberately NOT bootstrap_vocabulary: that function replaces every row
+    for source_id in one transaction (see its own docstring), which would
+    discard every other table's already-derived vocabulary just to record
+    one investigated term. This upserts exactly one (source_id, term,
+    table_fqn, column_name) row via the same ON CONFLICT clause
+    bootstrap_vocabulary's own INSERT already uses, so a later
+    bootstrap_vocabulary run and this function never fight over the same
+    row shape. schema_snapshot_id is looked up fresh (best-effort) so the
+    row still points at a real snapshot; None is written if none exists yet,
+    which get_generated_vocabulary tolerates (schema_snapshot_id is not one
+    of the fields it filters on).
+
+    term must already be normalized (data.vocabulary_service.normalize_term)
+    by the caller — this function does not re-derive it, unlike
+    bootstrap_vocabulary's own table-name-driven derivation.
+
+    Returns False (no write) if source_id is not owned by user_id, or if
+    term/table_fqn is empty. Never raises.
+    """
+    if not term or not table_fqn:
+        return False
+    conn = get_connection()
+    try:
+        if not _verify_source(conn, source_id, user_id):
+            return False
+        snapshot = conn.execute(
+            "SELECT id FROM schema_snapshots WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
+            (source_id,),
+        ).fetchone()
+        snapshot_id = snapshot["id"] if snapshot else None
+        now = _now()
+        conn.execute(
+            """INSERT INTO generated_business_vocabulary
+                   (source_id, schema_snapshot_id, term, table_fqn, column_name,
+                    confidence_tier, confidence_score, evidence_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (source_id, term, table_fqn, column_name) DO UPDATE SET
+                   schema_snapshot_id = excluded.schema_snapshot_id,
+                   confidence_tier = excluded.confidence_tier,
+                   confidence_score = excluded.confidence_score,
+                   evidence_json = excluded.evidence_json,
+                   updated_at = excluded.updated_at""",
+            (
+                source_id, snapshot_id, term, table_fqn, column_name,
+                tier, score, json.dumps(evidence or []), now, now,
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception:  # noqa: BLE001
+        conn.rollback()
+        logger.warning(
+            "record_investigated_term: failed for source_id=%s term=%s table_fqn=%s",
+            source_id, term, table_fqn, exc_info=True,
+        )
+        return False
     finally:
         conn.close()
 

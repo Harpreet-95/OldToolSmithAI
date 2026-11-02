@@ -84,6 +84,14 @@ _ENTITY_KEYWORDS: dict[str, list[str]] = {
 
 # table_class → (entity to boost, boost amount).
 # Only classes with a clear structural association to a single entity type.
+#
+# Entity Classification Parity Sprint (2026-07-19) — evaluated, unchanged:
+# this map is structurally one entity per table_class value. Giving
+# Placement/Job a class boost would require changing the value from a single
+# (entity, boost) tuple to a list of them — a structural change to this
+# table's shape, not a membership extension, so it's out of scope for a
+# "smallest possible change" boost-parity fix. Revisit only if a future
+# milestone needs multi-entity table_class boosts generally.
 _CLASS_BOOSTS: dict[str, tuple[str, float]] = {
     "TRANSACTIONAL": ("Payment",    0.5),
     "REFERENCE":     ("Department", 0.3),
@@ -91,17 +99,45 @@ _CLASS_BOOSTS: dict[str, tuple[str, float]] = {
 
 # Each entry: (set of semantic type tokens that trigger the boost, entity, boost amount).
 # A boost fires when ANY token in the set appears in the table's column semantic types.
+#
+# Entity Classification Parity Sprint (2026-07-19): Client/Candidate added as
+# email-boost targets, mirroring User/Applicant at the same weights — a
+# Client record is a top-level contact/account entity (same shape as User),
+# a Candidate record is a recruiting-pipeline person entity (same shape as
+# Applicant, which this table already treats as a lighter-weight variant of
+# the User boost). Placement/Job are NOT added here: neither is a person/
+# contact-holding entity in its own right (a placement or job posting may
+# reference a person via FK, but the row itself isn't a contact record).
 _SEMANTIC_TYPE_BOOSTS: list[tuple[frozenset[str], str, float]] = [
     (frozenset({"amount", "currency", "price"}), "Payment",   0.3),
     (frozenset({"date"}),                        "Event",     0.2),
     (frozenset({"email"}),                       "User",      0.2),
     (frozenset({"email"}),                       "Applicant", 0.15),
+    (frozenset({"email"}),                       "Client",    0.2),
+    (frozenset({"email"}),                       "Candidate", 0.15),
 ]
 
 # Person-type entities that are lifted by PII presence.
-_PII_PERSON_ENTITIES: tuple[str, ...] = ("Student", "Employee", "User", "Applicant")
+#
+# Entity Classification Parity Sprint (2026-07-19): Client/Candidate added —
+# both are person/company contact records (client contacts, candidate
+# resumes/CVs) that legitimately carry the same PII signals (name, email,
+# phone) as the legacy person entities above, but previously earned none of
+# this boost's evidence. This was the direct cause of real tables like
+# dbo.vw_Clients classifying as Entity=User: User accumulated this PII boost
+# while Client, despite a clean name-keyword match, did not. Placement/Job
+# are NOT added — neither is a person-level record (see _SEMANTIC_TYPE_BOOSTS
+# comment above for the same reasoning).
+_PII_PERSON_ENTITIES: tuple[str, ...] = ("Student", "Employee", "User", "Applicant", "Client", "Candidate")
 
 # Entities that are typically referenced by many other tables (high fan-in).
+#
+# Entity Classification Parity Sprint (2026-07-19) — evaluated, unchanged:
+# no baseline evidence tied a fan-in scoring gap to the Client/Candidate/
+# Placement/Job misclassifications observed (the documented root-defect
+# evidence points at PII/contact/email boosts and naming-penalty gaps, not
+# referenced_by_count). Adding entities here without that evidence would be
+# speculative; left out of scope for this sprint.
 _HIGH_FANIN_ENTITIES: tuple[str, ...] = ("Department", "Program", "Employee")
 
 # ---------------------------------------------------------------------------
@@ -124,15 +160,40 @@ _LOW_CARDINALITY_TIERS = frozenset({"CONSTANT", "BINARY", "LOW"})
 _HIGH_CARDINALITY_TIERS = frozenset({"UNIQUE", "HIGH"})
 
 # Person-type entities boosted by PII/contact column signals
-_PERSON_SIGNAL_ENTITIES: tuple[str, ...] = ("Student", "Applicant", "User", "Employee")
+#
+# Entity Classification Parity Sprint (2026-07-19): Client/Candidate added,
+# mirroring _PII_PERSON_ENTITIES above — same rationale (both are
+# contact/PII-bearing person or company-contact records).
+_PERSON_SIGNAL_ENTITIES: tuple[str, ...] = ("Student", "Applicant", "User", "Employee", "Client", "Candidate")
 
 # Reference-type entities boosted by low-cardinality lookup signals
+#
+# Entity Classification Parity Sprint (2026-07-19) — evaluated, unchanged:
+# none of Client/Candidate/Placement/Job are low-cardinality lookup/reference
+# tables; each is a high-cardinality business entity (many client companies,
+# many candidates, many placements, many job postings), so this boost does
+# not semantically apply to any of them.
 _REFERENCE_SIGNAL_ENTITIES: tuple[str, ...] = ("Department", "Course", "Program")
 
 # Event-type entities boosted by timestamp/sequential signals
-_EVENT_SIGNAL_ENTITIES: tuple[str, ...] = ("Event", "Campaign")
+#
+# Entity Classification Parity Sprint (2026-07-19): Placement added — a
+# placement record is timestamp-heavy and transactional (start date, end
+# date, fee), the same shape as Event/Campaign. Job is NOT added: a job
+# posting/requisition is a reference-shaped record with a lifecycle status,
+# not an append-only timestamped stream, and no baseline evidence showed a
+# Job misclassification driven by timestamp signals.
+_EVENT_SIGNAL_ENTITIES: tuple[str, ...] = ("Event", "Campaign", "Placement")
 
 # Master data entities boosted by high-uniqueness identifier signals
+#
+# Entity Classification Parity Sprint (2026-07-19) — evaluated, unchanged:
+# this boost rewards ID-density evidence, a different evidence class than
+# the PII/contact/email parity gap this sprint closes (see background in
+# _PII_PERSON_ENTITIES above). No baseline evidence tied an ID-density
+# scoring gap to the Client/Candidate/Placement/Job misclassifications
+# observed; adding entities here without that evidence would be speculative
+# rather than reuse-justified. Left out of scope for this sprint.
 _MASTER_SIGNAL_ENTITIES: tuple[str, ...] = ("Student", "Employee", "User", "Vendor")
 
 

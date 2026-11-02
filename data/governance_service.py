@@ -45,6 +45,7 @@ from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ class GovernedObjectType(str, Enum):
     RELATIONSHIP_SUGGESTION = "relationship.suggestion"
     DOMAIN_ASSIGNMENT      = "domain.assignment"
     ENTITY_ASSIGNMENT      = "entity.assignment"
+    CONCEPT_MAPPING        = "concept.mapping"
 
 
 _TYPE_META: dict[str, dict] = {
@@ -122,6 +124,7 @@ _TYPE_META: dict[str, dict] = {
     "relationship.suggestion": {"display_name": "Relationship Suggestion",     "source_table": "table_relationships"},
     "domain.assignment":      {"display_name": "Domain Assignment",           "source_table": "domain_assignments"},
     "entity.assignment":      {"display_name": "Entity Assignment",           "source_table": "entity_assignments"},
+    "concept.mapping":        {"display_name": "Concept-to-Table Mapping",    "source_table": "concept_table_mappings"},
 }
 
 
@@ -763,6 +766,64 @@ def _build_relationship_profile(row: dict) -> GovernanceProfile:
     )
 
 
+def _parse_concept_mapping_evidence(raw: str | None) -> list[dict]:
+    """concept_table_mappings.evidence_json is always written as a flat
+    list (see data/concept_mapping_service.py) — no dict-vs-list branching
+    needed, unlike _parse_relationship_evidence above."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _build_concept_mapping_profile(row: dict) -> GovernanceProfile:
+    """Mirrors _build_relationship_profile's shape: confidence and
+    governance_state are stored directly on the row (unlike
+    _build_dict_table_profile's on-the-fly computation), since
+    concept_table_mappings — unlike domain_assignments — already has an
+    explicit governance_state column, so it is read directly rather than
+    re-derived from assignment_source."""
+    obj_id = str(row["id"])
+    state = GovernanceState(row.get("governance_state") or "GENERATED")
+    confidence = row.get("confidence")
+    column_name = row.get("column_name") or None
+    target = f"{row['table_fqn']}.{column_name}" if column_name else row["table_fqn"]
+    review_required = state in (GovernanceState.GENERATED, GovernanceState.SUGGESTED, GovernanceState.NEEDS_REVIEW)
+
+    review_reason = (
+        f"Concept '{row['concept_term']}' -> {target} "
+        f"({row.get('assignment_source', 'unknown')}, "
+        f"{confidence:.0%} confidence); awaiting human approval."
+        if review_required and confidence is not None else
+        f"Concept '{row['concept_term']}' -> {target}; awaiting human approval."
+        if review_required else None
+    )
+
+    can_ai, warn = _compute_ai_trust(state, confidence)
+    return GovernanceProfile(
+        object_type_id    = GovernedObjectType.CONCEPT_MAPPING,
+        object_id         = obj_id,
+        approval_state    = state,
+        confidence_score  = confidence,
+        confidence_tier   = _confidence_tier(confidence),
+        confidence_source = row.get("assignment_source"),
+        review_required   = review_required,
+        review_reason     = review_reason,
+        reviewed_by       = row.get("created_by") if state == GovernanceState.HUMAN_APPROVED else None,
+        reviewed_at       = row.get("updated_at") if state in (GovernanceState.HUMAN_APPROVED, GovernanceState.AUTO_APPROVED) else None,
+        created_by        = row.get("created_by"),
+        created_at        = row.get("created_at"),
+        updated_at        = row.get("updated_at"),
+        evidence          = _parse_concept_mapping_evidence(row.get("evidence_json")),
+        can_ai_use        = can_ai,
+        ai_warning        = warn,
+        domain_context     = None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public — Event Logging (called by existing services as side-effects)
 # ---------------------------------------------------------------------------
@@ -1155,6 +1216,7 @@ def get_governance_profile(
     suggestion_id: int | None = None,
     tool_id: str | None = None,
     relationship_id: int | None = None,
+    mapping_id: int | None = None,
 ) -> GovernanceProfile | None:
     """
     Return the unified governance profile for one governed object.
@@ -1291,6 +1353,19 @@ def get_governance_profile(
                 if row else None
             )
 
+        elif obj_type == GovernedObjectType.CONCEPT_MAPPING:
+            # Looked up by primary key, unlike domain/entity assignment's
+            # (source_id, table_fqn) lookup — concept_table_mappings allows
+            # multiple competing candidate rows per (source_id, concept_term),
+            # so a single unambiguous identifier is required.
+            if mapping_id is None:
+                return None
+            row = conn.execute(
+                "SELECT * FROM concept_table_mappings WHERE id = ?",
+                (mapping_id,),
+            ).fetchone()
+            profile = _build_concept_mapping_profile(dict(row)) if row else None
+
         if profile is None:
             return None
 
@@ -1358,21 +1433,29 @@ def confirm_pii_column(
         if owns is None:
             return None
 
+        snapshot = get_latest_profiling_snapshot(source_id, conn=conn)
+
         now = _now()
+        if snapshot is None:
+            conn.commit()
+            return None
+
         cursor = conn.execute(
             """UPDATE profiling_column_profiles
-                  SET pii_confirmed = 1,
-                      updated_at    = ?
-                WHERE profiling_snapshot_id = (
-                    SELECT id FROM profiling_snapshots
-                    WHERE source_id = ?
-                    ORDER BY snapshot_version DESC LIMIT 1
-                )
+                  SET pii_confirmed                 = 1,
+                      pii_classification             = 'CONFIRMED_PII',
+                      pii_classification_confidence  = 1.0,
+                      pii_classification_evidence    = 'Manually confirmed by administrator',
+                      pii_classification_source      = 'MANUAL',
+                      pii_classified_at              = ?,
+                      pii_manual_override            = 1,
+                      updated_at                     = ?
+                WHERE profiling_snapshot_id = ?
                   AND source_id    = ?
                   AND table_fqn   = ?
                   AND column_name = ?
                   AND pii_name_heuristic = 1""",
-            (now, source_id, source_id, table_fqn, column_name),
+            (now, now, snapshot.id, source_id, table_fqn, column_name),
         )
         conn.commit()
 
@@ -1408,6 +1491,98 @@ def confirm_pii_column(
     )
 
     return dict(updated) if updated else {"pii_confirmed": True, "updated_at": now}
+
+
+def set_pii_non_pii_override(
+    source_id: int,
+    user_id: str,
+    table_fqn: str,
+    column_name: str,
+) -> dict | None:
+    """
+    Administrator override: mark a column as confirmed NOT PII, overriding
+    an automatic (or prior manual) PII classification — e.g. a Tier-3
+    name-heuristic false positive (see core.dictionary.pii_detector's
+    'bare/qualified name' tier) that a human has reviewed and cleared.
+
+    Sets pii_confirmed = 0 (nothing to mask) and pii_manual_override = 1, so
+    data.pii_classification_service.run_pii_classification never overwrites
+    this decision on a future automatic re-classification pass — manual
+    override always outranks automatic classification (Part 19).
+
+    Mirrors confirm_pii_column's shape/ownership checks, minus the
+    pii_name_heuristic=1 requirement: an administrator may clear a column
+    the heuristic never even flagged (defensive; normally a no-op since an
+    unflagged column is already ungated).
+
+    Returns the updated column profile dict, or None if the source is not
+    owned by user_id or the column is not found in the latest snapshot.
+    """
+    conn = get_connection()
+    try:
+        owns = conn.execute(
+            "SELECT id FROM data_source_connections WHERE id = ? AND user_id = ?",
+            (source_id, user_id),
+        ).fetchone()
+        if owns is None:
+            return None
+
+        snapshot = get_latest_profiling_snapshot(source_id, conn=conn)
+        now = _now()
+        if snapshot is None:
+            conn.commit()
+            return None
+
+        cursor = conn.execute(
+            """UPDATE profiling_column_profiles
+                  SET pii_confirmed                 = 0,
+                      pii_classification             = 'CONFIRMED_NON_PII',
+                      pii_classification_confidence  = 1.0,
+                      pii_classification_evidence    = 'Manually cleared by administrator',
+                      pii_classification_source      = 'MANUAL',
+                      pii_classified_at              = ?,
+                      pii_manual_override            = 1,
+                      updated_at                     = ?
+                WHERE profiling_snapshot_id = ?
+                  AND source_id    = ?
+                  AND table_fqn   = ?
+                  AND column_name = ?""",
+            (now, now, snapshot.id, source_id, table_fqn, column_name),
+        )
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            return None
+
+        updated = conn.execute(
+            """SELECT * FROM profiling_column_profiles
+               WHERE source_id = ? AND table_fqn = ? AND column_name = ?
+               ORDER BY profiling_snapshot_id DESC LIMIT 1""",
+            (source_id, table_fqn, column_name),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    obj_id = f"{source_id}:{table_fqn}:{column_name}"
+    log_governance_event(
+        object_type_id = GovernedObjectType.PII_CONFIRMATION,
+        object_id      = obj_id,
+        event_type     = "PII_CLEARED",
+        from_state     = GovernanceState.SUGGESTED,
+        to_state       = GovernanceState.HUMAN_APPROVED,
+        actor_id       = user_id,
+        notes          = f"PII classification cleared (confirmed non-PII) for {table_fqn}.{column_name}",
+        source_service = "governance_service",
+    )
+    upsert_governance_state(
+        object_type_id = GovernedObjectType.PII_CONFIRMATION,
+        object_id      = obj_id,
+        approval_state = GovernanceState.HUMAN_APPROVED,
+        reviewer_id    = user_id,
+        reviewed_at    = now,
+    )
+
+    return dict(updated) if updated else {"pii_confirmed": False, "updated_at": now}
 
 
 # ---------------------------------------------------------------------------

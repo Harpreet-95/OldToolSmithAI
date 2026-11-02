@@ -56,7 +56,7 @@ from core.config import (
 )
 from data.audit import delete_audit_log_entries, log_audit_event, purge_old_audit_db, purge_old_audit_log_file
 from data.db import get_connection
-from data.execution_history import enrich_execution_record, get_execution_by_id, get_repeated_intent_suggestions, get_workflow_success_insights, purge_old_execution_history
+from data.execution_history import enrich_execution_record, get_execution_by_id, get_repeated_intent_suggestions, get_workflow_success_insights, purge_old_execution_history, purge_old_execution_history_for_user
 from data.usage_service import count_usage_events, list_usage_events
 from data.report_service import list_reports_for_user, get_report_by_id, delete_report
 from data.notification_service import list_notifications_for_user, mark_notification_read, delete_notification
@@ -97,8 +97,11 @@ import core.connectors.relational.mysql       # noqa: F401
 from data.datasource_service import (
     create_data_source,
     delete_data_source,
+    disconnect_data_source,
     get_metadata_job,
     list_data_sources,
+    reconnect_data_source,
+    remove_datasource_credentials,
     run_metadata_job,
     test_data_source,
 )
@@ -733,18 +736,6 @@ class ComposeIntentRequest(BaseModel):
     save_workspace: bool = False
 
 
-class QueryPlanRequest(BaseModel):
-    question: str
-    concepts:   list[str] = []
-    measures:   list[str] = []
-    dimensions: list[str] = []
-    filters:    list[dict] = []
-
-
-class SqlPlanRequest(QueryPlanRequest):
-    allow_unconfirmed_pii: bool = False
-
-
 @router.post("/interpret")
 def interpret(request: InterpretRequest, user: AuthenticatedUser = Depends(require_jwt)) -> dict:
     if not request.input.strip():
@@ -934,6 +925,42 @@ def get_my_data(user: AuthenticatedUser = Depends(require_auth)) -> dict:
             "data": {
                 "audit_logs": audit_data,
                 "execution_history": [enrich_execution_record(dict(row)) for row in execution_rows],
+            },
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content=build_error_response("Internal server error", str(e)))
+
+
+@router.get("/me/history")
+def get_my_execution_history(
+    limit: int = Query(default=500, ge=1, le=1000),
+    user: AuthenticatedUser = Depends(require_auth),
+) -> dict:
+    """Return display-ready execution history without the much larger audit export."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
+        purge_old_execution_history_for_user(user.user_id, cutoff)
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT eh.id, eh.plan_id, eh.workflow_id, eh.trigger_source,"
+            " eh.task_type, eh.intent, eh.status,"
+            " eh.started_at, eh.finished_at, eh.duration_ms,"
+            " eh.step_count, eh.failed_step_id, eh.failed_tool, eh.error_message,"
+            " eh.dataset_id,"
+            " d.filename AS dataset_name,"
+            " d.row_count AS dataset_row_count"
+            " FROM execution_history eh"
+            " LEFT JOIN datasets d ON d.id = eh.dataset_id"
+            " WHERE eh.user_id = ?"
+            " ORDER BY eh.id DESC"
+            " LIMIT ?",
+            (user.user_id, limit),
+        ).fetchall()
+        conn.close()
+        return {
+            "status": "success",
+            "data": {
+                "execution_history": [enrich_execution_record(dict(row)) for row in rows],
             },
         }
     except Exception as e:
@@ -4031,6 +4058,74 @@ def test_source(
     return result
 
 
+# Phase 7, Step 6H, Part 3 — explicit, reversible lifecycle actions,
+# distinct from DELETE /sources/{id} (permanent, destructive, cascades
+# every piece of metadata). Each wording below is deliberately specific so
+# a client can never confuse "disconnect" (metadata preserved, reversible)
+# with "delete" (destroyed, irreversible).
+
+class DataSourceReasonRequest(BaseModel):
+    reason: str | None = None
+
+
+@router.post("/sources/{source_id}/disconnect")
+def disconnect_source(
+    source_id: int,
+    body: DataSourceReasonRequest = DataSourceReasonRequest(),
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """Temporarily disconnect: credentials and metadata are both preserved
+    untouched; the source simply stops being usable for new questions until
+    reconnected. Never deletes anything -- see DELETE /sources/{id} for the
+    permanent, destructive action."""
+    result = disconnect_data_source(source_id, user.user_id, reason=body.reason)
+    if result is None:
+        return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
+    return {"status": "success", "data": result}
+
+
+@router.post("/sources/{source_id}/remove-credentials")
+def remove_source_credentials(
+    source_id: int,
+    body: DataSourceReasonRequest = DataSourceReasonRequest(),
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """Remove saved credentials: strips the stored secret while keeping the
+    locator (host/port/database) and every piece of metadata -- the source
+    cannot be used again until reconnect supplies fresh credentials."""
+    result = remove_datasource_credentials(source_id, user.user_id, reason=body.reason)
+    if result is None:
+        return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
+    return {"status": "success", "data": result}
+
+
+@router.post("/sources/reconnect")
+def reconnect_source(
+    body: DataSourceCreateRequest,
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """Reconnect the same database: matches by stable datasource identity
+    (never by display name or raw config equality). If a previously
+    disconnected/credentials-removed source matches, its SAME source_id is
+    reattached (every piece of existing metadata, business knowledge, and
+    durable plan cache stays associated). If nothing matches (never
+    connected before, or previously permanently deleted), falls back to an
+    ordinary new connection -- never an error for that normal case."""
+    try:
+        record = reconnect_data_source(
+            user_id=user.user_id,
+            payload={
+                "display_name": body.display_name,
+                "source_type": body.source_type,
+                "config": body.config,
+                "metadata": body.metadata,
+            },
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content=build_error_response(str(exc)))
+    return {"status": "success", "data": record}
+
+
 @router.post("/sources/{source_id}/discover")
 def discover_source_schema(
     source_id: int,
@@ -4190,6 +4285,35 @@ def run_structural_profile_route(
     if result is None:
         return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
     return {"status": "success", "data": result}
+
+
+@router.post("/sources/{source_id}/executive-report")
+def generate_executive_report_route(
+    source_id: int,
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """Executive Report Query Foundation milestone — builds a small
+    executive report (KPI cards/charts/tables + optional narrative) for a
+    connected live SQL source. Every displayed number traces to a validated
+    AI PhysicalQueryPlan executed through the same governed path ordinary
+    SQL Q&A uses (core.reporting.executive_report_service.
+    generate_executive_report) — never legacy/unvalidated SQL."""
+    from data.datasource_service import get_data_source_by_id
+
+    source = get_data_source_by_id(source_id, user.user_id)
+    if source is None:
+        return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
+
+    try:
+        from core.reporting.executive_report_service import generate_executive_report
+
+        report = generate_executive_report(
+            source_id, user.user_id, source_display_name=source.get("display_name"),
+        )
+    except Exception:
+        return JSONResponse(status_code=500, content=build_error_response("Executive report generation failed."))
+
+    return {"status": "success", "data": report.to_dict()}
 
 
 @router.get("/sources/{source_id}/profile")
@@ -4811,125 +4935,42 @@ def reject_relationship_route(
 
 
 # ---------------------------------------------------------------------------
-# Business Query Planning Engine  (/v1/sources/{id}/query-plan)
+# RETIRED — Business/SQL Query Planning Engine
+# (/v1/sources/{id}/query-plan, /sql-plan, /generate-sql)
 # ---------------------------------------------------------------------------
+# These three routes let an API caller reach data.query_planning_service.
+# plan_business_query directly (a full independent semantic decision-maker),
+# bypassing the single AI-first fast path (POST /composer/ask). Retired as an
+# explicit, discoverable refusal (410 Gone with routing guidance) rather than
+# a bare 404 -- "safe refusal, never a second planner".
+
+_RETIRED_QUERY_PLANNING_ROUTE_MESSAGE = (
+    "This endpoint is retired. Question answering has one path — POST "
+    "/composer/ask (the AI-first fast path) — which resolves intent, schema, "
+    "and SQL in one validated planning call instead of this route's "
+    "candidate-table search."
+)
+
 
 @router.post("/sources/{source_id}/query-plan")
-def plan_business_query_route(
-    source_id: int,
-    request: QueryPlanRequest,
-    user: AuthenticatedUser = Depends(require_jwt),
-) -> dict:
-    if not request.question or not request.question.strip():
-        return JSONResponse(status_code=400, content=build_error_response("question must not be empty."))
-    try:
-        from data.query_planning_service import plan_business_query
-        result = plan_business_query(
-            source_id,
-            user.user_id,
-            {
-                "question":   request.question.strip(),
-                "concepts":   request.concepts,
-                "measures":   request.measures,
-                "dimensions": request.dimensions,
-                "filters":    request.filters,
-            },
-        )
-    except Exception:
-        logger.exception("plan_business_query_route failed for source_id=%s", source_id)
-        return JSONResponse(status_code=500, content=build_error_response("Query plan generation failed."))
-    if result is None:
-        return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
-    return {"status": "success", "data": result}
+def plan_business_query_route(source_id: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=410, content=build_error_response(_RETIRED_QUERY_PLANNING_ROUTE_MESSAGE),
+    )
 
-
-# ---------------------------------------------------------------------------
-# SQL Planning & Validation Engine  (/v1/sources/{id}/sql-plan)
-# ---------------------------------------------------------------------------
 
 @router.post("/sources/{source_id}/sql-plan")
-def build_sql_plan_route(
-    source_id: int,
-    request: SqlPlanRequest,
-    user: AuthenticatedUser = Depends(require_jwt),
-) -> dict:
-    if not request.question or not request.question.strip():
-        return JSONResponse(status_code=400, content=build_error_response("question must not be empty."))
-    try:
-        from data.query_planning_service import plan_business_query
-        from data.sql_planning_service import build_sql_plan
+def build_sql_plan_route(source_id: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=410, content=build_error_response(_RETIRED_QUERY_PLANNING_ROUTE_MESSAGE),
+    )
 
-        query_plan = plan_business_query(
-            source_id,
-            user.user_id,
-            {
-                "question":   request.question.strip(),
-                "concepts":   request.concepts,
-                "measures":   request.measures,
-                "dimensions": request.dimensions,
-                "filters":    request.filters,
-            },
-        )
-        if query_plan is None:
-            return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
-
-        sql_plan = build_sql_plan(
-            source_id, user.user_id, query_plan,
-            allow_unconfirmed_pii=request.allow_unconfirmed_pii,
-        )
-    except Exception:
-        logger.exception("build_sql_plan_route failed for source_id=%s", source_id)
-        return JSONResponse(status_code=500, content=build_error_response("SQL plan generation failed."))
-    return {"status": "success", "data": {"query_plan": query_plan, "sql_plan": sql_plan}}
-
-
-# ---------------------------------------------------------------------------
-# Safe SQL Generation Engine  (/v1/sources/{id}/generate-sql)
-# ---------------------------------------------------------------------------
 
 @router.post("/sources/{source_id}/generate-sql")
-def generate_sql_route(
-    source_id: int,
-    request: SqlPlanRequest,
-    user: AuthenticatedUser = Depends(require_jwt),
-) -> dict:
-    if not request.question or not request.question.strip():
-        return JSONResponse(status_code=400, content=build_error_response("question must not be empty."))
-    try:
-        from data.query_planning_service import plan_business_query
-        from data.sql_planning_service import build_sql_plan
-        from data.sql_generation_service import generate_sql
-
-        query_plan = plan_business_query(
-            source_id,
-            user.user_id,
-            {
-                "question":   request.question.strip(),
-                "concepts":   request.concepts,
-                "measures":   request.measures,
-                "dimensions": request.dimensions,
-                "filters":    request.filters,
-            },
-        )
-        if query_plan is None:
-            return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
-
-        sql_plan = build_sql_plan(
-            source_id, user.user_id, query_plan,
-            allow_unconfirmed_pii=request.allow_unconfirmed_pii,
-        )
-        sql_generation = generate_sql(source_id, user.user_id, sql_plan)
-    except Exception:
-        logger.exception("generate_sql_route failed for source_id=%s", source_id)
-        return JSONResponse(status_code=500, content=build_error_response("SQL generation failed."))
-    return {
-        "status": "success",
-        "data": {
-            "query_plan":     query_plan,
-            "sql_plan":       sql_plan,
-            "sql_generation": sql_generation,
-        },
-    }
+def generate_sql_route(source_id: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=410, content=build_error_response(_RETIRED_QUERY_PLANNING_ROUTE_MESSAGE),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5020,27 +5061,100 @@ def execute_query_route(
     if not request.question or not request.question.strip():
         return JSONResponse(status_code=400, content=build_error_response("question must not be empty."))
     try:
-        # Enterprise Milestone M-30 — Production Route Integration: this
-        # route now calls the single shared agent entry point
-        # (core.orchestrator.agent.answer_business_question) instead of
-        # re-implementing its own plan -> build -> generate -> execute
-        # sequence. answer_business_question already reuses
-        # _plan_with_autonomous_preparation (same bounded planner-retry
-        # policy this route always shared with composer/ask) plus governed
-        # execution, M-27 result validation, and M-29 targeted
-        # investigation — none of that is duplicated here.
-        from core.orchestrator.agent import answer_business_question
-        from api.v1.agent_response_adapters import build_execute_query_response
+        # Phase 8A -- this route answers through the SAME single AI-first
+        # fast path as POST /v1/composer/ask (validated plan cache or one
+        # combined model call -> deterministic SQL validation -> live
+        # execution). There is no alternate pipeline and no fallback.
+        from api.v1.ai_first_composer_execution import run_fast_path_execute_query
 
-        state = answer_business_question(source_id, user.user_id, request.question.strip())
-        status_code, body = build_execute_query_response(state)
+        body = run_fast_path_execute_query(source_id, str(user.user_id), request.question.strip())
     except Exception:
         logger.exception("execute_query_route failed for source_id=%s", source_id)
         return JSONResponse(status_code=500, content=build_error_response("Query execution failed."))
 
-    if status_code != 200:
-        return JSONResponse(status_code=status_code, content=body)
     return body
+
+
+class PromoteConceptMappingRequest(BaseModel):
+    concept_term: str
+    table_fqn: str
+    column_name: "str | None" = None
+    # Phase 3, Step 3 — optional: the business term (e.g. "customer") whose
+    # existing approved mapping concept_term should be remembered as a
+    # synonym of. Omitted entirely -> behavior is byte-for-byte identical to
+    # pre-Step-3 (concept_table_mappings write only, no synonym write
+    # attempted at all).
+    canonical_term: "str | None" = None
+    confirm_replace: bool = False
+
+
+@router.post("/sources/{source_id}/concept-mappings")
+def promote_concept_mapping_route(
+    source_id: int,
+    request: PromoteConceptMappingRequest,
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """
+    Phase 2, Step 7 — records a user's clarification-turn selection (e.g.
+    "clients" -> dbo.ADF_Clients) as an approved concept_table_mappings row,
+    so future questions using the same business term on this source resolve
+    directly to that table/column instead of asking again. Source-scoped to
+    the requesting user's own source only.
+
+    Reuses data/concept_mapping_service.py::promote_clarification_selection
+    — no new approval mechanism. This is a human decision (the user just
+    picked this option in a clarification turn), so it is written as
+    HUMAN_APPROVED immediately, not queued for further review.
+
+    Phase 3, Step 3 — when canonical_term is also supplied, additionally
+    teaches concept_mapping_service.remember_synonym() that concept_term
+    means the same thing as canonical_term. If that term was already taught
+    to mean something else, remember_synonym refuses the write (unless
+    confirm_replace=True) and this returns a structured 409 conflict instead
+    of a 500 or a silent overwrite — the caller (frontend) is expected to
+    ask the user and resubmit with confirm_replace=True on explicit
+    confirmation. The concept_table_mappings write above always happens
+    regardless of any synonym conflict; only the synonym linkage is gated.
+    """
+    if not request.concept_term or not request.concept_term.strip():
+        return JSONResponse(status_code=400, content=build_error_response("concept_term must not be empty."))
+    if not request.table_fqn or not request.table_fqn.strip():
+        return JSONResponse(status_code=400, content=build_error_response("table_fqn must not be empty."))
+    try:
+        from data.concept_mapping_service import promote_clarification_selection, remember_synonym
+
+        result = promote_clarification_selection(
+            source_id, user.user_id, request.concept_term.strip(), request.table_fqn.strip(),
+            request.column_name.strip() if request.column_name else None,
+            actor_id=user.user_id,
+        )
+
+        if request.canonical_term and request.canonical_term.strip():
+            synonym_result = remember_synonym(
+                source_id, user.user_id, request.concept_term.strip(), request.canonical_term.strip(),
+                actor_id=user.user_id, confirm_replace=request.confirm_replace,
+            )
+            if synonym_result.get("conflict"):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "status": "conflict",
+                        "reason": "remembered_term_conflict",
+                        "conflict": True,
+                        "source_id": source_id,
+                        "synonym_term": synonym_result["synonym_term"],
+                        "existing_canonical_term": synonym_result["existing_canonical_term"],
+                        "requested_canonical_term": synonym_result["new_canonical_term"],
+                    },
+                )
+            result["synonym"] = synonym_result
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content=build_error_response(str(exc)))
+    except Exception:
+        logger.exception("promote_concept_mapping_route failed for source_id=%s", source_id)
+        return JSONResponse(status_code=500, content=build_error_response("Failed to record concept mapping."))
+
+    return {"status": "success", "data": result}
 
 
 # ---------------------------------------------------------------------------
@@ -5091,6 +5205,31 @@ def list_query_executions_route(
         offset=offset,
     )
     return {"status": "success", "data": records}
+
+
+@router.get("/admin/query-executions/{execution_id}/trace")
+def get_query_execution_trace_route(
+    execution_id: str,
+    user: AuthenticatedUser = Depends(require_role("admin")),
+) -> dict:
+    """Reconnect Reliability milestone, Part 14 — diagnostic pipeline trace
+    for one execution (candidates considered, join reasoning, SQL
+    validation status, warnings). Admin-only and NOT ownership-scoped to
+    `user` — cross-user visibility is the point of a support/diagnostic
+    endpoint, unlike /query-executions/{execution_id} above. Never returns
+    raw SQL text, parameter values, or row data — see
+    core.observability.pipeline_trace's own module docstring for that
+    invariant; this endpoint is an additional access-control layer on top
+    of it, not a substitute for it.
+    """
+    from data.query_execution_service import get_pipeline_trace
+    trace = get_pipeline_trace(execution_id)
+    if trace is None:
+        return JSONResponse(
+            status_code=404,
+            content=build_error_response("No pipeline trace found for this execution."),
+        )
+    return {"status": "success", "data": trace}
 
 
 @router.post("/domain-refinements/{suggestion_id}/reject")
@@ -5425,6 +5564,21 @@ def governance_toggle_policy(
     return {"status": "success", "data": result}
 
 
+@router.get("/sources/{source_id}/pii-classifications")
+def list_pii_classifications_route(
+    source_id: int,
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """Full PII classification inventory for the admin PII view: every
+    heuristic-flagged column with its classification/confidence/evidence/
+    source/override state and resulting policy effect."""
+    from data.profiling_service import list_pii_classifications
+    result = list_pii_classifications(source_id, user.user_id)
+    if result is None:
+        return JSONResponse(status_code=404, content=build_error_response("Data source not found."))
+    return {"status": "success", "data": result}
+
+
 @router.post("/governance/pii/confirm")
 def governance_confirm_pii(
     body: _PiiConfirmRequest,
@@ -5455,6 +5609,40 @@ def governance_confirm_pii(
     return {
         "status":      "success",
         "confirmed":   True,
+        "table_fqn":   body.table_fqn,
+        "column_name": body.column_name,
+    }
+
+
+@router.post("/governance/pii/mark-non-pii")
+def governance_mark_non_pii(
+    body: _PiiConfirmRequest,
+    user: AuthenticatedUser = Depends(require_jwt),
+) -> dict:
+    """
+    Administrator override: clear a column's PII classification (mark
+    confirmed non-PII), e.g. a Tier-3 name-heuristic false positive. Sets
+    pii_confirmed=0 and pii_manual_override=1 so a future automatic
+    classification pass never overwrites this decision (manual override
+    outranks automatic — see data.pii_classification_service).
+    """
+    from data.governance_service import set_pii_non_pii_override
+    result = set_pii_non_pii_override(
+        source_id   = body.source_id,
+        user_id     = user.user_id,
+        table_fqn   = body.table_fqn,
+        column_name = body.column_name,
+    )
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content=build_error_response(
+                "Column not found, or source does not belong to this user."
+            ),
+        )
+    return {
+        "status":      "success",
+        "confirmed_non_pii": True,
         "table_fqn":   body.table_fqn,
         "column_name": body.column_name,
     }

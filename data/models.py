@@ -1,4 +1,436 @@
+import json
+import logging
+
 from data.db import get_connection
+
+_SSE_TABLE = "sql_semantic_enrichments"
+_SSE_PHASE_COLUMN = "phase"
+_SSE_CACHE_KEY_INDEX = "idx_sse_cache_key"
+_SSE_SOURCE_CURRENT_INDEX = "idx_sse_source_current"
+
+
+class SemanticEnrichmentMigrationError(RuntimeError):
+    """Raised by ensure_sql_semantic_enrichments_phase_migration() when
+    sql_semantic_enrichments is in a state it cannot safely reconcile
+    automatically -- a PARTIALLY applied migration 016 (the `phase` column
+    present without the phase-inclusive unique index, or vice versa),
+    almost certainly meaning an earlier migration attempt was interrupted
+    or the schema was manually edited outside this codebase's own
+    migration path. Never silently tolerated, guessed past, or auto-
+    repaired -- a human must inspect the database before init_db() can
+    proceed."""
+
+
+def _sse_table_exists(conn) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_SSE_TABLE,)
+    ).fetchone() is not None
+
+
+def _sse_columns(conn) -> set:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({_SSE_TABLE})").fetchall()}
+
+
+def _sse_index_columns(conn, index_name: str) -> tuple:
+    return tuple(row[2] for row in conn.execute(f"PRAGMA index_info({index_name})").fetchall())
+
+
+def ensure_sql_semantic_enrichments_phase_migration(conn) -> str:
+    """
+    Idempotent, schema-STATE-checking equivalent of
+    migrations/016_add_semantic_enrichment_phase.sql's ALTER TABLE ADD
+    COLUMN -- SQL Architecture Correction, Phase 6, Step 4C2A, Problem 2.
+
+    Why this exists: SQLite's ALTER TABLE ADD COLUMN has no "IF NOT EXISTS"
+    form (unlike CREATE TABLE/INDEX), so migration 016's raw SQL cannot be
+    re-run safely the way every other statement in init_db() already can
+    be. This project has NO separate migration-ledger/runner mechanism
+    (verified: no migrations table, no "applied migrations" tracking of
+    any kind exists anywhere in this codebase) -- init_db() ITSELF, called
+    on every real app startup (see api/app.py), IS the project's own
+    established idempotent-migration mechanism for exactly this situation;
+    see this same function's neighboring PRAGMA table_info(...)-guarded
+    ALTER TABLE blocks for profiling_column_profiles (PII classification /
+    Phase 1A-C columns) for the identical, already-production-proven
+    pattern this function follows.
+
+    Returns "APPLIED" (the table existed and predated Step 4C2 -- this call
+    just added the column/indexes) or "ALREADY_CURRENT" (nothing to do --
+    either a fresh Step-4C2+ CREATE TABLE already has `phase` from the
+    start, the table doesn't exist yet at all, or a prior call already
+    migrated it). Idempotent and cheap to call on every init_db(): when
+    already current, this is a handful of read-only PRAGMA queries, never a
+    write.
+
+    Never touches a ROW of sql_semantic_enrichments, and never rebuilds or
+    copies the table: ALTER TABLE ADD COLUMN in SQLite is schema-metadata-
+    only (existing rows read back the DEFAULT lazily; the table file itself
+    is not rewritten), and the index changes below are DROP/CREATE INDEX
+    only (index-only, no row data touched) -- safe regardless of how large
+    the real table has grown.
+
+    Raises SemanticEnrichmentMigrationError -- never silently applied,
+    ignored, or guessed past -- for a genuinely PARTIALLY migrated state:
+    the `phase` column present without the phase-inclusive unique index, or
+    vice versa. This is structurally impossible to reach via THIS function
+    alone (both are always applied together, in the block below) but is
+    still checked explicitly, defensively, in case of manual tampering or
+    an incomplete external migration attempt.
+    """
+    if not _sse_table_exists(conn):
+        return "ALREADY_CURRENT"
+
+    has_phase_column = _SSE_PHASE_COLUMN in _sse_columns(conn)
+    index_has_phase = _SSE_PHASE_COLUMN in _sse_index_columns(conn, _SSE_CACHE_KEY_INDEX)
+
+    if has_phase_column and index_has_phase:
+        return "ALREADY_CURRENT"
+
+    if has_phase_column != index_has_phase:
+        raise SemanticEnrichmentMigrationError(
+            f"{_SSE_TABLE} is in a partially migrated state: phase column present={has_phase_column}, "
+            f"phase-inclusive unique index present={index_has_phase} -- resolve this manually "
+            "(inspect PRAGMA table_info/index_info) before init_db() can proceed safely"
+        )
+
+    conn.execute(
+        f"ALTER TABLE {_SSE_TABLE} ADD COLUMN {_SSE_PHASE_COLUMN} TEXT NOT NULL "
+        "DEFAULT 'COLUMN_DEFERRED' CHECK (phase IN ('OBJECT_CORE','COLUMN_DEFERRED'))"
+    )
+    # SQLite has no ALTER INDEX -- drop and recreate is the only option, and
+    # is safe (an index carries no data of its own, only derived pointers).
+    conn.execute(f"DROP INDEX IF EXISTS {_SSE_CACHE_KEY_INDEX}")
+    conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {_SSE_CACHE_KEY_INDEX} ON {_SSE_TABLE} "
+        "(source_id, object_fqn, semantic_input_hash, provider_id, model, contract_version, phase)"
+    )
+    conn.execute(f"DROP INDEX IF EXISTS {_SSE_SOURCE_CURRENT_INDEX}")
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS {_SSE_SOURCE_CURRENT_INDEX} ON {_SSE_TABLE} "
+        "(source_id, status, provider_id, model, contract_version, phase)"
+    )
+    conn.commit()
+    return "APPLIED"
+
+
+_SVSE_TABLE = "sql_view_semantic_enrichments"
+
+
+def _svse_table_exists(conn) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_SVSE_TABLE,)
+    ).fetchone() is not None
+
+
+def ensure_sql_view_semantic_enrichments_table(conn) -> str:
+    """
+    Idempotent creation of `sql_view_semantic_enrichments` -- Phase 6 Step
+    6C1's replacement for the Step 6C design (which widened
+    sql_semantic_enrichments' `phase` CHECK constraint via a table rebuild;
+    see migrations/017_create_view_semantic_enrichments.sql's own docstring
+    for the full audit and why that rebuild was abandoned in favor of this
+    brand-new, dedicated table).
+
+    Deliberately NOT a rebuild, an ALTER TABLE, or any other schema
+    SURGERY on an existing table: this is a plain `CREATE TABLE IF NOT
+    EXISTS`, exactly like every other table in this file (see the
+    `sql_semantic_enrichments` block just above, as it stood BEFORE Step
+    6C ever touched it -- entirely unmodified by this function or by
+    anything in Step 6C1). A `CREATE TABLE IF NOT EXISTS` statement is
+    trivially idempotent and cannot be "partially applied" the way a
+    multi-statement rebuild can -- there is no intermediate state for a
+    partial-failure detector to find, and nothing here ever reads or
+    writes a single row of `sql_semantic_enrichments` or any other table.
+
+    Returns "APPLIED" (the table did not exist yet -- this call created it)
+    or "ALREADY_CURRENT" (a prior call, or a fresh CREATE TABLE IF NOT
+    EXISTS from this SAME function running again, already created it).
+    """
+    existed_before = _svse_table_exists(conn)
+    conn.executescript(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_SVSE_TABLE} (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id            INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            object_fqn           TEXT    NOT NULL CHECK (length(object_fqn) > 0),
+            semantic_input_hash  TEXT    NOT NULL CHECK (length(semantic_input_hash) = 64),
+            provider_id          TEXT    NOT NULL CHECK (length(provider_id) > 0),
+            model                TEXT    NOT NULL CHECK (length(model) > 0),
+            contract_version     INTEGER NOT NULL CHECK (contract_version > 0),
+            payload_json         TEXT    NOT NULL,
+            status               TEXT    NOT NULL CHECK (status IN ('ACTIVE','INVALID')) DEFAULT 'ACTIVE',
+            created_at           TEXT    NOT NULL,
+            updated_at           TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_svse_cache_key
+            ON {_SVSE_TABLE} (source_id, object_fqn, semantic_input_hash, provider_id, model, contract_version);
+        CREATE INDEX IF NOT EXISTS idx_svse_source_current
+            ON {_SVSE_TABLE} (source_id, status, provider_id, model, contract_version);
+        CREATE INDEX IF NOT EXISTS idx_svse_source_object
+            ON {_SVSE_TABLE} (source_id, object_fqn);
+        """
+    )
+    conn.commit()
+    return "ALREADY_CURRENT" if existed_before else "APPLIED"
+
+
+_SVP_TABLE = "sql_view_profiles"
+
+
+def _svp_table_exists(conn) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_SVP_TABLE,)
+    ).fetchone() is not None
+
+
+def ensure_sql_view_profiles_table(conn) -> str:
+    """
+    Idempotent creation of `sql_view_profiles` -- Phase 7, Step 6E3B:
+    persisted, deterministic, per-view structural/lineage/suitability
+    profile. One row per (source_id, object_fqn), upserted on
+    recomputation (definition change, schema-fingerprint change, or
+    profiling_version bump) -- mirrors view_semantic_evidence's own
+    idx_vse_source_table_uniq one-row-per-view convention exactly.
+
+    Plain `CREATE TABLE IF NOT EXISTS`, exactly like every other table in
+    this file -- purely additive, no ALTER/rebuild, nothing here reads or
+    writes any existing table (view_semantic_evidence, schema_snapshots,
+    sql_retrieval_documents, ... are all read-only inputs to the module
+    that populates this table, never touched by this function).
+
+    Most of the rich per-view structural facts this milestone requires
+    (output-column lineage, join kinds, WHERE/HAVING restrictions,
+    literals, GROUP BY/aggregates, UNION branches, window functions,
+    TOP/LIMIT, candidate grain + confidence, entity keys, duplication/
+    row-preservation risk, population restrictions, purpose suitability,
+    PII categories (informational only, never values), secret/credential
+    column names, snapshot/cross-source status, evidence provenance) live
+    in `payload_json` -- the same one-blob-per-row convention
+    sql_view_semantic_enrichments/sql_semantic_enrichments already use for
+    similarly-shaped rich per-object facts. A handful of the fields a
+    validator needs to filter/gate on cheaply are ALSO promoted to real
+    columns (authority_class, the four suitable_for_* flags,
+    lineage_complete, is_framework_backed, duplication_risk,
+    row_preservation_risk, required_distinct_key) so
+    core.sqlservice.sql_validation can query them directly without parsing
+    JSON for every candidate object.
+
+    No raw row values or PII/secret VALUES are ever stored here -- only
+    column NAMES, categories, and structural facts about the view
+    definition itself (see core.sqlservice.view_profiler's own module
+    docstring for the enforcement of that boundary).
+
+    Returns "APPLIED" (first call) or "ALREADY_CURRENT" (already existed).
+
+    Rollback: `DROP TABLE IF EXISTS sql_view_profiles;` -- purely additive,
+    dropping it removes only this milestone's own cached profiles and
+    cannot affect view_semantic_evidence, schema_object_authority, or any
+    other existing table/row. Safe to run against a test database at any
+    time; profiles are fully recomputable (deterministic, no live
+    connection, no AI call) by re-running the connect-time bootstrap's
+    VIEW_PROFILING step.
+    """
+    existed_before = _svp_table_exists(conn)
+    conn.executescript(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_SVP_TABLE} (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id               INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            build_id                INTEGER,
+            object_fqn              TEXT    NOT NULL CHECK (length(object_fqn) > 0),
+            schema_fingerprint      TEXT,
+            definition_hash         TEXT,
+            profiling_version       INTEGER NOT NULL CHECK (profiling_version > 0),
+            completion_status       TEXT    NOT NULL CHECK (completion_status IN ('COMPLETE','INCOMPLETE','FAILED')),
+            failure_reason          TEXT,
+            authority_class         TEXT,
+            lineage_complete        INTEGER NOT NULL DEFAULT 0,
+            is_framework_backed     INTEGER NOT NULL DEFAULT 0,
+            suitable_for_detail     INTEGER NOT NULL DEFAULT 0,
+            suitable_for_count      INTEGER NOT NULL DEFAULT 0,
+            suitable_for_aggregation INTEGER NOT NULL DEFAULT 0,
+            suitable_for_join       INTEGER NOT NULL DEFAULT 0,
+            duplication_risk        TEXT    NOT NULL DEFAULT 'UNKNOWN',
+            row_preservation_risk   TEXT    NOT NULL DEFAULT 'UNKNOWN',
+            required_distinct_key   TEXT,
+            payload_json            TEXT    NOT NULL,
+            created_at              TEXT    NOT NULL,
+            updated_at              TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_svp_source_object_uniq
+            ON {_SVP_TABLE} (source_id, object_fqn);
+        CREATE INDEX IF NOT EXISTS idx_svp_source_status
+            ON {_SVP_TABLE} (source_id, completion_status);
+        CREATE INDEX IF NOT EXISTS idx_svp_source_authority
+            ON {_SVP_TABLE} (source_id, authority_class);
+        """
+    )
+    conn.commit()
+    return "ALREADY_CURRENT" if existed_before else "APPLIED"
+
+
+def ensure_business_knowledge_tables(conn) -> str:
+    """
+    Idempotent creation of the Phase 7, Step 3J business-knowledge-package
+    tables -- a source-scoped, versioned store for owner-confirmed business
+    facts (concepts/relationships/facts) plus the AI-proposed and
+    deterministically-verified schema mappings derived from them
+    (business_knowledge_mappings), and a bookkeeping table
+    (business_knowledge_mapping_runs) that makes an unchanged source/schema/
+    package rerun a zero-provider-call no-op (unique on package_id,
+    schema_fingerprint, content_hash -- see
+    core.sqlservice.business_knowledge_mapper).
+
+    Plain `CREATE TABLE IF NOT EXISTS`, exactly like every other table in
+    this file -- purely additive, no ALTER/rebuild, nothing here reads or
+    writes an existing table. Authoritative (owner-supplied) rows are
+    distinguished from AI-inferred ones purely by the `origin` column and by
+    which service function is allowed to write them
+    (data.business_knowledge_package_service never lets the AI mapping path
+    touch a row with origin='AUTHORITATIVE') -- never by a separate schema.
+
+    Returns "APPLIED" (first call) or "ALREADY_CURRENT" (already existed).
+    """
+    existed_before = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='business_knowledge_packages'"
+    ).fetchone() is not None
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS business_knowledge_packages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id       INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            user_id         TEXT    NOT NULL,
+            package_version INTEGER NOT NULL CHECK (package_version > 0),
+            status          TEXT    NOT NULL CHECK (status IN ('DRAFT','ACTIVE','SUPERSEDED')) DEFAULT 'DRAFT',
+            created_by      TEXT    NOT NULL,
+            created_at      TEXT    NOT NULL,
+            updated_at      TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bkp_source_version
+            ON business_knowledge_packages (source_id, package_version);
+        CREATE INDEX IF NOT EXISTS idx_bkp_source_status
+            ON business_knowledge_packages (source_id, status);
+
+        CREATE TABLE IF NOT EXISTS business_knowledge_concepts (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id      INTEGER NOT NULL REFERENCES business_knowledge_packages(id) ON DELETE CASCADE,
+            concept_id      TEXT    NOT NULL CHECK (length(concept_id) > 0),
+            concept_type    TEXT    NOT NULL CHECK (concept_type IN (
+                                'DOMAIN','ENTITY','PROGRAM','LIFECYCLE_STAGE','MEASURE',
+                                'STATUS','PAYMENT_CONCEPT','ACTIVITY_CONCEPT'
+                            )),
+            display_name    TEXT    NOT NULL CHECK (length(display_name) > 0),
+            description     TEXT,
+            aliases_json    TEXT    NOT NULL DEFAULT '[]',
+            origin          TEXT    NOT NULL CHECK (origin IN ('AUTHORITATIVE','AI_INFERRED')),
+            confidence      REAL    NOT NULL DEFAULT 1.0,
+            evidence_json   TEXT    NOT NULL DEFAULT '[]',
+            created_at      TEXT    NOT NULL,
+            updated_at      TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bkc_package_concept
+            ON business_knowledge_concepts (package_id, concept_id);
+        CREATE INDEX IF NOT EXISTS idx_bkc_package_type
+            ON business_knowledge_concepts (package_id, concept_type);
+
+        CREATE TABLE IF NOT EXISTS business_knowledge_relationships (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id          INTEGER NOT NULL REFERENCES business_knowledge_packages(id) ON DELETE CASCADE,
+            from_concept_id     TEXT    NOT NULL CHECK (length(from_concept_id) > 0),
+            relationship_type   TEXT    NOT NULL CHECK (length(relationship_type) > 0),
+            to_concept_id       TEXT    NOT NULL CHECK (length(to_concept_id) > 0),
+            origin              TEXT    NOT NULL CHECK (origin IN ('AUTHORITATIVE','AI_INFERRED')),
+            confidence          REAL    NOT NULL DEFAULT 1.0,
+            evidence_json       TEXT    NOT NULL DEFAULT '[]',
+            created_at          TEXT    NOT NULL,
+            updated_at          TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bkr_package_edge
+            ON business_knowledge_relationships (package_id, from_concept_id, relationship_type, to_concept_id);
+        CREATE INDEX IF NOT EXISTS idx_bkr_package_from
+            ON business_knowledge_relationships (package_id, from_concept_id);
+
+        CREATE TABLE IF NOT EXISTS business_knowledge_facts (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id          INTEGER NOT NULL REFERENCES business_knowledge_packages(id) ON DELETE CASCADE,
+            fact_key            TEXT    NOT NULL CHECK (length(fact_key) > 0),
+            fact_text           TEXT    NOT NULL CHECK (length(fact_text) > 0),
+            related_concept_id  TEXT,
+            created_by          TEXT    NOT NULL,
+            created_at          TEXT    NOT NULL,
+            updated_at          TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bkf_package_key
+            ON business_knowledge_facts (package_id, fact_key);
+
+        CREATE TABLE IF NOT EXISTS business_knowledge_mappings (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id          INTEGER NOT NULL REFERENCES business_knowledge_packages(id) ON DELETE CASCADE,
+            concept_id          TEXT    NOT NULL CHECK (length(concept_id) > 0),
+            object_fqn          TEXT    NOT NULL CHECK (length(object_fqn) > 0),
+            mapping_role        TEXT    NOT NULL CHECK (mapping_role IN (
+                                    'CANONICAL_ENTITY_SOURCE','PREFERRED_BUSINESS_VIEW',
+                                    'DETAIL_ACTIVITY_SOURCE','ENROLLMENT_SOURCE','FEE_SOURCE',
+                                    'FULL_PAYMENT_SOURCE','INSTALLMENT_PAYMENT_SOURCE',
+                                    'STATUS_SOURCE','OUTCOME_SOURCE','CONNECTOR_ONLY',
+                                    'UNSUPPORTED_OR_CONFLICTING',
+                                    'FEE_DEFINITION_SOURCE','FEE_PAYMENT_SOURCE'
+                                )),
+            columns_json        TEXT    NOT NULL DEFAULT '[]',
+            mapping_kind        TEXT    NOT NULL CHECK (mapping_kind IN (
+                                    'DIRECT','DEPENDENT','EQUIVALENT','CONDITIONAL','UNRESOLVED'
+                                )),
+            status              TEXT    NOT NULL CHECK (status IN (
+                                    'PROPOSED','VERIFIED','UNRESOLVED','REJECTED'
+                                )) DEFAULT 'PROPOSED',
+            confidence          REAL    NOT NULL DEFAULT 0.0,
+            evidence_json       TEXT    NOT NULL DEFAULT '[]',
+            schema_fingerprint  TEXT    NOT NULL CHECK (length(schema_fingerprint) > 0),
+            provider_id         TEXT,
+            model               TEXT,
+            contract_version    INTEGER NOT NULL DEFAULT 1,
+            content_hash        TEXT    NOT NULL CHECK (length(content_hash) = 64),
+            rejection_reason    TEXT,
+            created_at          TEXT    NOT NULL,
+            updated_at          TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bkm_package_concept_object_role
+            ON business_knowledge_mappings (package_id, concept_id, object_fqn, mapping_role);
+        CREATE INDEX IF NOT EXISTS idx_bkm_package_object
+            ON business_knowledge_mappings (package_id, object_fqn);
+        CREATE INDEX IF NOT EXISTS idx_bkm_package_fingerprint
+            ON business_knowledge_mappings (package_id, schema_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_bkm_package_status
+            ON business_knowledge_mappings (package_id, status);
+
+        CREATE TABLE IF NOT EXISTS business_knowledge_mapping_runs (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id           INTEGER NOT NULL REFERENCES business_knowledge_packages(id) ON DELETE CASCADE,
+            schema_fingerprint   TEXT    NOT NULL CHECK (length(schema_fingerprint) > 0),
+            content_hash         TEXT    NOT NULL CHECK (length(content_hash) = 64),
+            status               TEXT    NOT NULL CHECK (status IN ('RUNNING','COMPLETE','FAILED')) DEFAULT 'RUNNING',
+            batches_total        INTEGER NOT NULL DEFAULT 0,
+            batches_completed    INTEGER NOT NULL DEFAULT 0,
+            provider_calls_made  INTEGER NOT NULL DEFAULT 0,
+            error_json           TEXT,
+            started_at           TEXT    NOT NULL,
+            completed_at         TEXT
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bkmr_package_fingerprint_hash
+            ON business_knowledge_mapping_runs (package_id, schema_fingerprint, content_hash);
+        """
+    )
+    conn.commit()
+    return "ALREADY_CURRENT" if existed_before else "APPLIED"
 
 
 def init_db() -> None:
@@ -137,6 +569,7 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_reports_user_id    ON reports (user_id);
         CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports (created_at);
+        CREATE INDEX IF NOT EXISTS idx_reports_exec_id    ON reports (exec_id);
 
         CREATE TABLE IF NOT EXISTS notifications (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +586,8 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_notifications_user_id    ON notifications (user_id);
         CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications (created_at);
+        CREATE INDEX IF NOT EXISTS idx_notifications_related_execution_id
+            ON notifications (related_execution_id);
 
         CREATE TABLE IF NOT EXISTS scheduled_workflow_runs (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +608,8 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_sched_runs_schedule_id ON scheduled_workflow_runs (schedule_id);
         CREATE INDEX IF NOT EXISTS idx_sched_runs_user_id     ON scheduled_workflow_runs (user_id);
         CREATE INDEX IF NOT EXISTS idx_sched_runs_started_at  ON scheduled_workflow_runs (started_at);
+        CREATE INDEX IF NOT EXISTS idx_sched_runs_related_execution_id
+            ON scheduled_workflow_runs (related_execution_id);
 
         CREATE TABLE IF NOT EXISTS report_metric_snapshots (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -497,6 +934,162 @@ def init_db() -> None:
     """)
     conn.commit()
 
+    # Product decision: live query execution is enabled by default for every
+    # SQL data source (any connector whose registered capabilities include
+    # 'sql_query'), not gated behind a manual post-connect flag flip.
+    # Governed read-only enforcement, SQL validation, and ownership
+    # isolation are unchanged — this only lifts the previous default-off
+    # gate in core.live.connection_resolver.LiveConnectionResolver, it does
+    # not touch what SQL is allowed to run. Idempotent: re-running only
+    # affects rows not already enabled, and only ones with 'sql_query'
+    # capability, so non-SQL sources are untouched.
+    for row in cursor.execute(
+        "SELECT id, capabilities_json FROM data_source_connections WHERE live_query_enabled = 0"
+    ).fetchall():
+        try:
+            capabilities = json.loads(row["capabilities_json"] or "[]")
+        except (TypeError, ValueError):
+            capabilities = []
+        if "sql_query" in capabilities:
+            cursor.execute(
+                "UPDATE data_source_connections SET live_query_enabled = 1 WHERE id = ?",
+                (row["id"],),
+            )
+    conn.commit()
+
+    # Phase 7, Step 6H, Part 2/3 — stable datasource identity + lifecycle
+    # state. Additive only: two nullable/defaulted columns, idempotent via
+    # the same PRAGMA table_info guard used throughout this file.
+    # `connection_state` is deliberately separate from the pre-existing
+    # `source_status` (connectivity-test result: ACTIVE/ERROR) and
+    # `is_active` (soft-hide flag) columns — neither of those express the
+    # new disconnect/credentials-removed/reconnect lifecycle, and changing
+    # their existing meaning would be a silent behavior change for every
+    # current caller of list_data_sources/is_ready_to_ask.
+    dsc_existing = {
+        row[1] for row in cursor.execute("PRAGMA table_info(data_source_connections)").fetchall()
+    }
+    dsc_migrations = [
+        ("datasource_identity_key", "ALTER TABLE data_source_connections ADD COLUMN datasource_identity_key TEXT"),
+        ("connection_state", "ALTER TABLE data_source_connections ADD COLUMN connection_state TEXT NOT NULL DEFAULT 'ACTIVE'"),
+    ]
+    for column, statement in dsc_migrations:
+        if column not in dsc_existing:
+            cursor.execute(statement)
+    conn.commit()
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dsc_identity_key ON data_source_connections (datasource_identity_key)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dsc_connection_state ON data_source_connections (connection_state)"
+    )
+    conn.commit()
+
+    # One-time best-effort backfill for pre-existing rows with no identity
+    # key yet. A row whose config fails to decrypt (corrupt row, rotated
+    # ENCRYPTION_KEY with no migration) is skipped and logged — never fatal
+    # to init_db(), exactly like every other best-effort step in this
+    # codebase's connect/bootstrap path.
+    backfill_rows = cursor.execute(
+        "SELECT id, user_id, source_type, encrypted_config_json FROM data_source_connections "
+        "WHERE datasource_identity_key IS NULL"
+    ).fetchall()
+    if backfill_rows:
+        from core.secrets.datasource_identity import compute_datasource_identity_key
+        from core.secrets.manager import get_secret_manager
+
+        secret_manager = get_secret_manager()
+        for row in backfill_rows:
+            try:
+                params = json.loads(secret_manager.decrypt_secret(row["encrypted_config_json"]))
+                identity_key = compute_datasource_identity_key(row["user_id"], row["source_type"], params)
+                cursor.execute(
+                    "UPDATE data_source_connections SET datasource_identity_key = ? WHERE id = ?",
+                    (identity_key, row["id"]),
+                )
+            except Exception:  # noqa: BLE001 — best-effort backfill, never fatal
+                logging.getLogger(__name__).warning(
+                    "init_db: datasource identity backfill failed for source_id=%s", row["id"],
+                )
+        conn.commit()
+
+    # datasource_lifecycle_audit — Phase 7, Step 6H, Part 3/9. One row per
+    # explicit lifecycle action (disconnect/credentials-removed/reconnect/
+    # permanent delete) — never a row for routine connectivity tests or
+    # automatic metadata refreshes, which already have their own tracking
+    # (last_tested_at / metadata_jobs). No FK to data_source_connections(id):
+    # a permanent-delete audit record must outlive the row it describes.
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS datasource_lifecycle_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id       INTEGER NOT NULL,
+            user_id         TEXT    NOT NULL,
+            action          TEXT    NOT NULL,
+            reason          TEXT,
+            created_at      TEXT    NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dsla_source_id ON datasource_lifecycle_audit (source_id);
+        CREATE INDEX IF NOT EXISTS idx_dsla_user_id   ON datasource_lifecycle_audit (user_id);
+        CREATE INDEX IF NOT EXISTS idx_dsla_action     ON datasource_lifecycle_audit (action);
+    """)
+    conn.commit()
+
+    # fast_path_durable_plans — Phase 7, Step 6H, Part 4. Persistent
+    # counterpart to core.sqlservice.fast_path_plan_cache's in-memory
+    # OrderedDict, keyed by datasource_identity_key (NOT source_id) so a
+    # reconnect of the same physical database can still hit — mirrors the
+    # sql_retrieval_embeddings/sql_example_embeddings content-addressed,
+    # non-source-scoped keying idiom identified as reusable by the Step 6H0
+    # audit. Deliberately NOT FK'd to data_source_connections(id), for the
+    # same reason those two tables aren't: it must survive both a reconnect
+    # (new or reused source_id) and must not be silently resurrected by a
+    # later, unrelated source reusing the same identity after a genuine
+    # permanent delete — see this table's own module docstring in
+    # core.sqlservice.durable_plan_store for how plan_format_version /
+    # schema_fingerprint / business-knowledge version naturally invalidate a
+    # stale row instead of a hard FK being required to do so.
+    #
+    # Never stores: raw question text, resolved_standalone_question, result
+    # rows, PII, credentials, embeddings, or raw model prompts/responses —
+    # only normalized_question_hash (a one-way hash) plus the same bounded,
+    # already-audited-safe structural plan fields
+    # core.sqlservice.fast_path_plan_cache.FastPathCachedPlan already stores
+    # in memory (intent/selected objects/reasons/sql/decision evidence/
+    # confidence/model), serialized into plan_payload_json.
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS fast_path_durable_plans (
+            id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key_hash                  TEXT    NOT NULL UNIQUE,
+            datasource_identity_key         TEXT    NOT NULL,
+            user_id                         TEXT    NOT NULL,
+            normalized_question_hash        TEXT    NOT NULL,
+            schema_fingerprint              TEXT    NOT NULL,
+            retrieval_build_id              INTEGER,
+            business_knowledge_package_id   INTEGER,
+            business_knowledge_package_version INTEGER,
+            metrics_contract_version        TEXT,
+            view_profile_state              TEXT,
+            relationship_state_digest       TEXT,
+            secret_policy_version           INTEGER NOT NULL DEFAULT 0,
+            fast_path_model                 TEXT    NOT NULL,
+            fast_path_reasoning_effort      TEXT,
+            fast_path_prompt_version        TEXT    NOT NULL,
+            plan_format_version             INTEGER NOT NULL,
+            plan_payload_json               TEXT    NOT NULL,
+            created_at                      TEXT    NOT NULL,
+            last_used_at                    TEXT    NOT NULL,
+            expires_at                      TEXT,
+            use_count                       INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_fpdp_identity_key ON fast_path_durable_plans (datasource_identity_key);
+        CREATE INDEX IF NOT EXISTS idx_fpdp_user_id       ON fast_path_durable_plans (user_id);
+        CREATE INDEX IF NOT EXISTS idx_fpdp_expires_at    ON fast_path_durable_plans (expires_at);
+    """)
+    conn.commit()
+
     # schema_snapshots — versioned schema discovery results per data source connection.
     cursor.executescript("""
         CREATE TABLE IF NOT EXISTS schema_snapshots (
@@ -805,6 +1398,35 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_prcp_source_pii
             ON profiling_column_profiles (source_id, pii_confirmed);
     """)
+    conn.commit()
+
+    # Idempotent migrations for autonomous PII classification (see
+    # data/pii_classification_service.py). pii_confirmed stays the existing
+    # boolean gate query_execution_service._governance_recheck already reads
+    # (True only for pii_classification == CONFIRMED_PII); these columns add
+    # the tri-state decision plus evidence/source/manual-override precedence
+    # on top of it without changing pii_confirmed's existing semantics.
+    prcp_existing = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(profiling_column_profiles)").fetchall()
+    }
+    prcp_migrations = [
+        ("pii_classification",
+         "ALTER TABLE profiling_column_profiles ADD COLUMN pii_classification TEXT"),
+        ("pii_classification_confidence",
+         "ALTER TABLE profiling_column_profiles ADD COLUMN pii_classification_confidence REAL"),
+        ("pii_classification_evidence",
+         "ALTER TABLE profiling_column_profiles ADD COLUMN pii_classification_evidence TEXT"),
+        ("pii_classification_source",
+         "ALTER TABLE profiling_column_profiles ADD COLUMN pii_classification_source TEXT"),
+        ("pii_classified_at",
+         "ALTER TABLE profiling_column_profiles ADD COLUMN pii_classified_at TEXT"),
+        ("pii_manual_override",
+         "ALTER TABLE profiling_column_profiles ADD COLUMN pii_manual_override INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for column, statement in prcp_migrations:
+        if column not in prcp_existing:
+            cursor.execute(statement)
     conn.commit()
 
     # Idempotent migrations for profiling_column_profiles: Phase 1A deep profiling.
@@ -1246,6 +1868,60 @@ def init_db() -> None:
     conn.commit()
 
     # -------------------------------------------------------------------------
+    # View Semantic Discovery milestone — connect-time-discovered VIEW
+    # definitions/dependencies, persisted so the live restriction-detection
+    # probe in semantic_contract_service.py and candidate discovery in
+    # semantic_retrieval_service.py don't need a live round-trip on every
+    # question. One row per view per source; upserted on re-discovery.
+    # -------------------------------------------------------------------------
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS view_semantic_evidence (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id               INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            snapshot_id             INTEGER NOT NULL REFERENCES schema_snapshots(id) ON DELETE CASCADE,
+            table_fqn               TEXT    NOT NULL,
+            definition_sql          TEXT,
+            definition_checksum     TEXT,
+            referenced_tables_json  TEXT,
+            restriction_json        TEXT,
+            naming_penalty_score    REAL    NOT NULL DEFAULT 0.0,
+            is_curated              INTEGER NOT NULL DEFAULT 0,
+            discovered_at           TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_vse_source_table_uniq
+            ON view_semantic_evidence (source_id, table_fqn);
+
+        CREATE INDEX IF NOT EXISTS idx_vse_source_curated
+            ON view_semantic_evidence (source_id, is_curated);
+    """)
+    conn.commit()
+
+    # view_semantic_evidence — Phase 7, Step 6E3B4, Part 2: additive columns
+    # for the complete-definition capture fix. Existing rows (captured via
+    # the OLD, truncating value-sampling path) backfill via column DEFAULT
+    # to 'LEGACY_UNKNOWN' — an honest "captured before this fix existed,
+    # completeness unverified" label, never silently assumed complete.
+    # definition_length is always a cheap derived fact
+    # (len(definition_sql)), persisted as a real column anyway so a caller
+    # can filter/sort on it without loading/parsing definition_sql itself.
+    # Mirrors table_relationships' own ALTER-guarded migration idiom
+    # immediately above — purely additive, PRAGMA table_info-guarded, safe
+    # to run against an already-populated table.
+    _vse_existing_cols = {
+        row["name"]
+        for row in cursor.execute("PRAGMA table_info(view_semantic_evidence)").fetchall()
+    }
+    _vse_migrations = [
+        ("definition_capture_status", "ALTER TABLE view_semantic_evidence ADD COLUMN definition_capture_status TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN'"),
+        ("definition_length",         "ALTER TABLE view_semantic_evidence ADD COLUMN definition_length INTEGER"),
+    ]
+    for _col_name, _ddl in _vse_migrations:
+        if _col_name not in _vse_existing_cols:
+            cursor.execute(_ddl)
+    conn.commit()
+
+    # -------------------------------------------------------------------------
     # Unified Governance Engine — Phase 1 Foundation
     # -------------------------------------------------------------------------
 
@@ -1387,6 +2063,23 @@ def init_db() -> None:
             "POLICY_AUTO_APPROVE_HIGH_CONFIDENCE_ASSIGNMENTS",
             1, 35,
             '["domain.assignment","entity.assignment"]',
+            '{"confidence_min": 0.90}',
+            "AUTO_APPROVE",
+        ),
+        # Phase 2: concept-to-table mappings with very strong stored
+        # confidence are auto-approve eligible. Priority 40 — after the
+        # assignment policy (35) and before the priority-50 catch-alls.
+        # Not sufficient alone in practice: this phase's only implemented
+        # write path is the human clarification-resume fast path
+        # (concept_mapping_service.promote_clarification_selection), which
+        # writes governance_state='HUMAN_APPROVED' directly since a human
+        # already decided — an auto_governance batch curator that would
+        # actually exercise this policy is deliberately not built yet (see
+        # concept_mapping_service.py's own module docstring).
+        (
+            "POLICY_AUTO_APPROVE_HIGH_CONFIDENCE_CONCEPT_MAPPING",
+            1, 40,
+            '["concept.mapping"]',
             '{"confidence_min": 0.90}',
             "AUTO_APPROVE",
         ),
@@ -1541,6 +2234,18 @@ def init_db() -> None:
             "ALTER TABLE query_execution_log ADD COLUMN execution_kind "
             "TEXT NOT NULL DEFAULT 'user_query'"
         )
+    # Reconnect Reliability milestone, Part 14 — pipeline observability trace.
+    # Nullable, additive: existing rows and every pre-existing caller of
+    # log_query_execution() that doesn't pass pipeline_trace are unaffected.
+    # Stores an encrypted JSON blob (core.security.encryption.encrypt, same
+    # pattern data/audit.py already uses) — the trace itself
+    # (core.observability.pipeline_trace.build_pipeline_trace) never
+    # includes raw SQL text/parameter values/row data, but is still
+    # encrypted at rest since it can reveal table/column names.
+    if "pipeline_trace_encrypted" not in existing_qel_columns:
+        cursor.execute(
+            "ALTER TABLE query_execution_log ADD COLUMN pipeline_trace_encrypted TEXT"
+        )
     conn.commit()
 
     # ai_semantic_suggestions — pending review queue for AI-generated dictionary suggestions.
@@ -1642,5 +2347,244 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_mlr_status    ON metadata_lifecycle_runs (status);
     """)
     conn.commit()
+
+    # Idempotent migration for the Part 16 duplicate-run guard
+    # (data.lifecycle_service.find_duplicate_lifecycle_run). old/new_snapshot_id
+    # alone identify the SCHEMA snapshot pair, which is not fine-grained
+    # enough on its own — two runs can share an unchanged schema pair while
+    # differing in PROFILING evidence (see
+    # tests/test_lifecycle_profiling_trigger.py::
+    # test_idempotent_no_duplicate_vocabulary_rows). These two extra columns
+    # let the guard key on both pairs together.
+    mlr_existing = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(metadata_lifecycle_runs)").fetchall()
+    }
+    mlr_migrations = [
+        ("prof_old_snapshot_id",
+         "ALTER TABLE metadata_lifecycle_runs ADD COLUMN prof_old_snapshot_id INTEGER"),
+        ("prof_new_snapshot_id",
+         "ALTER TABLE metadata_lifecycle_runs ADD COLUMN prof_new_snapshot_id INTEGER"),
+    ]
+    for column, statement in mlr_migrations:
+        if column not in mlr_existing:
+            cursor.execute(statement)
+    conn.commit()
+
+    # SQL rebuild Phase 1, Step 5 — sql_retrieval_builds / sql_retrieval_documents:
+    # transactional, versioned persistence for core.sqlservice's retrieval-document
+    # builder (core/sqlservice/retrieval_documents.py) and its bulk metadata loader
+    # (core/sqlservice/metadata_loader.py). One build row per persisted attempt,
+    # keyed on the structural schema fingerprint (data/schema_fingerprint_service.py)
+    # plus a deterministic document_set_hash, so an unchanged source reuses its
+    # existing READY build instead of duplicating rows (see
+    # core/sqlservice/retrieval_store.py). error_message exists for forward
+    # compatibility with a future non-transactional/async builder that might record
+    # a FAILED row directly — the synchronous persist_retrieval_build() in this step
+    # always rolls back to zero new rows on failure instead, so it never writes
+    # status='FAILED' itself. No embeddings column here by design — that belongs to
+    # the later vector-store step.
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS sql_retrieval_builds (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id           INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            snapshot_id         INTEGER NOT NULL REFERENCES schema_snapshots(id),
+            snapshot_version    INTEGER NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
+            schema_fingerprint  TEXT    NOT NULL,
+            table_set_hash      TEXT    NOT NULL,
+            document_set_hash   TEXT    NOT NULL,
+            status              TEXT    NOT NULL CHECK (status IN ('BUILDING','READY','FAILED')),
+            document_count      INTEGER NOT NULL DEFAULT 0,
+            error_message       TEXT    CHECK (error_message IS NULL OR length(error_message) <= 2000),
+            created_at          TEXT    NOT NULL,
+            completed_at        TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_srb_source_status
+            ON sql_retrieval_builds (source_id, status);
+        -- Step 5A: UNIQUE, not just an index — this is the database-enforced
+        -- idempotency/concurrency guarantee. Two racing callers persisting the
+        -- same logical build (same source, fingerprint_version,
+        -- schema_fingerprint, document_set_hash) cannot both succeed: SQLite
+        -- serializes writers, so the loser's INSERT raises IntegrityError,
+        -- which core.sqlservice.retrieval_store.persist_retrieval_build()
+        -- catches and turns into a REUSED result pointing at the winner's
+        -- build (see that function's docstring for the full sequence).
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_srb_unique_build
+            ON sql_retrieval_builds (source_id, fingerprint_version, schema_fingerprint, document_set_hash);
+
+        CREATE TABLE IF NOT EXISTS sql_retrieval_documents (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            build_id        INTEGER NOT NULL REFERENCES sql_retrieval_builds(id) ON DELETE CASCADE,
+            source_id       INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            object_fqn      TEXT    NOT NULL,
+            object_type     TEXT    NOT NULL CHECK (object_type IN ('TABLE','VIEW')),
+            retrieval_tier  INTEGER NOT NULL CHECK (retrieval_tier BETWEEN 1 AND 4),
+            document_hash   TEXT    NOT NULL,
+            document_text   TEXT    NOT NULL,
+            metadata_json   TEXT    NOT NULL,
+            created_at      TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_srd_build_fqn
+            ON sql_retrieval_documents (build_id, object_fqn);
+        CREATE INDEX IF NOT EXISTS idx_srd_build_id
+            ON sql_retrieval_documents (build_id);
+        CREATE INDEX IF NOT EXISTS idx_srd_build_tier
+            ON sql_retrieval_documents (build_id, retrieval_tier);
+        CREATE INDEX IF NOT EXISTS idx_srd_hash
+            ON sql_retrieval_documents (document_hash);
+    """)
+    conn.commit()
+
+    # SQL rebuild Phase 2, Step 1 — sql_retrieval_embeddings: a
+    # content-addressed embedding cache for core.sqlservice's retrieval
+    # documents (core/sqlservice/embedding_store.py). Keyed on
+    # (embedding_provider, embedding_model, embedding_dimensions,
+    # document_hash) — deliberately NOT build_id or document id — so an
+    # unchanged document (same document_hash) reuses its cached vector
+    # across every retrieval build and source that produces that hash,
+    # instead of recomputing or duplicating it. Vectors are stored as
+    # compact float32 little-endian binary (vector_blob), never JSON. This
+    # step never calls OpenAI, never generates a real embedding, and never
+    # performs vector similarity search — it only creates local, empty
+    # storage plus the validated read/write functions in
+    # core/sqlservice/embedding_store.py.
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS sql_retrieval_embeddings (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            embedding_provider   TEXT    NOT NULL CHECK (length(embedding_provider) > 0),
+            embedding_model      TEXT    NOT NULL CHECK (length(embedding_model) > 0),
+            embedding_dimensions INTEGER NOT NULL CHECK (embedding_dimensions > 0),
+            document_hash        TEXT    NOT NULL CHECK (length(document_hash) = 64),
+            vector_blob          BLOB    NOT NULL,
+            vector_byte_length   INTEGER NOT NULL CHECK (vector_byte_length = embedding_dimensions * 4),
+            created_at           TEXT    NOT NULL,
+            CHECK (length(vector_blob) = vector_byte_length)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sre_provider_model_dims_hash
+            ON sql_retrieval_embeddings (embedding_provider, embedding_model, embedding_dimensions, document_hash);
+        CREATE INDEX IF NOT EXISTS idx_sre_hash
+            ON sql_retrieval_embeddings (document_hash);
+    """)
+    conn.commit()
+
+    # SQL rebuild Phase 5, Step 9 — sql_examples / sql_example_embeddings:
+    # automatically-trusted (core/sqlservice/sql_example_model.py's
+    # classify_trust_level -- NO manual approval workflow) natural-
+    # language-question/SQL-template pairs plus their content-addressed
+    # search-document embedding cache. See migrations/014_create_sql_examples.sql
+    # for the full design rationale (identical schema, kept in sync here).
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS sql_examples (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id               INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            schema_fingerprint      TEXT    NOT NULL,
+            question_pattern        TEXT    NOT NULL CHECK (length(question_pattern) > 0),
+            sql_template             TEXT    NOT NULL CHECK (length(sql_template) > 0),
+            canonical_object_fqns_json TEXT NOT NULL,
+            canonical_columns_json  TEXT    NOT NULL DEFAULT '[]',
+            join_path_json          TEXT    NOT NULL DEFAULT '[]',
+            result_shape            TEXT    NOT NULL CHECK (result_shape IN ('COUNT','LIST','GROUPED_AGGREGATION','TREND','ATTRIBUTE')),
+            provenance               TEXT    NOT NULL CHECK (provenance IN ('SCHEMA_GENERATED_TEMPLATE','DEVELOPER_VERIFICATION_SET','VALIDATED_EXECUTION','OBSERVED_UNVERIFIED')),
+            trust_level              TEXT    NOT NULL CHECK (trust_level IN ('TRUSTED','UNTRUSTED')),
+            search_document_text    TEXT    NOT NULL,
+            search_document_hash    TEXT    NOT NULL CHECK (length(search_document_hash) = 64),
+            content_hash             TEXT    NOT NULL CHECK (length(content_hash) = 64),
+            status                   TEXT    NOT NULL CHECK (status IN ('ACTIVE','STALE')) DEFAULT 'ACTIVE',
+            created_at               TEXT    NOT NULL,
+            updated_at               TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_se_source_content_hash
+            ON sql_examples (source_id, content_hash);
+        CREATE INDEX IF NOT EXISTS idx_se_source_status_trust
+            ON sql_examples (source_id, status, trust_level);
+        CREATE INDEX IF NOT EXISTS idx_se_search_document_hash
+            ON sql_examples (search_document_hash);
+
+        CREATE TABLE IF NOT EXISTS sql_example_embeddings (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            embedding_provider    TEXT    NOT NULL CHECK (length(embedding_provider) > 0),
+            embedding_model       TEXT    NOT NULL CHECK (length(embedding_model) > 0),
+            embedding_dimensions  INTEGER NOT NULL CHECK (embedding_dimensions > 0),
+            search_document_hash  TEXT    NOT NULL CHECK (length(search_document_hash) = 64),
+            vector_blob           BLOB    NOT NULL,
+            vector_byte_length    INTEGER NOT NULL CHECK (vector_byte_length = embedding_dimensions * 4),
+            created_at            TEXT    NOT NULL,
+            CHECK (length(vector_blob) = vector_byte_length)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_seem_provider_model_dims_hash
+            ON sql_example_embeddings (embedding_provider, embedding_model, embedding_dimensions, search_document_hash);
+        CREATE INDEX IF NOT EXISTS idx_seem_hash
+            ON sql_example_embeddings (search_document_hash);
+    """)
+    conn.commit()
+
+    # SQL Architecture Correction, Phase 6, Step 4B — sql_semantic_enrichments:
+    # structurally validated, model-inferred object/column semantics
+    # (core/sqlservice/semantic_enrichment_service.py's EnrichedObjectSemantics
+    # + EnrichedColumnSemantics, never arbitrary raw provider JSON), persisted
+    # by per-object semantic-input hash. NO manual approval workflow. See
+    # migrations/015_create_semantic_enrichment.sql for the full design
+    # rationale (identical schema, kept in sync here) and
+    # migrations/016_add_semantic_enrichment_phase.sql (Phase 6 Step 4C2) for
+    # the `phase` column added below — a fresh database created via
+    # init_db() already has both migrations' end-state schema in ONE
+    # CREATE TABLE, so it never needs migration 016's ALTER TABLE applied.
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS sql_semantic_enrichments (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id            INTEGER NOT NULL REFERENCES data_source_connections(id) ON DELETE CASCADE,
+            object_fqn           TEXT    NOT NULL CHECK (length(object_fqn) > 0),
+            semantic_input_hash  TEXT    NOT NULL CHECK (length(semantic_input_hash) = 64),
+            provider_id          TEXT    NOT NULL CHECK (length(provider_id) > 0),
+            model                TEXT    NOT NULL CHECK (length(model) > 0),
+            contract_version     INTEGER NOT NULL CHECK (contract_version > 0),
+            phase                TEXT    NOT NULL CHECK (phase IN ('OBJECT_CORE','COLUMN_DEFERRED')) DEFAULT 'COLUMN_DEFERRED',
+            payload_json         TEXT    NOT NULL,
+            status               TEXT    NOT NULL CHECK (status IN ('ACTIVE','INVALID')) DEFAULT 'ACTIVE',
+            created_at           TEXT    NOT NULL,
+            updated_at           TEXT    NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sse_cache_key
+            ON sql_semantic_enrichments (source_id, object_fqn, semantic_input_hash, provider_id, model, contract_version, phase);
+        CREATE INDEX IF NOT EXISTS idx_sse_source_current
+            ON sql_semantic_enrichments (source_id, status, provider_id, model, contract_version, phase);
+        CREATE INDEX IF NOT EXISTS idx_sse_source_object
+            ON sql_semantic_enrichments (source_id, object_fqn);
+    """)
+    conn.commit()
+
+    # Phase 6 Step 4C2A: handles the ONE case the CREATE TABLE IF NOT EXISTS
+    # above cannot -- an existing, pre-Step-4C2 sql_semantic_enrichments
+    # table that predates the `phase` column. See this function's own
+    # docstring for why this can't just be more idempotent raw SQL.
+    ensure_sql_semantic_enrichments_phase_migration(conn)
+
+    # Phase 6 Step 6C1: a brand-new, dedicated table for deep VIEW_ENRICHED
+    # semantics -- NOT an extension of sql_semantic_enrichments (Step 6C's
+    # original design widened that table's `phase` CHECK via a table
+    # rebuild; Step 6C1's audit replaced it with this safer, purely
+    # additive table so the live, already-populated sql_semantic_enrichments
+    # table (590 real OBJECT_CORE rows as of this audit) is never rebuilt,
+    # renamed, or otherwise touched by view-enrichment work at all). See
+    # ensure_sql_view_semantic_enrichments_table's own docstring.
+    ensure_sql_view_semantic_enrichments_table(conn)
+
+    # Phase 7 Step 6E3B: persisted, deterministic per-view structural/
+    # lineage/suitability profile -- purely additive, see
+    # ensure_sql_view_profiles_table's own docstring for the rollback
+    # procedure and exactly what this does/does not touch.
+    ensure_sql_view_profiles_table(conn)
+
+    # Phase 7, Step 3J: persistent, source-scoped business-knowledge package
+    # (concepts/relationships/facts) plus its AI-proposed/verified schema
+    # mappings -- see ensure_business_knowledge_tables's own docstring.
+    ensure_business_knowledge_tables(conn)
 
     conn.close()

@@ -5,15 +5,52 @@ import pathlib
 import tempfile
 from datetime import datetime, timezone
 
+from core.config import AUDIT_LOG_DIR, AUDIT_LOG_MAX_BYTES, TOOLSMITH_DATA_DIR
 from core.security.encryption import encrypt
 from data.db import get_connection
 
 logger = logging.getLogger(__name__)
 
-AUDIT_LOG_PATH = pathlib.Path(__file__).parent / "audit.log"
+
+def _resolve_audit_log_path(audit_log_dir: str, data_dir: str) -> pathlib.Path:
+    """Precedence: AUDIT_LOG_DIR (audit-log-specific override) >
+    TOOLSMITH_DATA_DIR (general runtime-data override) > historical default
+    next to this file. A pure function of its arguments so path resolution
+    is unit-testable without reloading this module."""
+    if audit_log_dir:
+        base = pathlib.Path(audit_log_dir)
+    elif data_dir:
+        base = pathlib.Path(data_dir)
+    else:
+        base = pathlib.Path(__file__).parent
+    return base / "audit.log"
+
+
+AUDIT_LOG_PATH = _resolve_audit_log_path(AUDIT_LOG_DIR, TOOLSMITH_DATA_DIR)
+
+
+def _rotate_if_oversized() -> None:
+    """Archive audit.log to a timestamped file once it reaches
+    AUDIT_LOG_MAX_BYTES, before it grows large enough to risk write failures
+    on cloud-synced filesystems — observed: a 131 MB audit.log inside a
+    OneDrive-synced project directory reliably failed open+close with
+    OSError [Errno 22] Invalid argument (reproduced in both text and binary
+    mode; a fresh/small file at the same path never failed), because nothing
+    ever rotated it. Best-effort: rotation failure must not block the write
+    it guards, matching this module's existing non-fatal error handling.
+    """
+    try:
+        if AUDIT_LOG_PATH.exists() and AUDIT_LOG_PATH.stat().st_size >= AUDIT_LOG_MAX_BYTES:
+            archive_path = AUDIT_LOG_PATH.with_name(
+                f"audit.log.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.bak"
+            )
+            os.replace(AUDIT_LOG_PATH, archive_path)
+    except OSError as e:
+        logger.error("Failed to rotate audit log: %s", e)
 
 
 def log_audit_event(task_result: dict, user_id: str | None = None) -> None:
+    _rotate_if_oversized()
     task_type = (
         task_result.get("task_type")
         or "execution"

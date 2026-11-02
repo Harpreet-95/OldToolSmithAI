@@ -231,7 +231,22 @@ class LiveQueryEngine:
                 )
 
             rows_raw = rows_raw or []
-            truncated = len(rows_raw) > limits.row_limit
+            # NEXT MILESTONE — REAL BUSINESS Q&A COMPLETION, Part 30. The
+            # generated SQL this engine executes always carries its own
+            # TOP/LIMIT clause matching limits.row_limit (data.
+            # sql_generation_service), so the DB driver structurally never
+            # returns MORE rows than the limit — `len(rows_raw) >
+            # limits.row_limit` can essentially never be true, making
+            # `truncated` false by construction even when the real
+            # underlying result set is far larger (live-confirmed: 1,000 of
+            # 13,255 real relationship rows returned reported
+            # truncated=False). Hitting the limit exactly is itself the
+            # only observable signal available here that more rows likely
+            # exist upstream; a false positive (reporting "possibly more"
+            # for a result that happens to have exactly row_limit rows) is
+            # a far safer failure mode than a false negative (silently
+            # under-reporting a governed query's true result size).
+            truncated = len(rows_raw) >= limits.row_limit
             rows_raw = rows_raw[:limits.row_limit]
             columns = _build_columns(description, pii_aliases or set())
             rows = _build_rows(rows_raw, columns)

@@ -58,6 +58,19 @@ class LiveConnectionResolver:
                 message="Data source is inactive or in an error state.",
             )
 
+        # Phase 7, Step 6H, Part 3 — a temporarily disconnected or
+        # credentials-removed source must never resolve a live connection,
+        # even though is_active/source_status (a different, pre-existing
+        # concept) are otherwise untouched by either action. Defaults to
+        # 'ACTIVE' for every pre-existing row, so this is a zero-behavior
+        # -change addition for any source that was never disconnected.
+        if record.get("connection_state") not in (None, "ACTIVE"):
+            return ResolutionResult(
+                status=ResolutionStatus.INACTIVE,
+                context=None,
+                message="Data source is disconnected. Reconnect it before running a live query.",
+            )
+
         import core.connectors.registry as registry
 
         connector_cls = registry.get(record["source_type"])

@@ -20,9 +20,11 @@ Run from project root:
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import sqlite3
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from cryptography.fernet import Fernet
@@ -45,6 +47,10 @@ from data.governance_service import (
     log_governance_event,
     upsert_governance_state,
     confirm_pii_column,
+)
+from data.profiling_snapshot_resolver import (
+    ProfilingSnapshotRef,
+    get_latest_profiling_snapshot,
 )
 
 
@@ -242,6 +248,12 @@ _SCHEMA = """
         pii_name_heuristic    INTEGER NOT NULL DEFAULT 0,
         pii_confirmed         INTEGER NOT NULL DEFAULT 0,
         pii_signals_json      TEXT,
+        pii_classification            TEXT,
+        pii_classification_confidence REAL,
+        pii_classification_evidence   TEXT,
+        pii_classification_source     TEXT,
+        pii_classified_at             TEXT,
+        pii_manual_override   INTEGER NOT NULL DEFAULT 0,
         top_values_coverage   REAL,
         profiling_depth       TEXT NOT NULL DEFAULT 'STRUCTURAL_ONLY',
         profiling_duration_ms INTEGER,
@@ -1267,6 +1279,162 @@ class TestListGovernanceEvents:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2G.14 — additional seed helpers and connection wrappers for
+# confirm_pii_column() baseline coverage (latest-snapshot precedence, write
+# scoping, connection/transaction behavior). TestConfirmPiiColumn._setup_db()
+# below is left untouched; these build additional profiling_snapshots /
+# profiling_column_profiles rows on top of it (or on a fresh db) for
+# scenarios _setup_db() alone doesn't cover. This is read-only test
+# infrastructure — confirm_pii_column() itself is not modified this phase.
+# ---------------------------------------------------------------------------
+
+def _seed_source_only(db: sqlite3.Connection, source_id: int, user_id: str) -> None:
+    db.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        "encrypted_config_json, config_schema_version, capabilities_json, "
+        "metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (?, ?, 'Test DB', 'mssql', 'relational_db', "
+        "'{}', 1, '[]', '{}', 'ACTIVE', 1, '2025-01-01', '2025-01-01')",
+        (source_id, user_id),
+    )
+    db.commit()
+
+
+def _seed_snapshot(
+    db: sqlite3.Connection, snap_id: int, source_id: int,
+    snapshot_version: int, status: str = "COMPLETE",
+) -> None:
+    db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(id, source_id, schema_snapshot_id, snapshot_version, mode, sample_rate, "
+        "profiling_rules_version, status, tables_total, tables_profiled, "
+        "tables_skipped, tables_failed, tables_timed_out, columns_total, "
+        "columns_profiled, columns_skipped, total_rows_profiled, "
+        "pii_columns_found, classifications_complete, batch_size, "
+        "next_table_index, created_at) "
+        "VALUES (?, ?, 1, ?, 'full', 1.0, '1.0.0', ?, "
+        "1, 1, 0, 0, 0, 3, 3, 0, 5000, 1, 1, 50, 0, '2025-01-01')",
+        (snap_id, source_id, snapshot_version, status),
+    )
+    db.commit()
+
+
+def _seed_column_profile(
+    db: sqlite3.Connection, row_id: int, snap_id: int, source_id: int,
+    table_fqn: str, column_name: str, *,
+    pii_name_heuristic: int = 1, pii_confirmed: int = 0,
+) -> None:
+    db.execute(
+        "INSERT INTO profiling_column_profiles "
+        "(id, profiling_snapshot_id, source_id, table_fqn, column_name, data_type, "
+        "pii_name_heuristic, pii_confirmed, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 'VARCHAR', ?, ?, '2025-01-01', '2025-01-01')",
+        (row_id, snap_id, source_id, table_fqn, column_name,
+         pii_name_heuristic, pii_confirmed),
+    )
+    db.commit()
+
+
+def _row_by_id(db: sqlite3.Connection, row_id: int) -> dict | None:
+    row = db.execute(
+        "SELECT * FROM profiling_column_profiles WHERE id = ?", (row_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+class _CountingConn:
+    """Wraps a sqlite3.Connection like _NoClose (keeps the shared in-memory
+    DB alive across close() calls so post-call assertions still work) but
+    also counts commit()/rollback()/close() calls, to characterize
+    confirm_pii_column()'s transaction behavior precisely."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.close_count = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        self.commit_count += 1
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self.close_count += 1  # deliberately not closing — mirrors _NoClose
+
+
+class _RaisingOnUpdateConn:
+    """Like _CountingConn, but raises when confirm_pii_column()'s UPDATE
+    statement executes — used to characterize exception/rollback/close
+    behavior when the write itself fails."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.close_count = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str) and "UPDATE profiling_column_profiles" in sql:
+            raise sqlite3.OperationalError("simulated failure")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def commit(self) -> None:
+        self.commit_count += 1
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class _RecordingConn:
+    """Wraps a sqlite3.Connection like _NoClose (keeps the shared in-memory
+    DB alive across close() calls), records every SQL statement executed,
+    and counts commit()/rollback()/close() calls — Phase 2G.16 uses this to
+    prove the UPDATE never runs when the resolver returns None."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.executed_sql: list[str] = []
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.close_count = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str):
+            self.executed_sql.append(sql)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def commit(self) -> None:
+        self.commit_count += 1
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self.close_count += 1  # deliberately not closing — mirrors _NoClose
+
+
+# ---------------------------------------------------------------------------
 # Part 5 — PII Confirmation Write Path
 # ---------------------------------------------------------------------------
 
@@ -1385,13 +1553,540 @@ class TestConfirmPiiColumn:
             )
         assert result is None
 
+    # -------------------------------------------------------------------
+    # Phase 2G.14 — baseline characterization of the correlated
+    # latest-profiling-snapshot subquery inside the UPDATE, ahead of its
+    # eventual resolver migration. Every test below describes CURRENT
+    # behavior only — none of them assert or require any "improved"
+    # behavior, even where the behavior looks surprising (see
+    # test_followup_select_can_diverge_from_the_updated_row).
+    # -------------------------------------------------------------------
+
+    # --- A. latest-snapshot semantics -----------------------------------
+
+    def test_highest_snapshot_version_wins(self):
+        db = self._setup_db()  # snap 10 (v1, COMPLETE), row 100
+        _seed_snapshot(db, 20, source_id=1, snapshot_version=2, status="COMPLETE")
+        _seed_column_profile(db, 200, 20, 1, "dbo.customers", "email_addr")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        assert result["id"] == 200
+        assert result["pii_confirmed"] == 1
+        # The older snapshot's row must be untouched.
+        assert _row_by_id(db, 100)["pii_confirmed"] == 0
+
+    def test_older_complete_snapshot_wins_over_newer_cancelled(self):
+        """The resolver picks the older COMPLETE snapshot (10) over the
+        newer CANCELLED one (30), so the UPDATE writes pii_confirmed=1 to
+        row 100 (under snapshot 10), and row 300 (under snapshot 30) is left
+        untouched. Per the documented divergence baseline (see
+        test_followup_select_can_diverge_from_the_updated_row above), the
+        follow-up SELECT still orders by profiling_snapshot_id DESC, and 30
+        > 10, so the returned dict is the stale, never-updated row 300."""
+        db = self._setup_db()  # snap 10 (v1, COMPLETE), row 100
+        _seed_snapshot(db, 30, source_id=1, snapshot_version=2, status="CANCELLED")
+        _seed_column_profile(db, 300, 30, 1, "dbo.customers", "email_addr")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        # The row actually written to is 100 (the older COMPLETE snapshot,
+        # correctly selected by the resolver):
+        assert _row_by_id(db, 100)["pii_confirmed"] == 1
+        # But the follow-up SELECT (ORDER BY profiling_snapshot_id DESC)
+        # returns row 300 instead - stale, never updated.
+        assert result is not None
+        assert result["id"] == 300
+        assert result["pii_confirmed"] == 0
+
+    def test_older_complete_snapshot_wins_over_newer_running(self):
+        """Same divergence pattern as the CANCELLED case above, with a
+        newer RUNNING snapshot (40) instead."""
+        db = self._setup_db()  # snap 10 (v1, COMPLETE), row 100
+        _seed_snapshot(db, 40, source_id=1, snapshot_version=2, status="RUNNING")
+        _seed_column_profile(db, 400, 40, 1, "dbo.customers", "email_addr")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        # The row actually written to is 100 (the older COMPLETE snapshot,
+        # correctly selected by the resolver):
+        assert _row_by_id(db, 100)["pii_confirmed"] == 1
+        # But the follow-up SELECT (ORDER BY profiling_snapshot_id DESC)
+        # returns row 400 instead - stale, never updated.
+        assert result is not None
+        assert result["id"] == 400
+        assert result["pii_confirmed"] == 0
+
+    def test_snapshot_selection_scoped_to_source(self):
+        db = self._setup_db()  # source 1: snap 10 (v1), row 100
+        _seed_source_only(db, source_id=2, user_id="bob")
+        # source 2's snapshot has a FAR higher version - must never affect source 1.
+        _seed_snapshot(db, 999, source_id=2, snapshot_version=99, status="COMPLETE")
+        _seed_column_profile(db, 9001, 999, 2, "dbo.customers", "email_addr")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        assert result["id"] == 100  # source 1's own (only) row, not source 2's
+        # source 2's identically-named row must remain untouched.
+        assert _row_by_id(db, 9001)["pii_confirmed"] == 0
+
+    def test_snapshot_selection_ignores_other_status_values(self):
+        """Generalizes the CANCELLED/RUNNING precedence tests above: the
+        subquery has no status filter at all, so any status value on the
+        highest snapshot_version wins, not just CANCELLED/RUNNING."""
+        db = self._setup_db()
+        _seed_snapshot(db, 50, source_id=1, snapshot_version=2, status="FAILED")
+        _seed_column_profile(db, 500, 50, 1, "dbo.customers", "email_addr")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        assert result["id"] == 500
+
+    # --- B. write behavior ------------------------------------------------
+
+    def test_unrelated_columns_in_same_snapshot_unchanged(self):
+        db = self._setup_db()  # snap 10, row 100 (email_addr)
+        _seed_column_profile(
+            db, 101, 10, 1, "dbo.customers", "full_name", pii_name_heuristic=0,
+        )
+
+        with _patch(db):
+            confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        unrelated = _row_by_id(db, 101)
+        assert unrelated["pii_confirmed"] == 0
+        assert unrelated["updated_at"] == "2025-01-01"
+
+    def test_exact_fields_changed_by_update(self):
+        db = self._setup_db()
+        before = _row_by_id(db, 100)
+
+        with _patch(db):
+            confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        after = _row_by_id(db, 100)
+        changed = {k for k in before if before[k] != after[k]}
+        # Parts 2-4 (autonomous PII classification): manual confirmation now
+        # also stamps the classification tri-state fields and the manual-
+        # override flag, so a future automatic re-classification pass never
+        # overwrites this human decision (manual override precedence).
+        assert changed == {
+            "pii_confirmed", "updated_at",
+            "pii_classification", "pii_classification_confidence",
+            "pii_classification_evidence", "pii_classification_source",
+            "pii_classified_at", "pii_manual_override",
+        }
+        assert after["pii_confirmed"] == 1
+        assert after["pii_classification"] == "CONFIRMED_PII"
+        assert after["pii_manual_override"] == 1
+        assert after["updated_at"] != before["updated_at"]
+
+    def test_successful_return_shape_matches_full_row(self):
+        db = self._setup_db()
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        direct = _row_by_id(db, 100)
+        assert result == direct
+        assert set(result.keys()) == set(direct.keys())
+
+    def test_followup_select_reads_the_updated_row_in_the_normal_case(self):
+        """Normal case: profiling_snapshot_id and snapshot_version increase
+        together, so the follow-up SELECT (ordered by profiling_snapshot_id
+        DESC) happens to agree with the UPDATE's snapshot_version-based
+        selection. Contrast with the divergence test below."""
+        db = self._setup_db()
+        _seed_snapshot(db, 20, source_id=1, snapshot_version=2, status="COMPLETE")
+        _seed_column_profile(db, 200, 20, 1, "dbo.customers", "email_addr")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result["id"] == 200
+        assert result["profiling_snapshot_id"] == 20
+
+    def test_followup_select_can_diverge_from_the_updated_row(self):
+        """Baseline finding, not a desired behavior: the UPDATE selects the
+        target row via 'ORDER BY snapshot_version DESC' (the correlated
+        subquery), but the follow-up SELECT re-picks the row via
+        'ORDER BY profiling_snapshot_id DESC' - a DIFFERENT ordering key.
+        When a profiling_snapshots row has a numerically higher id but a
+        LOWER snapshot_version (ids and versions are not guaranteed to stay
+        in lockstep), the function can return a stale row that was never
+        actually updated, even though pii_confirmed=1 was successfully
+        written to a different row. This test documents that this is the
+        function's actual current behavior - it is not asserting this is
+        correct or desirable."""
+        db = self._setup_db()
+        # snap 500: version 2 (the TRUE latest by version - what gets updated)
+        _seed_snapshot(db, 500, source_id=1, snapshot_version=2, status="COMPLETE")
+        _seed_column_profile(db, 5001, 500, 1, "dbo.customers", "ssn")
+        # snap 600: version 1 (older by version) but a HIGHER id than 500.
+        _seed_snapshot(db, 600, source_id=1, snapshot_version=1, status="COMPLETE")
+        _seed_column_profile(db, 6001, 600, 1, "dbo.customers", "ssn")
+
+        with _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="ssn",
+            )
+
+        # The row actually written to is 5001 (version 2, correctly selected
+        # by the UPDATE's subquery):
+        assert _row_by_id(db, 5001)["pii_confirmed"] == 1
+        # But the follow-up SELECT (ORDER BY profiling_snapshot_id DESC)
+        # returns row 6001 instead - stale, never updated, pii_confirmed
+        # still 0. This is the function's actual current return value.
+        assert result["id"] == 6001
+        assert result["pii_confirmed"] == 0
+
+    # --- C. missing-data and ownership behavior ----------------------------
+
+    def test_no_profiling_snapshot_returns_none_and_still_commits(self):
+        db = _make_db()
+        _seed_source_only(db, source_id=3, user_id="carol")
+        # No profiling_snapshots row at all for source 3.
+        wrapper = _CountingConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper):
+            result = confirm_pii_column(
+                source_id=3, user_id="carol",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is None
+        assert wrapper.commit_count == 1  # commit() runs unconditionally after the UPDATE
+        assert wrapper.rollback_count == 0
+        assert wrapper.close_count == 1
+
+    def test_no_matching_profile_row_returns_none_and_still_commits(self):
+        db = self._setup_db()
+        wrapper = _CountingConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="does_not_exist",
+            )
+
+        assert result is None
+        assert wrapper.commit_count == 1
+        assert wrapper.rollback_count == 0
+        assert wrapper.close_count == 1
+
+    def test_unowned_source_returns_none_with_no_commit_and_no_writes(self):
+        db = self._setup_db()
+        before = _row_by_id(db, 100)
+        wrapper = _CountingConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper):
+            result = confirm_pii_column(
+                source_id=1, user_id="mallory",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is None
+        assert wrapper.commit_count == 0  # returns before the UPDATE is ever reached
+        assert wrapper.rollback_count == 0
+        assert wrapper.close_count == 1
+        assert _row_by_id(db, 100) == before
+
+    def test_nonexistent_source_returns_none_with_no_commit_and_no_writes(self):
+        db = self._setup_db()
+        before = _row_by_id(db, 100)
+        wrapper = _CountingConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper):
+            result = confirm_pii_column(
+                source_id=999999, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is None
+        assert wrapper.commit_count == 0
+        assert wrapper.rollback_count == 0
+        assert wrapper.close_count == 1
+        assert _row_by_id(db, 100) == before
+
+    # --- D. connection and transaction behavior ----------------------------
+
+    def test_connection_acquisition_count_on_success(self):
+        """NOT 1: confirm_pii_column()'s own read+write block uses exactly
+        ONE connection (opened, used for the ownership check, the UPDATE
+        whose WHERE clause embeds the latest-snapshot subquery, and the
+        follow-up SELECT, then closed) - but on a successful confirmation
+        the function ALSO calls log_governance_event() and
+        upsert_governance_state() as post-success side effects, and each of
+        those independently calls get_connection() itself (see their own
+        definitions in data/governance_service.py). The observed total for
+        a successful call is therefore 3, not 1."""
+        db = self._setup_db()
+
+        with _patch(db) as mock_get_connection:
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        assert mock_get_connection.call_count == 3
+
+    def test_commit_and_close_counts_on_success(self):
+        """Mirrors test_connection_acquisition_count_on_success: 3 commits
+        and 3 closes on a successful call - one set from
+        confirm_pii_column()'s own connection, one each from
+        log_governance_event()'s and upsert_governance_state()'s own,
+        separate connections."""
+        db = self._setup_db()
+        wrapper = _CountingConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        assert wrapper.commit_count == 3
+        assert wrapper.rollback_count == 0
+        assert wrapper.close_count == 3
+
+    def test_sql_error_during_update_propagates_without_commit_or_rollback(self):
+        db = self._setup_db()
+        wrapper = _RaisingOnUpdateConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper):
+            with pytest.raises(sqlite3.OperationalError):
+                confirm_pii_column(
+                    source_id=1, user_id="alice",
+                    table_fqn="dbo.customers", column_name="email_addr",
+                )
+
+        assert wrapper.commit_count == 0
+        assert wrapper.rollback_count == 0  # no explicit rollback() call in the function
+        assert wrapper.close_count == 1  # the finally block still runs
+
+    # -------------------------------------------------------------------
+    # Phase 2G.16 — migration-proof tests: confirm_pii_column() now
+    # delegates to the shared resolver instead of running its own
+    # correlated latest-snapshot subquery inside the UPDATE.
+    # -------------------------------------------------------------------
+
+    def test_resolver_called_once_with_source_id_and_caller_conn(self):
+        """Proves: get_latest_profiling_snapshot is called exactly once,
+        with the correct source_id and the exact connection object
+        confirm_pii_column() itself opened (not a new one), and the
+        resolver never opens its own connection."""
+        db = self._setup_db()
+        wrapper = _NoClose(db)
+
+        resolver_calls: list = []
+        real_resolver = get_latest_profiling_snapshot
+
+        def _tracking_resolver(source_id_arg, conn=None):
+            resolver_calls.append((source_id_arg, conn))
+            return real_resolver(source_id_arg, conn=conn)
+
+        mock_resolver_get_connection = MagicMock()
+        with patch("data.governance_service.get_connection", return_value=wrapper), \
+             patch("data.governance_service.get_latest_profiling_snapshot", _tracking_resolver), \
+             patch("data.profiling_snapshot_resolver.get_connection", mock_resolver_get_connection):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        assert len(resolver_calls) == 1
+        called_source_id, called_conn = resolver_calls[0]
+        assert called_source_id == 1
+        assert called_conn is wrapper
+        assert mock_resolver_get_connection.call_count == 0
+
+    def test_resolver_result_drives_update_not_inline_query(self):
+        """Seeds a real, HIGHER-version profiling snapshot (which any
+        remaining inline 'ORDER BY snapshot_version DESC' query would have
+        picked), then patches the resolver to return a ProfilingSnapshotRef
+        for the LOWER-version snapshot instead. Only the resolver-returned
+        snapshot's row gets updated, proving snapshot.id from the
+        resolver's return value drives the UPDATE - not any inline query.
+        Also proves the source/table/column/heuristic predicates still
+        apply within the resolver-selected snapshot."""
+        db = self._setup_db()  # snap 10 (v1, COMPLETE), row 100 (email_addr, heuristic=1)
+        _seed_snapshot(db, 20, source_id=1, snapshot_version=5, status="COMPLETE")
+        _seed_column_profile(db, 200, 20, 1, "dbo.customers", "email_addr")
+        # A second column under the SAME (resolver-selected) snap 10,
+        # without the PII heuristic flag - the predicate must still gate it out.
+        _seed_column_profile(
+            db, 101, 10, 1, "dbo.customers", "full_name", pii_name_heuristic=0,
+        )
+
+        fake_ref = ProfilingSnapshotRef(
+            id=10, source_id=1, snapshot_version=1,
+            status="COMPLETE", schema_snapshot_id=1,
+        )
+
+        with patch(
+            "data.governance_service.get_latest_profiling_snapshot",
+            lambda source_id, conn=None: fake_ref,
+        ), _patch(db):
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is not None
+        # snap 10's row (the resolver-returned snapshot) was updated:
+        assert _row_by_id(db, 100)["pii_confirmed"] == 1
+        # snap 20's row (real highest-version, NOT resolver-returned) is
+        # untouched - proves the UPDATE uses snapshot.id from the resolver,
+        # not any inline "ORDER BY snapshot_version DESC" query:
+        assert _row_by_id(db, 200)["pii_confirmed"] == 0
+        # A row in the SAME resolver-selected snapshot without the
+        # heuristic flag is still excluded by the predicate:
+        assert _row_by_id(db, 101)["pii_confirmed"] == 0
+
+    def test_resolver_returns_none_skips_update_but_still_commits_once(self):
+        """When the resolver returns None (no profiling snapshot), the
+        UPDATE must never execute, conn.commit() must still fire exactly
+        once, the function returns None, and neither governance
+        side-effect helper is called - preserving the pre-migration
+        zero-row-match observable behavior exactly."""
+        db = self._setup_db()
+        wrapper = _RecordingConn(db)
+
+        with patch("data.governance_service.get_connection", return_value=wrapper), \
+             patch(
+                 "data.governance_service.get_latest_profiling_snapshot",
+                 return_value=None,
+             ) as mock_resolver, \
+             patch("data.governance_service.log_governance_event") as mock_log_event, \
+             patch("data.governance_service.upsert_governance_state") as mock_upsert_state:
+            result = confirm_pii_column(
+                source_id=1, user_id="alice",
+                table_fqn="dbo.customers", column_name="email_addr",
+            )
+
+        assert result is None
+        assert mock_resolver.call_count == 1
+        called_args, called_kwargs = mock_resolver.call_args
+        assert called_args[0] == 1
+        assert called_kwargs.get("conn") is wrapper
+        assert not any(
+            "UPDATE profiling_column_profiles" in sql for sql in wrapper.executed_sql
+        )
+        assert wrapper.commit_count == 1
+        assert wrapper.rollback_count == 0
+        assert wrapper.close_count == 1
+        mock_log_event.assert_not_called()
+        mock_upsert_state.assert_not_called()
+
+    def test_static_exactly_one_resolver_import_and_call_with_conn(self):
+        """Static/AST proof: exactly one resolver import at module level,
+        and exactly one get_latest_profiling_snapshot(...) call inside
+        confirm_pii_column() itself, with source_id as the first positional
+        argument and conn=conn passed by keyword."""
+        with open("data/governance_service.py", encoding="utf-8") as f:
+            module_source = f.read()
+
+        import_lines = [
+            line for line in module_source.splitlines()
+            if line.strip()
+            == "from data.profiling_snapshot_resolver import get_latest_profiling_snapshot"
+        ]
+        assert len(import_lines) == 1, "expected exactly one resolver import"
+
+        func_source = inspect.getsource(confirm_pii_column)
+        tree = ast.parse(func_source)
+
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "get_latest_profiling_snapshot"
+        ]
+        assert len(calls) == 1, "expected exactly one get_latest_profiling_snapshot(...) call"
+
+        call = calls[0]
+        positional_names = [a.id for a in call.args if isinstance(a, ast.Name)]
+        assert positional_names[:1] == ["source_id"], (
+            "source_id must be the first positional argument"
+        )
+
+        keyword_values = {kw.arg: kw.value for kw in call.keywords}
+        assert "conn" in keyword_values
+        conn_value = keyword_values["conn"]
+        assert isinstance(conn_value, ast.Name) and conn_value.id == "conn"
+
+    def test_no_inline_latest_snapshot_sql_remains_in_confirm_pii_column(self):
+        """Confirms the correlated subquery this phase's migration removed
+        is fully gone from confirm_pii_column(), and the UPDATE now uses a
+        direct placeholder bound to snapshot.id."""
+        func_source = inspect.getsource(confirm_pii_column)
+
+        assert "SELECT id FROM profiling_snapshots" not in func_source
+        assert "ORDER BY snapshot_version DESC LIMIT 1" not in func_source
+        assert "profiling_snapshot_id = (" not in func_source  # no correlated subquery
+        assert "WHERE profiling_snapshot_id = ?" in func_source
+
+    def test_followup_select_sql_unchanged(self):
+        """Static proof that the follow-up SELECT's SQL fragments are
+        untouched by the migration - it still re-selects by
+        (source_id, table_fqn, column_name) ordered by profiling_snapshot_id
+        DESC, independent of snapshot_version. The runtime behavior this
+        implies (the known stale-row divergence) is proven by
+        test_followup_select_reads_the_updated_row_in_the_normal_case and
+        test_followup_select_can_diverge_from_the_updated_row above, both
+        retained unmodified and still passing against the migrated code."""
+        func_source = inspect.getsource(confirm_pii_column)
+
+        assert "SELECT * FROM profiling_column_profiles" in func_source
+        assert "WHERE source_id = ? AND table_fqn = ? AND column_name = ?" in func_source
+        assert "ORDER BY profiling_snapshot_id DESC LIMIT 1" in func_source
+
 
 # ---------------------------------------------------------------------------
 # Part 6 — list_governed_object_types
 # ---------------------------------------------------------------------------
 
 class TestListGovernedObjectTypes:
-    def test_returns_all_ten_types(self):
+    def test_returns_all_eleven_types(self):
         types = list_governed_object_types()
         ids = {t["id"] for t in types}
         expected = {
@@ -1402,6 +2097,9 @@ class TestListGovernedObjectTypes:
             # Added in Phase 11 (Enterprise Autonomous Metadata Lifecycle) for the
             # domain/entity assignment human-lock governance event trail.
             "domain.assignment", "entity.assignment",
+            # Added in Phase 2, Step 7 (Scoped Semantic Memory) for
+            # concept-to-table/column mapping governance.
+            "concept.mapping",
         }
         assert expected == ids
 

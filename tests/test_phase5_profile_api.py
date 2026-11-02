@@ -25,6 +25,9 @@ os.environ.setdefault("JWT_SECRET",      "test-jwt-secret-phase5-toolsmithai-lon
 os.environ.setdefault("USER_ID_SALT",    "test-salt-phase5")
 
 from data.profiling_service import get_column_profiles, get_table_profile_detail
+from data.profiling_snapshot_resolver import (
+    get_latest_profiling_snapshot as _real_get_latest_profiling_snapshot,
+)
 
 
 # ── Minimal schema (only the tables these service functions touch) ─────────────
@@ -235,11 +238,17 @@ def db():
 
     Patches data.profiling_service.get_connection (the already-bound name)
     to return a no-close wrapper around the in-memory connection.
+    Also patches data.profiling_snapshot_resolver.get_connection: since
+    Phase 1A, get_column_profiles delegates its latest-snapshot lookup to
+    that module, which holds its own independently-imported get_connection
+    reference — patching only data.profiling_service's would leave the
+    resolver's queries hitting the real on-disk DB instead of this fixture.
     The underlying connection is closed once after the test completes.
     """
     conn = _make_db()
     wrapper = _NoClose(conn)
-    with patch("data.profiling_service.get_connection", return_value=wrapper):
+    with patch("data.profiling_service.get_connection", return_value=wrapper), \
+         patch("data.profiling_snapshot_resolver.get_connection", return_value=wrapper):
         yield conn
     conn.close()
 
@@ -397,6 +406,145 @@ def test_column_profiles_uses_latest_snapshot(db):
     assert result["total"] == 2
 
 
+# ── 4b. Phase 1A resolver-migration regression guards ─────────────────────────
+#
+# get_column_profiles now delegates its latest-snapshot lookup to
+# data.profiling_snapshot_resolver.get_latest_profiling_snapshot. That
+# resolver's policy prefers the highest-snapshot_version row whose
+# status == COMPLETE, falling back to the highest-snapshot_version row of
+# any status only when no COMPLETE row exists — a newer CANCELLED/RUNNING
+# snapshot must never shadow older, usable COMPLETE profiling evidence.
+# These tests prove get_column_profiles picks up that status-aware
+# selection rather than some leftover status-independent behavior.
+
+def test_column_profiles_older_complete_snapshot_wins_over_newer_cancelled(db):
+    src = _seed_source(db, "user-1")
+
+    ss1 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap1 = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 1, 'COMPLETE', CURRENT_TIMESTAMP)",
+        (src, ss1),
+    ).lastrowid
+    db.commit()
+    _seed_column(db, snap1, src, "dbo.orders", "order_id", 1, semantic_type="ID")
+
+    ss2 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap2_cancelled = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 2, 'CANCELLED', CURRENT_TIMESTAMP)",
+        (src, ss2),
+    ).lastrowid
+    db.commit()
+    # No columns seeded for the cancelled snapshot — mirrors a real partial run.
+
+    result = get_column_profiles(src, "user-1")
+
+    # The older COMPLETE snapshot (snap1) must win selection: a newer
+    # CANCELLED snapshot must never shadow older, usable COMPLETE evidence.
+    assert result["snapshot_id"] == snap1
+    assert result["total"] == 1  # snap1's own seeded column (order_id)
+
+
+def test_column_profiles_older_complete_snapshot_wins_over_newer_running(db):
+    src = _seed_source(db, "user-1")
+
+    ss1 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap1 = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 1, 'COMPLETE', CURRENT_TIMESTAMP)",
+        (src, ss1),
+    ).lastrowid
+    db.commit()
+    _seed_column(db, snap1, src, "dbo.orders", "order_id", 1, semantic_type="ID")
+
+    ss2 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap2_running = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 2, 'RUNNING', CURRENT_TIMESTAMP)",
+        (src, ss2),
+    ).lastrowid
+    db.commit()
+    # No columns seeded for the running snapshot — mirrors a real in-progress run.
+
+    result = get_column_profiles(src, "user-1")
+
+    # The older COMPLETE snapshot (snap1) must win selection: a newer
+    # RUNNING snapshot must never shadow older, usable COMPLETE evidence.
+    assert result["snapshot_id"] == snap1
+    assert result["total"] == 1  # snap1's own seeded column (order_id)
+
+
+def test_column_profiles_delegates_to_shared_resolver(db):
+    """Proves the migration actually happened at runtime, not just in source:
+    get_column_profiles must call the shared resolver (and use its result),
+    rather than coincidentally still working via a leftover inline query."""
+    src = _seed_source(db, "user-1")
+    snap = _seed_snapshot(db, src)
+    _seed_column(db, snap, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    with patch(
+        "data.profiling_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        result = get_column_profiles(src, "user-1")
+
+    spy.assert_called_once_with(src)
+    assert result["snapshot_id"] == snap
+
+
+def test_column_profiles_makes_no_writes(db):
+    """get_column_profiles is a pure read — it must not modify any row in
+    any table it touches, including via its delegated snapshot lookup."""
+    src = _seed_source(db, "user-1")
+    snap = _seed_snapshot(db, src)
+    _seed_column(db, snap, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    def _dump(table: str) -> list[dict]:
+        return [dict(r) for r in db.execute(f"SELECT * FROM {table}").fetchall()]
+
+    before = {
+        t: _dump(t)
+        for t in ("data_source_connections", "profiling_snapshots",
+                  "profiling_table_profiles", "profiling_column_profiles")
+    }
+
+    get_column_profiles(src, "user-1")
+    get_column_profiles(999999, "user-1")  # no-snapshot / not-found path too
+
+    after = {
+        t: _dump(t)
+        for t in ("data_source_connections", "profiling_snapshots",
+                  "profiling_table_profiles", "profiling_column_profiles")
+    }
+
+    assert before == after
+
+
 # ── 5. Column list returns stored profile rows ────────────────────────────────
 
 def test_column_profiles_returns_all_columns(db):
@@ -545,6 +693,212 @@ def test_table_detail_returns_table_and_columns(db):
     assert result["table"]["table_class"] == "Master"
     assert result["table"]["classification_confidence"] == pytest.approx(0.87)
     assert len(result["columns"]) == 2
+
+
+# ── Phase 1B resolver-migration regression guards ─────────────────────────────
+#
+# get_table_profile_detail now delegates its latest-snapshot lookup to
+# data.profiling_snapshot_resolver.get_latest_profiling_snapshot. These tests
+# prove that migration picks up that resolver's status-aware selection: the
+# highest-snapshot_version row with status == COMPLETE wins, falling back to
+# the highest-snapshot_version row of any status only when no COMPLETE row
+# exists — a newer CANCELLED/RUNNING snapshot must never shadow older,
+# usable COMPLETE evidence.
+
+def test_table_detail_uses_highest_snapshot_version(db):
+    src = _seed_source(db, "user-1")
+
+    ss1 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap1 = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 1, 'COMPLETE', CURRENT_TIMESTAMP)",
+        (src, ss1),
+    ).lastrowid
+    db.commit()
+    _seed_table(db, snap1, src, "dbo.students")
+    _seed_column(db, snap1, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    ss2 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap2 = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 2, 'COMPLETE', CURRENT_TIMESTAMP)",
+        (src, ss2),
+    ).lastrowid
+    db.commit()
+    _seed_table(db, snap2, src, "dbo.students")
+    _seed_column(db, snap2, src, "dbo.students", "student_id", 1, semantic_type="ID")
+    _seed_column(db, snap2, src, "dbo.students", "email",      2, semantic_type="EMAIL", pii=1, data_type="TEXT")
+
+    result = get_table_profile_detail(src, "user-1", "dbo.students")
+    assert len(result["columns"]) == 2  # snap2's column set, not snap1's
+
+
+def test_table_detail_older_complete_snapshot_wins_over_newer_cancelled(db):
+    src = _seed_source(db, "user-1")
+
+    ss1 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap1 = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 1, 'COMPLETE', CURRENT_TIMESTAMP)",
+        (src, ss1),
+    ).lastrowid
+    db.commit()
+    _seed_table(db, snap1, src, "dbo.students")
+    _seed_column(db, snap1, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    ss2 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 2, 'CANCELLED', CURRENT_TIMESTAMP)",
+        (src, ss2),
+    )
+    db.commit()
+    # No table/column rows seeded under the cancelled snapshot — mirrors a
+    # real partial run where dbo.students wasn't reached before cancellation.
+    # The older COMPLETE snapshot (snap1) must win selection: a newer
+    # CANCELLED snapshot must never shadow older, usable COMPLETE evidence.
+
+    result = get_table_profile_detail(src, "user-1", "dbo.students")
+
+    assert result["table"] is not None
+    assert result["table"]["table_fqn"] == "dbo.students"
+    assert len(result["columns"]) == 1
+    assert result["columns"][0]["column_name"] == "student_id"
+
+
+def test_table_detail_older_complete_snapshot_wins_over_newer_running(db):
+    src = _seed_source(db, "user-1")
+
+    ss1 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    snap1 = db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 1, 'COMPLETE', CURRENT_TIMESTAMP)",
+        (src, ss1),
+    ).lastrowid
+    db.commit()
+    _seed_table(db, snap1, src, "dbo.students")
+    _seed_column(db, snap1, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    ss2 = db.execute(
+        "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
+        "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        (src,),
+    ).lastrowid
+    db.commit()
+    db.execute(
+        "INSERT INTO profiling_snapshots "
+        "(source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, 2, 'RUNNING', CURRENT_TIMESTAMP)",
+        (src, ss2),
+    )
+    db.commit()
+    # The older COMPLETE snapshot (snap1) must win selection: a newer
+    # RUNNING snapshot must never shadow older, usable COMPLETE evidence.
+
+    result = get_table_profile_detail(src, "user-1", "dbo.students")
+
+    assert result["table"] is not None
+    assert result["table"]["table_fqn"] == "dbo.students"
+    assert len(result["columns"]) == 1
+    assert result["columns"][0]["column_name"] == "student_id"
+
+
+def test_table_detail_source_scoping_unchanged(db):
+    src_a = _seed_source(db, "user-A")
+    src_b = _seed_source(db, "user-B")
+
+    snap_a = _seed_snapshot(db, src_a)
+    snap_b = _seed_snapshot(db, src_b)
+
+    _seed_table(db, snap_a, src_a, "dbo.t")
+    _seed_column(db, snap_a, src_a, "dbo.t", "col_a", 1)
+    _seed_table(db, snap_b, src_b, "dbo.t")
+    _seed_column(db, snap_b, src_b, "dbo.t", "col_b", 1)
+
+    res_a = get_table_profile_detail(src_a, "user-A", "dbo.t")
+    res_b = get_table_profile_detail(src_b, "user-B", "dbo.t")
+
+    assert res_a["columns"][0]["column_name"] == "col_a"
+    assert res_b["columns"][0]["column_name"] == "col_b"
+
+    # user-A cannot read source owned by user-B
+    assert get_table_profile_detail(src_b, "user-A", "dbo.t") is None
+
+
+def test_table_detail_delegates_to_shared_resolver(db):
+    """Proves the migration actually happened at runtime, not just in source."""
+    src  = _seed_source(db, "user-1")
+    snap = _seed_snapshot(db, src)
+    _seed_table(db, snap, src, "dbo.students")
+    _seed_column(db, snap, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    with patch(
+        "data.profiling_service.get_latest_profiling_snapshot",
+        wraps=_real_get_latest_profiling_snapshot,
+    ) as spy:
+        result = get_table_profile_detail(src, "user-1", "dbo.students")
+
+    spy.assert_called_once_with(src)
+    assert result["table"] is not None
+
+
+def test_table_detail_makes_no_writes(db):
+    """get_table_profile_detail is a pure read — it must not modify any row
+    in any table it touches, including via its delegated snapshot lookup."""
+    src  = _seed_source(db, "user-1")
+    snap = _seed_snapshot(db, src)
+    _seed_table(db, snap, src, "dbo.students")
+    _seed_column(db, snap, src, "dbo.students", "student_id", 1, semantic_type="ID")
+
+    def _dump(table: str) -> list[dict]:
+        return [dict(r) for r in db.execute(f"SELECT * FROM {table}").fetchall()]
+
+    before = {
+        t: _dump(t)
+        for t in ("data_source_connections", "profiling_snapshots",
+                  "profiling_table_profiles", "profiling_column_profiles")
+    }
+
+    get_table_profile_detail(src, "user-1", "dbo.students")
+    get_table_profile_detail(999999, "user-1", "dbo.students")  # not-found path too
+
+    after = {
+        t: _dump(t)
+        for t in ("data_source_connections", "profiling_snapshots",
+                  "profiling_table_profiles", "profiling_column_profiles")
+    }
+
+    assert before == after
 
 
 def test_table_detail_columns_in_ordinal_order(db):

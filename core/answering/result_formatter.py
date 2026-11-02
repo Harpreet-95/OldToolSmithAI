@@ -2,7 +2,18 @@ from __future__ import annotations
 
 import re
 
-_PREVIEW_LIMIT = 50
+from core.live.query_limits import MAX_PAGE_SIZE
+
+# Fresh-Connection Q&A Reliability milestone, Part 8 — this used to be an
+# independent, smaller cap (50) than what core.orchestrator.agent now
+# actually requests from LiveQueryEngine.execute() (page_size=MAX_PAGE_SIZE,
+# so `rows` here already holds every row up to the query's own row-limit
+# cap). A second, smaller truncation here silently discarded rows the
+# backend had already fetched and paid for, and made a "results were
+# capped" answer read as if the cap number were the true match count.
+# Aligning this with the same ceiling means "the preview" IS the full
+# capped result set, not a second, smaller window into it.
+_PREVIEW_LIMIT = MAX_PAGE_SIZE
 
 
 def _humanize(name: str) -> str:
@@ -95,8 +106,9 @@ def _build_source_columns(plan: dict) -> list[str]:
 
 def _alias_label_map(plan: dict) -> dict[str, str]:
     dims = plan.get("dimension_labels") or {}
+    select_rows = plan.get("select") or []
     mapping: dict[str, str] = {}
-    for row in plan.get("select") or []:
+    for row in select_rows:
         alias = row.get("alias")
         if alias is None:
             continue
@@ -107,6 +119,24 @@ def _alias_label_map(plan: dict) -> dict[str, str]:
             mapping[alias] = plan.get("measure_label") or plan.get("entity_label") or _humanize(alias)
         else:
             mapping[alias] = _humanize(column or alias)
+
+    # Day 3 — a relationship question can SELECT the same column name (e.g.
+    # CancelID) from two or more different tables in one query; the naive
+    # column-only label above collapses them onto one identical label, which
+    # then silently overwrites one entity's value with another's when
+    # _labeled_preview builds its label-keyed dict. Only the colliding
+    # subset is touched here — every existing single-table select (whose
+    # alias was already unique) keeps its exact prior label.
+    label_counts: dict[str, int] = {}
+    for label in mapping.values():
+        label_counts[label] = label_counts.get(label, 0) + 1
+    if any(count > 1 for count in label_counts.values()):
+        table_fqn_by_alias = {row.get("alias"): row.get("table_fqn") for row in select_rows}
+        for alias, label in list(mapping.items()):
+            if label_counts.get(label, 0) > 1:
+                table_fqn = table_fqn_by_alias.get(alias) or ""
+                table_label = _humanize(table_fqn.split(".")[-1])
+                mapping[alias] = f"{table_label} {label}" if table_label else label
     return mapping
 
 
@@ -205,7 +235,6 @@ def _build_chart_spec(shape: str, plan: dict, rows: list[dict]) -> dict | None:
 # ---------------------------------------------------------------------------
 
 _GRAIN_ADVERB = {"year": "yearly", "quarter": "quarterly", "month": "monthly", "week": "weekly", "day": "daily"}
-_TECHNICAL_PREFIX_RE = re.compile(r"^(?:[a-z]{2,5}_|vw_|dbo\.)", re.IGNORECASE)
 
 
 def _join_naturally(parts: list[str]) -> str:
@@ -216,6 +245,9 @@ def _join_naturally(parts: list[str]) -> str:
     if len(parts) == 2:
         return f"{parts[0]} and {parts[1]}"
     return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
+_TECHNICAL_PREFIX_RE = re.compile(r"^(?:[a-z]{2,5}_|vw_|dbo\.)", re.IGNORECASE)
 
 
 def _naive_pluralize(word: str) -> str:
@@ -396,10 +428,16 @@ def _ranked_answer(plan: dict, rows: list[dict], noun: str, direction_word: str,
     return lede, f"{direction_word.capitalize()} {limit} {dim_label.lower()}."
 
 
-def _tabular_answer(plan: dict, row_count: int, noun: str) -> "tuple[str, str]":
+def _tabular_answer(plan: dict, row_count: int, preview_count: int, noun: str) -> "tuple[str, str]":
     """Natural-language (answer, summary) for a raw/joined row list — Rule
     set E, "relationship-list result." Names the entities being shown using
-    already-computed business labels — never a raw table name."""
+    already-computed business labels — never a raw table name.
+
+    row_count is how many rows matched/were returned by the query;
+    preview_count is how many of those rows are actually included in
+    result_preview (capped at _PREVIEW_LIMIT). These can diverge, and the
+    wording must not claim more rows are "shown below" than are actually
+    present in the preview the frontend renders."""
     related: list[str] = []
     seen = {noun}
     for label in (plan.get("dimension_labels") or {}).values():
@@ -407,11 +445,12 @@ def _tabular_answer(plan: dict, row_count: int, noun: str) -> "tuple[str, str]":
         if low and low not in seen:
             seen.add(low)
             related.append(low)
-    answer = f"{format_value(row_count)} {noun} are shown below"
     shown = related[:2]
-    if shown:
-        answer += f", including {' and '.join(shown)}"
-    answer += "."
+    inclusion = f", including {' and '.join(shown)}" if shown else ""
+    if row_count > preview_count:
+        answer = f"{format_value(row_count)} {noun} matched{inclusion}. Showing the first {format_value(preview_count)}."
+    else:
+        answer = f"{format_value(row_count)} {noun} are shown below{inclusion}."
     return answer, f"{format_value(row_count)} {noun}."
 
 
@@ -437,10 +476,31 @@ def build_business_answer(data: dict) -> dict:
     date_context = plan.get("date_context")
     source_tables = plan.get("source_tables") or []
     source_columns = _build_source_columns(plan)
-    truncation_notice = (
-        f"Only the first {row_count} row(s) are shown; more matching rows exist."
-        if truncated else None
-    )
+    # How many of `rows` actually make it into result_preview (all preview
+    # builders below cap at _PREVIEW_LIMIT) — kept distinct from row_count
+    # (the query's matched/returned total) so wording never claims more rows
+    # are "shown" than are actually present in the preview the frontend
+    # renders. `truncated` is a separate, SQL-level signal: it means the
+    # query itself hit the configured row limit, so row_count may undercount
+    # how many rows actually match beyond what was fetched.
+    preview_row_count = min(len(rows), _PREVIEW_LIMIT)
+    row_limit_applied = data.get("row_limit_applied")
+    if row_count > preview_row_count:
+        truncation_notice = f"{format_value(row_count)} row(s) matched. Showing the first {format_value(preview_row_count)}."
+        if truncated:
+            truncation_notice += " The query itself was capped at the configured row limit, so more rows may exist beyond this count."
+    elif truncated:
+        # Part 8 — row_count here is the SQL execution cap (row_limit_applied),
+        # never a genuine database total: never phrase this as "N matched" or
+        # "N total" — that overstates certainty the capped query cannot
+        # actually provide (rows beyond the cap were never counted, not just
+        # never shown).
+        truncation_notice = (
+            f"Showing all {format_value(preview_row_count)} rows returned; the query is capped at "
+            f"{format_value(row_limit_applied or row_count)} matched rows, so more may exist beyond this count."
+        )
+    else:
+        truncation_notice = None
 
     from core.perf import stage_timer
 
@@ -578,9 +638,9 @@ def build_business_answer(data: dict) -> dict:
 
     # tabular
     preview = _labeled_preview(rows, plan)
-    answer, summary = _tabular_answer(plan, row_count, noun)
+    answer, summary = _tabular_answer(plan, row_count, len(preview), noun)
     if truncated:
-        answer += " Results were truncated by the configured row limit."
+        answer += " The query itself was capped at the configured row limit."
     return {
         **common,
         "answer": answer, "summary": summary,

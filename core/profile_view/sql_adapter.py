@@ -26,6 +26,7 @@ from collections import defaultdict
 
 from core.profile_view.models import ColumnProfileView, DatasetProfile, TableProfileView
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot_detail
 
 logger = logging.getLogger(__name__)
 
@@ -58,24 +59,21 @@ def build_profile_view_from_source(
         return None
 
     # ── Latest profiling snapshot ─────────────────────────────────────────────
-    conn = get_connection()
-    try:
-        snap_row = conn.execute(
-            "SELECT * FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
-    finally:
-        conn.close()
+    # Phase 1F.2 migration: snapshot selection now owned by
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot_detail,
+    # which reproduces the exact query this used to run inline (highest
+    # snapshot_version for source_id, status-independent) — no behavior
+    # change, just removing the duplicated SQL from this call site.
+    detail = get_latest_profiling_snapshot_detail(source_id)
 
-    if snap_row is None:
+    if detail is None:
         raise ValueError(
             f"No profiling snapshot found for source id={source_id}. "
             "Run structural or full profiling first."
         )
 
-    snap_id = snap_row["id"]
-    generated_at: str = snap_row["completed_at"] or snap_row["created_at"] or ""
+    snap_id = detail.id
+    generated_at: str = detail.completed_at or detail.created_at or ""
 
     # ── Table profiles ────────────────────────────────────────────────────────
     conn = get_connection()
@@ -160,14 +158,14 @@ def build_profile_view_from_source(
     # ── Summary metrics ───────────────────────────────────────────────────────
     summary: dict = {
         "snapshot_id":         snap_id,
-        "snapshot_version":    snap_row["snapshot_version"],
-        "profiling_mode":      snap_row["mode"],
-        "profiling_status":    snap_row["status"],
-        "total_tables":        snap_row["tables_total"] or len(table_rows),
-        "tables_profiled":     snap_row["tables_profiled"] or 0,
-        "columns_profiled":    snap_row["columns_profiled"] or 0,
-        "pii_columns_found":   snap_row["pii_columns_found"] or 0,
-        "total_rows_profiled": snap_row["total_rows_profiled"] or 0,
+        "snapshot_version":    detail.snapshot_version,
+        "profiling_mode":      detail.mode,
+        "profiling_status":    detail.status,
+        "total_tables":        detail.tables_total or len(table_rows),
+        "tables_profiled":     detail.tables_profiled or 0,
+        "columns_profiled":    detail.columns_profiled or 0,
+        "pii_columns_found":   detail.pii_columns_found or 0,
+        "total_rows_profiled": detail.total_rows_profiled or 0,
     }
 
     return DatasetProfile(

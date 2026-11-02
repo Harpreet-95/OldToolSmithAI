@@ -17,8 +17,88 @@ import logging
 from collections import deque
 
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
+
+# Phase 6, Step 6B — reuse the SAME hardened confirmed/inferred provenance
+# policy core.sqlservice.retrieval_documents already established (Phase 5,
+# Step 6B) for the new SQL retrieval path, instead of this module continuing
+# to run its own older, looser rule (relationship_status IN ('AUTO',
+# 'APPROVED') alone, with no relationship_type/inference_method check at
+# all — see _classify_graph_edge()'s docstring below for exactly what that
+# let through). No circular import risk: core.sqlservice.retrieval_documents
+# imports only core.connectors.schema and stdlib.
+from core.sqlservice.retrieval_documents import classify_relationship_row
 
 logger = logging.getLogger(__name__)
+
+# A confirmed edge whose from_column/to_column is this generic "whole
+# object, no particular column" lineage marker (data/view_dependency_
+# service.py's catalog-based VIEW_DEPENDENCY rows, and — Phase 6, Step 6B —
+# data/view_semantics_service.py's regex-based ones, now aligned to the
+# same sentinel) is real, authoritative LINEAGE evidence, never a literal
+# joinable column pair. "" is also treated as a sentinel defensively, for
+# any older/otherwise-malformed row that predates this alignment.
+_SENTINEL_COLUMNS = frozenset({"*", "", None})
+
+KIND_EXECUTABLE_FK = "executable_fk"
+KIND_CONFIRMED_LINEAGE = "confirmed_lineage"
+KIND_INFERRED = "inferred"
+
+
+def _classify_graph_edge(row: dict) -> str:
+    """
+    Classify one table_relationships row — a plain dict (NOT a raw
+    sqlite3.Row; callers must dict(row) first, since classify_relationship_
+    row() below calls .get() and sqlite3.Row has no such method) carrying at
+    least relationship_type, inference_method, relationship_status,
+    from_column, to_column — into exactly one of three graph-edge kinds:
+
+      KIND_EXECUTABLE_FK      — confirmed (per classify_relationship_row)
+                                 AND both endpoint columns are real, concrete
+                                 column names — a declared physical FK, or an
+                                 explicitly APPROVED relationship with valid
+                                 concrete join columns. Safe to present as a
+                                 literal "Foreign key: a.x -> b.y" join.
+      KIND_CONFIRMED_LINEAGE  — confirmed, but at least one endpoint column
+                                 is the "*"/"" sentinel (e.g. a catalog
+                                 view-dependency edge) — authoritative
+                                 evidence that the objects are related, but
+                                 NEVER an executable join column pair.
+      KIND_INFERRED           — not confirmed at all (PENDING/REJECTED, or
+                                 an AUTO-status row backed by neither a
+                                 declared-FK nor catalog-dependency
+                                 inference_method) — never presented as
+                                 confirmed of any kind, executable or not.
+
+    This is the ONE place in this module that decides "is this edge really
+    a physical join" — every consumer below (get_related_tables,
+    explain_table, trace_business_path) calls this instead of trusting
+    relationship_status alone, so a "*" sentinel column can never again be
+    formatted or traversed as if it were an executable FK.
+    """
+    if classify_relationship_row(row) != "confirmed":
+        return KIND_INFERRED
+    # sqlite3.Row and dict both support item access via [] — no branching needed.
+    if row["from_column"] in _SENTINEL_COLUMNS or row["to_column"] in _SENTINEL_COLUMNS:
+        return KIND_CONFIRMED_LINEAGE
+    return KIND_EXECUTABLE_FK
+
+
+# Relationship-type labels attached to a get_related_tables() entry for a
+# structural (non-domain/entity) edge — split by kind AND direction, so a
+# caller can tell "real FK" from "lineage-only" from "inferred" at a glance
+# instead of every structural edge being unconditionally labeled FK_*.
+_KIND_TO_LABELS = {
+    KIND_EXECUTABLE_FK:     ("FK_OUTBOUND", "FK_INBOUND"),
+    KIND_CONFIRMED_LINEAGE: ("LINEAGE_OUTBOUND", "LINEAGE_INBOUND"),
+    KIND_INFERRED:          ("INFERRED_OUTBOUND", "INFERRED_INBOUND"),
+}
+# Every structural label (as opposed to SAME_DOMAIN/SAME_ENTITY) — used only
+# to rank structural edges ahead of similarity-only peers; ranking AMONG
+# structural kinds is still governed by confidence, unchanged.
+_STRUCTURAL_TYPES = frozenset(
+    label for labels in _KIND_TO_LABELS.values() for label in labels
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,15 +123,6 @@ def _latest_schema_snap_id(conn, source_id: int) -> int | None:
     return row["id"] if row else None
 
 
-def _latest_profiling_snap_id(conn, source_id: int) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM profiling_snapshots WHERE source_id = ? "
-        "ORDER BY snapshot_version DESC LIMIT 1",
-        (source_id,),
-    ).fetchone()
-    return row["id"] if row else None
-
-
 def _compute_importance_score(table_profile: dict | None, dict_row=None) -> float:
     """
     Derive business importance (0–1) from structural metadata signals.
@@ -69,6 +140,19 @@ def _compute_importance_score(table_profile: dict | None, dict_row=None) -> floa
         score += min(0.30, 0.06 * ref_count)
 
     # Root table = primary entity with no incoming FKs
+    #
+    # Scoring/calibration milestone — tried and reverted: gating this on
+    # "not also a leaf" was meant to stop an isolated, ungoverned table
+    # (dbo.AIBOTT) from out-scoring real entity tables. Measured live
+    # against CCPP: the gate did NOT change AIBOTT's outcome at all (it
+    # still won), while it DID newly break two previously-safe multi-hop
+    # join questions ("How many enrollments per instructor?", "Show
+    # enrollments and instructors") by shifting relative authority scores
+    # enough to change which join path a search elsewhere considered best.
+    # No measured benefit + a measured regression = revert. AIBOTT's
+    # over-scoring needs a fix closer to its actual cause (see
+    # data/query_planning_service.py's _score_table_authority docstring
+    # for the still-open root cause), not a blanket root/leaf gate here.
     if table_profile.get("is_root_table"):
         score += 0.20
 
@@ -98,10 +182,22 @@ def _build_fk_graph(conn, source_id: int, schema_snap_id: int) -> dict[str, list
     Bidirectional so path-tracing can traverse FKs in either direction —
     both 'A references B' and 'B is referenced by A' are valid business
     connections.
+
+    Phase 6, Step 6B: every adjacency entry now carries a "kind" —
+    KIND_EXECUTABLE_FK / KIND_CONFIRMED_LINEAGE / KIND_INFERRED (see
+    _classify_graph_edge) — computed from relationship_type/inference_
+    method/relationship_status/the endpoint columns, never from
+    relationship_status alone. The row set selected here is UNCHANGED
+    (still every AUTO/APPROVED row) so trace_business_path's existing
+    reachability/connectivity behavior is preserved; only the label
+    attached to each edge changes, so a "*"-sentinel catalog view-
+    dependency edge is never again presented as if it were a literal,
+    joinable foreign key.
     """
     rows = conn.execute(
         """SELECT from_table_fqn, to_table_fqn,
-                  from_column, to_column, relationship_name, confidence
+                  from_column, to_column, relationship_name, confidence,
+                  relationship_type, inference_method, relationship_status
            FROM table_relationships
            WHERE source_id = ? AND snapshot_id = ?
              AND relationship_status IN ('AUTO', 'APPROVED')""",
@@ -109,7 +205,9 @@ def _build_fk_graph(conn, source_id: int, schema_snap_id: int) -> dict[str, list
     ).fetchall()
 
     adj: dict[str, list[dict]] = {}
-    for r in rows:
+    for row in rows:
+        r = dict(row)
+        kind = _classify_graph_edge(r)
         f, t = r["from_table_fqn"], r["to_table_fqn"]
         adj.setdefault(f, []).append({
             "table_fqn":         t,
@@ -118,6 +216,7 @@ def _build_fk_graph(conn, source_id: int, schema_snap_id: int) -> dict[str, list
             "relationship_name": r["relationship_name"],
             "direction":         "outbound",
             "confidence":        float(r["confidence"]),
+            "kind":              kind,
         })
         adj.setdefault(t, []).append({
             "table_fqn":         f,
@@ -126,6 +225,7 @@ def _build_fk_graph(conn, source_id: int, schema_snap_id: int) -> dict[str, list
             "relationship_name": r["relationship_name"],
             "direction":         "inbound",
             "confidence":        float(r["confidence"]),
+            "kind":              kind,
         })
     return adj
 
@@ -151,6 +251,8 @@ def get_related_tables(
     source_id: int,
     user_id: str,
     table_fqn: str,
+    *,
+    session=None,
 ) -> dict | None:
     """
     Return tables related to the given table by FK edges, shared domain,
@@ -162,9 +264,36 @@ def get_related_tables(
       SAME_ENTITY              : entity_confidence × 0.4
 
     Returns None when source not found or not owned by user_id.
+
+    session, when given (data.request_metadata_session.RequestMetadataSession),
+    reuses that request's connection instead of opening a new one, and
+    memoizes the result per (source_id, table_fqn) for the life of the
+    request — this same table's related-tables graph is read-only within
+    one planning request (nothing in-request changes table_relationships/
+    domain_assignments/entity_assignments), and gather_candidate_evidence's
+    own per-candidate inspection loop, plus multiple entity/measure/
+    dimension resolution passes, can otherwise ask for the SAME table's
+    related tables several times in one question.
     """
-    conn = get_connection()
-    try:
+    from core.perf import stage_timer
+
+    if session is not None:
+        with stage_timer.measure("related_tables_lookup"):
+            return session.get_or_compute(
+                f"related_tables:{source_id}:{table_fqn}",
+                lambda: _compute_related_tables(source_id, user_id, table_fqn, session.conn),
+            )
+
+    with stage_timer.measure("related_tables_lookup"):
+        conn = get_connection()
+        try:
+            return _compute_related_tables(source_id, user_id, table_fqn, conn)
+        finally:
+            conn.close()
+
+
+def _compute_related_tables(source_id: int, user_id: str, table_fqn: str, conn) -> dict | None:
+    if True:
         if not _verify_source(conn, source_id, user_id):
             return None
 
@@ -176,7 +305,8 @@ def get_related_tables(
         if schema_snap_id:
             fk_outbound = conn.execute(
                 """SELECT to_table_fqn, from_column, to_column,
-                          relationship_name, confidence
+                          relationship_name, confidence,
+                          relationship_type, inference_method, relationship_status
                    FROM table_relationships
                    WHERE source_id = ? AND snapshot_id = ? AND from_table_fqn = ?
                      AND relationship_status IN ('AUTO', 'APPROVED')""",
@@ -184,7 +314,8 @@ def get_related_tables(
             ).fetchall()
             fk_inbound = conn.execute(
                 """SELECT from_table_fqn, from_column, to_column,
-                          relationship_name, confidence
+                          relationship_name, confidence,
+                          relationship_type, inference_method, relationship_status
                    FROM table_relationships
                    WHERE source_id = ? AND snapshot_id = ? AND to_table_fqn = ?
                      AND relationship_status IN ('AUTO', 'APPROVED')""",
@@ -225,28 +356,42 @@ def get_related_tables(
                 (source_id, this_entity, table_fqn),
             ).fetchall()
 
-    finally:
-        conn.close()
-
     # ── Merge into keyed dict, propagating confidence ─────────────────────
     related: dict[str, dict] = {}
 
-    for r in fk_outbound:
+    # Phase 6, Step 6B: classify each edge before labeling/formatting it —
+    # a "*"-sentinel confirmed lineage edge (e.g. a catalog view dependency)
+    # must never be presented as "Foreign key: ...", and an edge that isn't
+    # actually confirmed (see _classify_graph_edge) must never be presented
+    # as structural evidence at all without saying so.
+    _EVIDENCE_VERB = {
+        KIND_EXECUTABLE_FK:     "Foreign key",
+        KIND_CONFIRMED_LINEAGE: "Confirmed lineage (not a literal join column)",
+        KIND_INFERRED:          "Inferred relationship (unconfirmed)",
+    }
+
+    for row in fk_outbound:
+        r = dict(row)
+        kind = _classify_graph_edge(r)
+        outbound_label, _inbound_label = _KIND_TO_LABELS[kind]
         fqn = r["to_table_fqn"]
         entry = related.setdefault(fqn, _empty_related(fqn))
-        entry["relationship_types"].append("FK_OUTBOUND")
+        entry["relationship_types"].append(outbound_label)
         entry["confidence"] = max(entry["confidence"], float(r["confidence"]))
         entry["evidence"].append(
-            f"Foreign key: {table_fqn}.{r['from_column']} → {fqn}.{r['to_column']}"
+            f"{_EVIDENCE_VERB[kind]}: {table_fqn}.{r['from_column']} → {fqn}.{r['to_column']}"
         )
 
-    for r in fk_inbound:
+    for row in fk_inbound:
+        r = dict(row)
+        kind = _classify_graph_edge(r)
+        _outbound_label, inbound_label = _KIND_TO_LABELS[kind]
         fqn = r["from_table_fqn"]
         entry = related.setdefault(fqn, _empty_related(fqn))
-        entry["relationship_types"].append("FK_INBOUND")
+        entry["relationship_types"].append(inbound_label)
         entry["confidence"] = max(entry["confidence"], float(r["confidence"]))
         entry["evidence"].append(
-            f"Foreign key: {fqn}.{r['from_column']} → {table_fqn}.{r['to_column']}"
+            f"{_EVIDENCE_VERB[kind]}: {fqn}.{r['from_column']} → {table_fqn}.{r['to_column']}"
         )
 
     for r in domain_peers:
@@ -265,12 +410,13 @@ def get_related_tables(
             entry["evidence"].append(f"Shared business entity: {this_entity}")
         entry["confidence"] = max(entry["confidence"], float(r["confidence"]) * 0.4)
 
-    # ── Rank: FK-direct first, then by confidence desc ────────────────────
-    _FK_TYPES = frozenset(("FK_OUTBOUND", "FK_INBOUND"))
+    # ── Rank: structural (FK or lineage) first, then by confidence desc ───
+    _FK_TYPES = frozenset(_KIND_TO_LABELS[KIND_EXECUTABLE_FK])
+    _LINEAGE_TYPES = frozenset(_KIND_TO_LABELS[KIND_CONFIRMED_LINEAGE])
     sorted_items = sorted(
         related.values(),
         key=lambda x: (
-            0 if any(t in _FK_TYPES for t in x["relationship_types"]) else 1,
+            0 if any(t in _STRUCTURAL_TYPES for t in x["relationship_types"]) else 1,
             -x["confidence"],
         ),
     )
@@ -282,7 +428,12 @@ def get_related_tables(
         "entity":         this_entity,
         "related_tables": sorted_items,
         "total_related":  len(sorted_items),
-        "fk_direct":      sum(1 for x in sorted_items if any(t in _FK_TYPES for t in x["relationship_types"])),
+        # fk_direct counts ONLY literal, executable foreign keys — a
+        # confirmed-but-lineage-only edge (e.g. a "*"-column catalog view
+        # dependency) is no longer counted here (Phase 6, Step 6B); it has
+        # its own lineage_related count instead.
+        "fk_direct":       sum(1 for x in sorted_items if any(t in _FK_TYPES for t in x["relationship_types"])),
+        "lineage_related": sum(1 for x in sorted_items if any(t in _LINEAGE_TYPES for t in x["relationship_types"])),
         "domain_related": sum(1 for x in sorted_items if "SAME_DOMAIN" in x["relationship_types"]),
         "entity_related": sum(1 for x in sorted_items if "SAME_ENTITY" in x["relationship_types"]),
     }
@@ -313,7 +464,8 @@ def find_business_assets(
             return None
 
         schema_snap_id = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id   = _latest_profiling_snap_id(conn, source_id)
+        snapshot       = get_latest_profiling_snapshot(source_id)
+        prof_snap_id   = snapshot.id if snapshot else None
 
         # ── Collect qualifying table FQNs ─────────────────────────────────
         qualified: set[str] = set()
@@ -487,7 +639,8 @@ def explain_table(
             return None
 
         schema_snap_id = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id   = _latest_profiling_snap_id(conn, source_id)
+        snapshot       = get_latest_profiling_snapshot(source_id)
+        prof_snap_id   = snapshot.id if snapshot else None
 
         dict_row = conn.execute(
             "SELECT business_name, description, grain, is_approved, "
@@ -526,20 +679,29 @@ def explain_table(
         outbound_rels: list = []
         inbound_rels:  list = []
         if schema_snap_id:
-            outbound_rels = conn.execute(
-                "SELECT to_table_fqn, from_column, to_column, relationship_name "
+            outbound_rels = [dict(r) for r in conn.execute(
+                "SELECT to_table_fqn, from_column, to_column, relationship_name, "
+                "relationship_type, inference_method, relationship_status "
                 "FROM table_relationships "
                 "WHERE source_id = ? AND snapshot_id = ? AND from_table_fqn = ? "
                 "AND relationship_status IN ('AUTO', 'APPROVED')",
                 (source_id, schema_snap_id, table_fqn),
-            ).fetchall()
-            inbound_rels = conn.execute(
-                "SELECT from_table_fqn, from_column, to_column, relationship_name "
+            ).fetchall()]
+            inbound_rels = [dict(r) for r in conn.execute(
+                "SELECT from_table_fqn, from_column, to_column, relationship_name, "
+                "relationship_type, inference_method, relationship_status "
                 "FROM table_relationships "
                 "WHERE source_id = ? AND snapshot_id = ? AND to_table_fqn = ? "
                 "AND relationship_status IN ('AUTO', 'APPROVED')",
                 (source_id, schema_snap_id, table_fqn),
-            ).fetchall()
+            ).fetchall()]
+            # Phase 6, Step 6B: classify once here (while conn is still
+            # open) rather than in the evidence/gaps section below, which
+            # runs after `finally: conn.close()`.
+            for r in outbound_rels:
+                r["kind"] = _classify_graph_edge(r)
+            for r in inbound_rels:
+                r["kind"] = _classify_graph_edge(r)
 
     finally:
         conn.close()
@@ -601,14 +763,29 @@ def explain_table(
         pii = table_profile["pii_column_count"] or 0
         if pii > 0:
             evidence.append(f"Contains {pii} PII-flagged column(s)")
-    if outbound_rels:
-        targets = ", ".join(r["to_table_fqn"] for r in outbound_rels[:3])
-        suffix = f" (+{len(outbound_rels)-3} more)" if len(outbound_rels) > 3 else ""
-        evidence.append(f"Outbound FK(s) to: {targets}{suffix}")
-    if inbound_rels:
-        sources = ", ".join(r["from_table_fqn"] for r in inbound_rels[:3])
-        suffix = f" (+{len(inbound_rels)-3} more)" if len(inbound_rels) > 3 else ""
-        evidence.append(f"Referenced by FK from: {sources}{suffix}")
+    # Phase 6, Step 6B: split by kind so a confirmed-but-lineage-only edge
+    # (e.g. a "*"-column catalog view dependency) is never described as a
+    # literal "FK", and a merely-inferred edge is called out as such.
+    def _append_kind_evidence(rels: list[dict], kind: str, outbound: bool) -> None:
+        matching = [r for r in rels if r["kind"] == kind]
+        if not matching:
+            return
+        fqn_key = "to_table_fqn" if outbound else "from_table_fqn"
+        label = {
+            (KIND_EXECUTABLE_FK, True):      "Outbound FK(s) to",
+            (KIND_EXECUTABLE_FK, False):     "Referenced by FK from",
+            (KIND_CONFIRMED_LINEAGE, True):  "Outbound view dependency/dependencies (lineage only) to",
+            (KIND_CONFIRMED_LINEAGE, False): "Referenced by view dependency (lineage only) from",
+            (KIND_INFERRED, True):           "Outbound inferred (unconfirmed) relationship(s) to",
+            (KIND_INFERRED, False):          "Referenced by inferred (unconfirmed) relationship from",
+        }[(kind, outbound)]
+        names = ", ".join(r[fqn_key] for r in matching[:3])
+        suffix = f" (+{len(matching)-3} more)" if len(matching) > 3 else ""
+        evidence.append(f"{label}: {names}{suffix}")
+
+    for _kind in (KIND_EXECUTABLE_FK, KIND_CONFIRMED_LINEAGE, KIND_INFERRED):
+        _append_kind_evidence(outbound_rels, _kind, outbound=True)
+        _append_kind_evidence(inbound_rels, _kind, outbound=False)
 
     # ── Identify metadata gaps ────────────────────────────────────────────
     gaps: list[str] = []
@@ -760,6 +937,12 @@ def trace_business_path(
                     "to_column":       edge["to_column"],
                     "relationship_name": edge["relationship_name"],
                     "direction":       edge["direction"],
+                    # Phase 6, Step 6B: lets a caller tell a literal,
+                    # joinable FK hop apart from a confirmed-but-lineage-
+                    # only (e.g. "*"-column catalog view dependency) or
+                    # merely-inferred hop, instead of every hop reading as
+                    # an executable foreign key.
+                    "kind":            edge["kind"],
                 },
             }
             new_path = path_so_far + [new_node]
@@ -798,7 +981,8 @@ def knowledge_graph_summary(source_id: int, user_id: str) -> dict | None:
             return None
 
         schema_snap_id = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id   = _latest_profiling_snap_id(conn, source_id)
+        snapshot       = get_latest_profiling_snapshot(source_id)
+        prof_snap_id   = snapshot.id if snapshot else None
 
         # Schema counts
         snap_row = conn.execute(

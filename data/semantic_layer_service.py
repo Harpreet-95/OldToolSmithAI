@@ -22,6 +22,7 @@ from collections import deque
 from data.db import get_connection
 from data.governance_service import _confidence_tier
 from data.profiling_service import get_column_profile_by_name
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 from data.relationship_service import _infer_cardinality, pk_quality_score
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,13 @@ _LOW_CONF_THRESH = 0.7  # confidence below this triggers ambiguity warning
 # Join Intelligence (Program 3 Phase 2) — fan-out escalates to HIGH when the
 # "many" side has at least this many rows per "one" side row.
 _FANOUT_RATIO_HIGH_THRESHOLD = 10
+
+# Automatic Relationship Validation — a table this small and this broadly
+# referenced is a shared reference/lookup list (e.g. a 32-row "cancellation
+# reasons" table), never a genuine multi-hop business bridge — see
+# _spurious_lookup_hub_tables's own docstring for the full evidence trail.
+_SMALL_LOOKUP_MAX_ROWS  = 100
+_SMALL_LOOKUP_MIN_FANIN = 3
 
 
 # ---------------------------------------------------------------------------
@@ -56,26 +64,31 @@ def _latest_schema_snap_id(conn, source_id: int) -> int | None:
     return row["id"] if row else None
 
 
-def _latest_profiling_snap_id(conn, source_id: int) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM profiling_snapshots WHERE source_id = ? "
-        "ORDER BY snapshot_version DESC LIMIT 1",
-        (source_id,),
-    ).fetchone()
-    return row["id"] if row else None
-
-
 def _load_edges(conn, source_id: int, snap_id: int) -> list[dict]:
-    """Trusted edges only — relationship_status IN ('AUTO', 'APPROVED')."""
+    """Trusted edges: declared/human-approved (AUTO/APPROVED), PLUS any
+    PENDING edge that clears automatic evidence-based trust (Part 4 —
+    data.relationship_service.get_auto_trusted_pending_relationship_ids).
+    That function never mutates relationship_status and never requires
+    human approval — it is a read-time evaluation of evidence
+    (data.relationship_service) already computed at discovery time, applied
+    fresh on every call. A PENDING row that doesn't clear it is excluded
+    exactly as before this change."""
+    from data.relationship_service import get_auto_trusted_pending_relationship_ids
+
+    auto_trusted_ids = get_auto_trusted_pending_relationship_ids(source_id, snap_id, conn=conn)
+
     rows = conn.execute(
-        """SELECT from_table_fqn, to_table_fqn,
-                  from_column, to_column, relationship_name, confidence
+        """SELECT id, from_table_fqn, to_table_fqn,
+                  from_column, to_column, relationship_name, confidence, relationship_status
            FROM table_relationships
            WHERE source_id = ? AND snapshot_id = ?
-             AND relationship_status IN ('AUTO', 'APPROVED')""",
+             AND relationship_status IN ('AUTO', 'APPROVED', 'PENDING')""",
         (source_id, snap_id),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [
+        dict(r) for r in rows
+        if r["relationship_status"] in ("AUTO", "APPROVED") or r["id"] in auto_trusted_ids
+    ]
 
 
 def _build_join_adj(edges: list[dict]) -> dict[str, list[dict]]:
@@ -95,6 +108,7 @@ def _build_join_adj(edges: list[dict]) -> dict[str, list[dict]]:
             "fk_name":        e["relationship_name"],
             "confidence":     float(e["confidence"]),
             "direction":      "references",
+            "relationship_status": e.get("relationship_status"),
         })
         adj.setdefault(t, []).append({
             "table_fqn":      f,
@@ -103,8 +117,112 @@ def _build_join_adj(edges: list[dict]) -> dict[str, list[dict]]:
             "fk_name":        e["relationship_name"],
             "confidence":     float(e["confidence"]),
             "direction":      "referenced_by",
+            "relationship_status": e.get("relationship_status"),
         })
     return adj
+
+
+def _spurious_lookup_hub_tables(
+    conn, source_id: int, edges: list[dict],
+) -> set[str]:
+    """Automatic Relationship Validation — general, evidence-based detection
+    of small shared reference/lookup tables that must never be used as an
+    INTERMEDIATE pass-through hop in multi-hop join-path search. They
+    remain fully valid as the literal start or end table of a search —
+    this only excludes them from being a hidden waypoint nobody asked for.
+
+    Live-confirmed against real CCPP: dbo.ADF_Cancel (32 profiled rows) is
+    a genuine, schema-DECLARED (AUTO status) foreign-key target of 4
+    otherwise business-unrelated tables (Student, ClassSignups, Instructor,
+    StudentAccessHistory) — each edge is a real FK, not a heuristic PENDING
+    guess, so relationship trust (get_auto_trusted_pending_relationship_ids)
+    correctly never touches it, and per-edge confidence scoring correctly
+    scores each one at the maximum (declared FKs always score confidence
+    100/governance-trusted). Neither signal can see the actual defect:
+    routing an Enrollment<->Instructor path THROUGH this shared 32-row
+    "cancellation reasons" table is a join-through-a-shared-dimension
+    fallacy — both tables independently reference it for unrelated reasons,
+    so the join is mathematically valid but produces near-empty, business-
+    meaningless results. Only the STRUCTURE of the intermediate table
+    itself (tiny, broadly shared) reveals this — no single edge's own
+    evidence does.
+
+    A table qualifies as an excluded pass-through hub when ALL of:
+      - it is NOT a declared junction/bridge table (is_junction_table) —
+        that IS a bridge table's whole designed purpose and must never be
+        excluded, e.g. a genuine many-to-many linking table;
+      - its own profiled row count is a real, KNOWN, small positive number
+        (0 < count < _SMALL_LOOKUP_MAX_ROWS) — zero is deliberately NOT
+        treated as "small": an unpopulated-right-now table (e.g. a genuine
+        business entity with no current rows, or one profiling simply
+        hasn't sampled yet) carries no evidence either way and must not be
+        conflated with a real, small, stable reference list. A real
+        business dimension/fact table (Student, Client, Class, ...) is
+        never this small in practice once it does have rows;
+      - it is connected, via THIS call's own already-loaded trusted edge
+        set, to at least _SMALL_LOOKUP_MIN_FANIN other DISTINCT tables — a
+        small table meaningful to only one or two relationships is not a
+        shared hub and creates no shortcut risk; only a broadly-shared one
+        does.
+
+    Reads the MOST RECENT profiling_table_profiles row for each candidate
+    table regardless of exact snapshot id (not strictly pinned to
+    prof_snap_id) — live-confirmed against real CCPP that incremental
+    profiling does not always re-profile every table on every snapshot, so
+    a strict snapshot match silently misses tables (including the
+    canonical dbo.ADF_Cancel case this function exists for) that simply
+    weren't re-profiled in the latest run.
+
+    No new evidence source and no new DB query beyond what recommend_best_
+    join_path/analyze_join_quality already read: `edges` is the caller's
+    own already-loaded trusted-edge list, and row counts come from the
+    same profiling_table_profiles table _row_count_ratio already queries.
+    Never raises; returns an empty set (fails open to today's unfiltered
+    behavior) on any failure."""
+    try:
+        fanin: dict[str, set[str]] = {}
+        for e in edges:
+            f, t = e["from_table_fqn"], e["to_table_fqn"]
+            fanin.setdefault(f, set()).add(t)
+            fanin.setdefault(t, set()).add(f)
+
+        candidates = [t for t, others in fanin.items() if len(others) >= _SMALL_LOOKUP_MIN_FANIN]
+        if not candidates:
+            return set()
+
+        # One batched query for every candidate's latest profile row
+        # (rather than one query per candidate) — recommend_best_join_path
+        # calls this on every invocation, and multi-entity grounding's own
+        # relationship tie-break (data.semantic_contract_service) can call
+        # it dozens of times in a single question; live-confirmed this
+        # dropped "Show classes and instructors" from 114s to sub-second.
+        placeholders = ",".join("?" * len(candidates))
+        rows = conn.execute(
+            f"""SELECT p.table_fqn, p.exact_row_count, p.estimated_row_count, p.is_junction_table
+                FROM profiling_table_profiles p
+                INNER JOIN (
+                    SELECT table_fqn, MAX(id) AS max_id
+                    FROM profiling_table_profiles
+                    WHERE source_id = ? AND table_fqn IN ({placeholders})
+                    GROUP BY table_fqn
+                ) latest ON p.id = latest.max_id
+                WHERE p.source_id = ?""",
+            (source_id, *candidates, source_id),
+        ).fetchall()
+
+        hubs: set[str] = set()
+        for row in rows:
+            if row["is_junction_table"]:
+                continue
+            row_count = row["exact_row_count"] if row["exact_row_count"] is not None else row["estimated_row_count"]
+            if row_count is not None and 0 < row_count < _SMALL_LOOKUP_MAX_ROWS:
+                hubs.add(row["table_fqn"])
+        return hubs
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "_spurious_lookup_hub_tables: failed for source_id=%s", source_id, exc_info=True,
+        )
+        return set()
 
 
 def _enrich_pair(conn, source_id: int, fqn_a: str, fqn_b: str, prof_snap_id: int | None) -> tuple[dict, dict]:
@@ -317,7 +435,14 @@ def _assess_fanout_risk(
 
 _JQ_CONFIDENCE_WEIGHT    = 30
 _JQ_CARDINALITY_WEIGHT   = 20
-_JQ_GOVERNANCE_WEIGHT    = 15  # constant: only AUTO/APPROVED edges ever reach this code
+_JQ_GOVERNANCE_WEIGHT    = 15  # constant bonus: every edge reaching this code is
+# already trusted (AUTO, APPROVED, or an evidence-qualified auto-trusted PENDING
+# row — see _load_edges/get_auto_trusted_pending_relationship_ids), so the bonus
+# itself is correctly unconditional; only the evidence TEXT below needs to name
+# which of the three it actually was, not blanket-claim "AUTO or APPROVED" for
+# an auto-trusted PENDING row (was previously misleading — never a scoring bug,
+# since the bonus applied either way, but callers reading `evidence` for
+# provenance/explanation deserve the real reason).
 _JQ_PK_WEIGHT            = 15
 _JQ_DICTIONARY_WEIGHT    = 10
 _JQ_DOMAIN_ENTITY_WEIGHT = 5
@@ -338,11 +463,21 @@ def _compute_join_quality(
     to_profile: dict | None,
     enrich_from: dict,
     enrich_to: dict,
+    relationship_status: str | None = None,
 ) -> dict:
     """
     Step 4. Weighted 0-100 join-quality score from relationship confidence,
     cardinality, governance trust, target-column key quality, dictionary
     approval, domain/entity confidence, and profiling completeness.
+
+    `relationship_status` is display-only (which of AUTO/APPROVED/PENDING the
+    edge actually was) — it does not gate the governance-trust bonus, which
+    stays unconditional here by design: the caller (_analyze_edge) only ever
+    passes an edge already selected from _load_edges's trust-filtered set, so
+    every edge reaching this function is trusted one way or another already.
+    Defaults to None (unknown) for the rare direct-call/test path that
+    doesn't have it, producing a generic-but-still-accurate message rather
+    than a wrong one.
     """
     evidence: list[dict] = []
     weaknesses: list[str] = []
@@ -363,8 +498,17 @@ def _compute_join_quality(
         weaknesses.append("MANY_TO_MANY cardinality increases row-duplication risk.")
 
     raw += _JQ_GOVERNANCE_WEIGHT
+    if relationship_status in ("AUTO", "APPROVED"):
+        trust_detail = f"Relationship is governance-trusted ({relationship_status})."
+    elif relationship_status == "PENDING":
+        trust_detail = (
+            "Relationship is governance-trusted (PENDING, but automatically "
+            "evidence-qualified — see get_auto_trusted_pending_relationship_ids)."
+        )
+    else:
+        trust_detail = "Relationship is governance-trusted."
     evidence.append({"signal": "governance_trust", "points": _JQ_GOVERNANCE_WEIGHT,
-                      "detail": "Relationship is governance-trusted (AUTO or APPROVED)."})
+                      "detail": trust_detail})
 
     pk_score = pk_quality_score(to_profile)
     pk_points = round(_JQ_PK_WEIGHT * pk_score / 100)
@@ -501,7 +645,10 @@ def _analyze_edge(conn, source_id: int, prof_snap_id: int | None, edge: dict) ->
         conn, source_id, edge["from_table_fqn"], edge["to_table_fqn"], prof_snap_id
     )
 
-    quality = _compute_join_quality(rel_confidence, cardinality, to_profile, enrich_from, enrich_to)
+    quality = _compute_join_quality(
+        rel_confidence, cardinality, to_profile, enrich_from, enrich_to,
+        relationship_status=edge.get("relationship_status"),
+    )
     join_type, driving_table = _recommend_join_type(
         edge, cardinality, from_profile, enrich_from, enrich_to, rel_confidence,
     )
@@ -533,13 +680,21 @@ def _find_all_join_paths(
     end: str,
     max_depth: int = _MAX_PATH_DEPTH,
     max_paths: int = _MAX_PATHS,
+    blocked_intermediate: "set[str] | None" = None,
 ) -> list[dict]:
     """
     BFS over the bidirectional join adjacency to find all distinct join paths
     from start to end up to max_depth hops.
     Each path carries cumulative confidence (product of edge confidences).
     Cycles are prevented via the per-path visited set.
+
+    blocked_intermediate (Automatic Relationship Validation —
+    _spurious_lookup_hub_tables) excludes a table from being used as a
+    PASS-THROUGH waypoint — it is never excluded when it is literally the
+    queried `end` table, so a question genuinely about that table still
+    works unchanged.
     """
+    blocked = blocked_intermediate or set()
     results: list[dict] = []
     # queue: (current, path_nodes, path_edges, cumulative_confidence)
     queue: deque = deque([(start, [start], [], 1.0)])
@@ -553,6 +708,8 @@ def _find_all_join_paths(
         for edge in join_adj.get(current, []):
             nbr = edge["table_fqn"]
             if nbr in node_path:      # avoid revisiting within this path
+                continue
+            if nbr in blocked and nbr != end:
                 continue
             new_conf     = round(cum_conf * edge["confidence"], 4)
             new_nodes    = node_path + [nbr]
@@ -666,7 +823,8 @@ def discover_business_joins(
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         if not snap_id:
             return _no_join_result(source_id, table_a, table_b, "No schema snapshot available.")
@@ -753,7 +911,8 @@ def analyze_join_quality(source_id: int, user_id: str, table_a: str, table_b: st
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
         if not snap_id:
             return _no_quality_result(source_id, table_a, table_b, "No schema snapshot available.")
 
@@ -900,11 +1059,13 @@ def _normalize_path_edge(current_node: str, edge_desc: dict) -> dict:
             "from_table_fqn": current_node,            "from_column": edge_desc["left_column"],
             "to_table_fqn":   edge_desc["table_fqn"],   "to_column":   edge_desc["right_column"],
             "confidence":     edge_desc["confidence"],  "relationship_name": edge_desc["fk_name"],
+            "relationship_status": edge_desc.get("relationship_status"),
         }
     return {
         "from_table_fqn": edge_desc["table_fqn"],   "from_column": edge_desc["right_column"],
         "to_table_fqn":   current_node,             "to_column":   edge_desc["left_column"],
         "confidence":     edge_desc["confidence"],  "relationship_name": edge_desc["fk_name"],
+        "relationship_status": edge_desc.get("relationship_status"),
     }
 
 
@@ -914,7 +1075,73 @@ _PATH_CARDINALITY_RANK = {
 }
 
 
-def _summarize_path(raw_path: dict, edge_analyses: list[dict]) -> dict:
+def _load_domain_map(conn, source_id: int, table_fqns: "set[str]") -> dict[str, str | None]:
+    """Batched domain_assignments lookup for every table appearing in any
+    candidate path (Join-Path Ranking Correctness). Domain assignments are
+    already computed automatically for essentially every table by the
+    existing domain classification pipeline (data.domain_service) — this
+    reuses that evidence read-only, one query per recommend_best_join_path
+    call regardless of candidate-path count. Missing/`Unknown` rows are
+    represented as None so callers can treat "no evidence" as neutral
+    rather than as a mismatch."""
+    if not table_fqns:
+        return {}
+    placeholders = ",".join("?" * len(table_fqns))
+    rows = conn.execute(
+        f"SELECT table_fqn, domain FROM domain_assignments "
+        f"WHERE source_id = ? AND table_fqn IN ({placeholders})",
+        (source_id, *table_fqns),
+    ).fetchall()
+    return {r["table_fqn"]: r["domain"] for r in rows if r["domain"] and r["domain"] != "Unknown"}
+
+
+def _path_domain_coherence(domain_map: dict, path_nodes: list[str]) -> float:
+    """Join-Path Ranking Correctness (Part 4) — a small, bounded,
+    domain-assignment-derived signal for whether a candidate path's
+    INTERMEDIATE tables (excluding the two tables the question is actually
+    about) sit in the same automatically-classified business domain as
+    either endpoint. This is deliberately generic: it reads whatever domain
+    labels this source's own domain classification produced (e.g.
+    "Operations" vs "System / Platform"), never a hardcoded table or
+    domain name, so it applies to any connected schema, not just CCPP.
+
+    Returns a value in [-1, 1]: +1 means every intermediate with known
+    domain evidence matches an endpoint's domain (strong business
+    corroboration), -1 means every intermediate with known evidence sits in
+    a domain unrelated to either endpoint (e.g. a routed-through platform/
+    identity/communications table), 0 means no evidence either way (no
+    domain assignment on the endpoints or the intermediates) — a fully
+    neutral tie-break contribution that changes nothing for sources without
+    domain assignments yet.
+
+    This only ever reorders candidates that already tied on hop count and
+    fan-out risk; it never removes a path from consideration, so a hub path
+    that is the ONLY trusted route is never affected (Part 5)."""
+    intermediates = path_nodes[1:-1]
+    if not intermediates:
+        return 0.0
+
+    endpoint_domains = {d for d in (domain_map.get(path_nodes[0]), domain_map.get(path_nodes[-1])) if d}
+    if not endpoint_domains:
+        return 0.0
+
+    matches = mismatches = 0
+    for t in intermediates:
+        d = domain_map.get(t)
+        if d is None:
+            continue
+        if d in endpoint_domains:
+            matches += 1
+        else:
+            mismatches += 1
+
+    scored = matches + mismatches
+    if scored == 0:
+        return 0.0
+    return round((matches - mismatches) / scored, 4)
+
+
+def _summarize_path(raw_path: dict, edge_analyses: list[dict], domain_coherence: float = 0.0) -> dict:
     n = len(edge_analyses)
     avg_quality = round(sum(e["join_quality"] for e in edge_analyses) / n, 1) if n else 100.0
     avg_conf    = round(sum(e["relationship_confidence"] for e in edge_analyses) / n, 1) if n else 100.0
@@ -934,6 +1161,7 @@ def _summarize_path(raw_path: dict, edge_analyses: list[dict]) -> dict:
         "min_relationship_confidence": min_conf,
         "worst_fanout_risk":           worst_risk,
         "cardinality_score":           card_score,
+        "domain_coherence":            domain_coherence,
     }
 
 
@@ -952,6 +1180,11 @@ def _why_best_path(best: dict, alternatives: list[dict]) -> str:
         reasons.append(f"{next_best['hops'] - best['hops']} hop(s) shorter")
     if _PATH_RISK_RANK.get(best["worst_fanout_risk"], 0) < _PATH_RISK_RANK.get(next_best["worst_fanout_risk"], 0):
         reasons.append(f"avoids a {next_best['worst_fanout_risk']} fan-out hop the next-best path has")
+    if best["domain_coherence"] > next_best["domain_coherence"]:
+        reasons.append(
+            "its intermediate table(s) sit in the same business domain as the "
+            "tables in question, unlike the next-best path"
+        )
     if best["min_relationship_confidence"] > next_best["min_relationship_confidence"]:
         reasons.append(
             f"higher minimum edge confidence ({best['min_relationship_confidence']} "
@@ -1017,11 +1250,25 @@ def recommend_best_join_path(
                 "Source and target are the same table.", same_table=True,
             )
 
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
         edges        = _load_edges(conn, source_id, snap_id)
         join_adj     = _build_join_adj(edges)
+        hub_tables   = _spurious_lookup_hub_tables(conn, source_id, edges)
 
-        raw_paths = _find_all_join_paths(join_adj, start_table, target_table, max_depth)
+        # Two-pass: try first WITHOUT routing through a spurious small
+        # shared-lookup hub at all. Only if that finds NOTHING (the hub is
+        # the sole connector — a legitimate star-schema dimension genuinely
+        # bridging otherwise-disconnected tables, e.g. a real 50-row
+        # "Region" hub referenced by 20 fact tables) does the second pass
+        # fall back to the unrestricted graph, so this never turns a real
+        # connection into a false refusal — it only ever prefers a
+        # non-hub-passthrough path when one actually exists.
+        raw_paths = _find_all_join_paths(
+            join_adj, start_table, target_table, max_depth, blocked_intermediate=hub_tables,
+        )
+        if not raw_paths:
+            raw_paths = _find_all_join_paths(join_adj, start_table, target_table, max_depth)
         if not raw_paths:
             return _no_best_path_result(
                 source_id, start_table, target_table,
@@ -1038,9 +1285,15 @@ def recommend_best_join_path(
                 edge_cache[key] = _analyze_edge(conn, source_id, prof_snap_id, norm)
             return edge_cache[key]
 
+        all_path_nodes: set[str] = set()
+        for p in raw_paths:
+            all_path_nodes.update(p["path"])
+        domain_map = _load_domain_map(conn, source_id, all_path_nodes)
+
         analyzed_paths = [
             _summarize_path(
-                p, [_analyzed(p["path"][i], p["joins"][i]) for i in range(len(p["joins"]))]
+                p, [_analyzed(p["path"][i], p["joins"][i]) for i in range(len(p["joins"]))],
+                domain_coherence=_path_domain_coherence(domain_map, p["path"]),
             )
             for p in raw_paths
         ]
@@ -1052,16 +1305,32 @@ def recommend_best_join_path(
     # every raw_paths candidate here is built exclusively from trusted edges
     # before ranking ever runs.
     #
-    # Ranking priority (Enterprise Implementation — Join Path Priority Fix):
-    # among trusted paths, prefer fewer hops first, then lower fanout risk,
+    # Ranking priority (Enterprise Implementation — Join Path Priority Fix,
+    # extended by Join-Path Ranking Correctness): among trusted paths,
+    # prefer fewer hops first, then lower fanout risk, then higher domain
+    # coherence (do the path's intermediate tables sit in the same
+    # automatically-classified business domain as the two tables the
+    # question is about, or an unrelated one — see _path_domain_coherence),
     # then higher minimum edge confidence, then higher average join
     # quality/confidence. Previously avg_join_quality was ranked first and
     # hops last, which let a long chain of high-confidence edges outrank a
     # short path containing one legitimately-trusted lower-confidence edge
     # (e.g. an approved STRUCTURAL_PK_NAME_MATCH edge at confidence 55).
+    # Domain coherence sits ahead of the quality/confidence tie-breakers
+    # because those are per-edge structural signals that have no way to
+    # tell a business-meaningful intermediate (e.g. an enrollment/class
+    # table between Student and Program) apart from an incidental
+    # technical one (e.g. a shared identity or media table) — real-CCPP
+    # regression: dbo.ADF_Student -> dnnuser.Users -> dbo.CB_VIDEODETAIL ->
+    # dbo.ADF_Path tied on hops/fanout/min-confidence with the genuine
+    # dbo.ADF_Student -> dbo.ADF_ClassSignups -> dbo.ADF_Class ->
+    # dbo.ADF_Path business path and won purely on a 1-point
+    # avg_join_quality difference contributed by an incidental ONE_TO_ONE
+    # identity-link edge.
     analyzed_paths.sort(key=lambda ap: (
         ap["hops"],
         _PATH_RISK_RANK.get(ap["worst_fanout_risk"], 1),
+        -ap["domain_coherence"],
         -ap["min_relationship_confidence"],
         -ap["avg_join_quality"],
         -ap["avg_relationship_confidence"],
@@ -1105,7 +1374,6 @@ def detect_join_ambiguity(
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
 
         if not snap_id:
             return {
@@ -1298,7 +1566,8 @@ def semantic_table_profile(
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         # Dictionary
         dict_row = conn.execute(
@@ -1445,7 +1714,8 @@ def semantic_summary(source_id: int, user_id: str) -> dict | None:
             return None
 
         snap_id      = _latest_schema_snap_id(conn, source_id)
-        prof_snap_id = _latest_profiling_snap_id(conn, source_id)
+        snapshot     = get_latest_profiling_snapshot(source_id)
+        prof_snap_id = snapshot.id if snapshot else None
 
         # Aggregate profiling class counts
         class_rows = conn.execute(

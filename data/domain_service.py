@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from core.domains.learning import LearnedDomainRule, apply_learned_rules
 from core.domains.rules import detect_table_domain
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +23,13 @@ _UPSERT = """
         source_id, profiling_snapshot_id, table_fqn, domain,
         confidence, evidence_json, competing_domains_json,
         assignment_source, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'rule', ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(source_id, table_fqn) DO UPDATE SET
         profiling_snapshot_id  = excluded.profiling_snapshot_id,
         domain                 = excluded.domain,
         confidence             = excluded.confidence,
         evidence_json          = excluded.evidence_json,
+        assignment_source      = excluded.assignment_source,
         competing_domains_json = excluded.competing_domains_json,
         updated_at             = excluded.updated_at
     WHERE domain_assignments.assignment_source NOT IN ('human', 'auto_governance')
@@ -37,6 +39,10 @@ _UPSERT = """
 # 'human' already is — without this, a matured row's governance record would
 # claim AUTO_APPROVED while the underlying domain/confidence silently drifted
 # out from under it on the next generate_domain_assignments() call.
+#
+# Business Learning Trust Hardening milestone: assignment_source is now a
+# bound parameter (was hardcoded 'rule') for the same reason as entity_
+# service.py's identical change — see that file's _UPSERT comment.
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +50,8 @@ _UPSERT = """
 # ---------------------------------------------------------------------------
 
 def generate_domain_assignments(
-    source_id: int, user_id: str, table_fqns: list[str] | None = None
+    source_id: int, user_id: str, table_fqns: list[str] | None = None,
+    assignment_source: str = 'rule',
 ) -> dict | None:
     """Classify every profiled table for source_id and persist the results.
 
@@ -57,6 +64,11 @@ def generate_domain_assignments(
     None (default) preserves the original full-source behavior used by the
     manual "Generate Domains" action. Rows with assignment_source='human' are
     never overwritten regardless of this parameter (see _UPSERT guard).
+
+    assignment_source: provenance tag, defaults to 'rule'. Business Learning's
+    connect-time bounded discovery path passes 'preliminary_connect_time' —
+    see data.entity_service.generate_entity_assignments's identical parameter
+    for the full rationale.
 
     Returns:
         Summary dict, or None if source_id does not belong to user_id.
@@ -73,19 +85,14 @@ def generate_domain_assignments(
         if owns is None:
             return None
 
-        snap_row = conn.execute(
-            "SELECT id FROM profiling_snapshots "
-            "WHERE source_id = ? "
-            "ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
-        if snap_row is None:
+        snapshot = get_latest_profiling_snapshot(source_id, conn=conn)
+        if snapshot is None:
             raise ValueError(
                 "No profiling snapshot found. "
                 "Run POST /sources/{id}/profile/structural first."
             )
 
-        snap_id = snap_row["id"]
+        snap_id = snapshot.id
 
         if table_fqns is not None:
             if not table_fqns:
@@ -210,6 +217,7 @@ def generate_domain_assignments(
                     a.confidence,
                     json.dumps(a.evidence),
                     json.dumps(competing),
+                    assignment_source,
                     now,
                     now,
                 ),
@@ -413,11 +421,17 @@ def list_domain_assignments(source_id: int, user_id: str) -> list[dict] | None:
     return result
 
 
-def get_domain_summary(source_id: int, user_id: str) -> dict | None:
+def get_domain_summary(
+    source_id: int, user_id: str, *, exclude_preliminary: bool = False,
+) -> dict | None:
     """Return aggregate domain counts for source_id.
 
     Returns None if source_id does not belong to user_id.
     Returns a zeroed summary (no error) if no assignments have been generated yet.
+
+    exclude_preliminary: Business Learning Trust Hardening milestone — see
+    data.entity_service.get_entity_summary's identical parameter for the
+    full rationale. Default False preserves every existing caller unchanged.
     """
     conn = get_connection()
     try:
@@ -428,18 +442,27 @@ def get_domain_summary(source_id: int, user_id: str) -> dict | None:
         if owns is None:
             return None
 
+        source_filter = "source_id = ?"
+        params: tuple = (source_id,)
+        if exclude_preliminary:
+            source_filter += " AND assignment_source != 'preliminary_connect_time'"
+
+        # Deterministic Semantic Planning — see data.entity_service.
+        # get_entity_summary's identical fix: a tied count needs a stable
+        # secondary key so this summary (feeds the AI interpreter's prompt
+        # vocabulary hint) doesn't vary run-to-run for unchanged data.
         count_rows = conn.execute(
             "SELECT domain, COUNT(*) AS cnt "
             "FROM domain_assignments "
-            "WHERE source_id = ? "
-            "GROUP BY domain ORDER BY cnt DESC",
-            (source_id,),
+            f"WHERE {source_filter} "
+            "GROUP BY domain ORDER BY cnt DESC, domain ASC",
+            params,
         ).fetchall()
 
         meta = conn.execute(
             "SELECT COUNT(*) AS total, MAX(updated_at) AS last_generated_at "
-            "FROM domain_assignments WHERE source_id = ?",
-            (source_id,),
+            f"FROM domain_assignments WHERE {source_filter}",
+            params,
         ).fetchone()
     finally:
         conn.close()

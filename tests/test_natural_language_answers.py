@@ -274,14 +274,23 @@ def test_ranked_answer_falls_back_when_series_extraction_fails():
 
 def test_tabular_answer_mentions_related_entities():
     plan = {"dimension_labels": {"enroll_date": "Enrollment Date", "course_title": "Course Title"}}
-    answer, summary = _tabular_answer(plan, 42, "students")
+    answer, summary = _tabular_answer(plan, 42, 42, "students")
     assert answer == "42 students are shown below, including enrollment date and course title."
     assert summary == "42 students."
 
 
 def test_tabular_answer_no_related_entities():
-    answer, _ = _tabular_answer({}, 5, "widgets")
+    answer, _ = _tabular_answer({}, 5, 5, "widgets")
     assert answer == "5 widgets are shown below."
+
+
+def test_tabular_answer_preview_smaller_than_row_count():
+    # row_count (matched/returned) exceeds preview_count (rows actually in
+    # result_preview, capped at _PREVIEW_LIMIT) — wording must not claim the
+    # full row_count is "shown below".
+    answer, summary = _tabular_answer({}, 1000, 50, "students")
+    assert answer == "1,000 students matched. Showing the first 50."
+    assert summary == "1,000 students."
 
 
 # ---------------------------------------------------------------------------

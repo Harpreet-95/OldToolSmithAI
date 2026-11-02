@@ -88,3 +88,94 @@ def diff_snapshots(old: SchemaSnapshot | None, new: SchemaSnapshot) -> ChangeSet
         column_changes=column_changes,
         is_first_scan=False,
     )
+
+
+def diff_profiling_classification(
+    old: dict[str, str | None] | None, new: dict[str, str | None],
+) -> ChangeSet:
+    """Compare table_class across two profiling snapshots and return a
+    ChangeSet — the profiling/classification counterpart of diff_snapshots,
+    same shape and same consumer contract (added/modified feed
+    ChangeSet.affected_table_fqns for the lifecycle's dictionary/domain/
+    entity refresh gating), so the rest of run_autonomous_lifecycle needs no
+    profiling-specific branching: this and diff_snapshots' outputs are just
+    merged before use.
+
+    old/new are {table_fqn: table_class} from
+    data.lifecycle_service.get_table_classifications. Pure — no DB access.
+
+    old=None means there is no prior COMPLETE profiling snapshot to diff
+    against (this source's first-ever completed profiling run): every
+    profiled table is reported as added, mirroring diff_snapshots' own
+    old=None contract.
+
+    A table whose table_class is unchanged (including staying None ->
+    None, e.g. a table that failed classification in both runs) is not
+    reported — this is what keeps a genuinely no-op re-profiling run cheap
+    (ChangeSet.has_changes stays False, so run_autonomous_lifecycle takes
+    its existing SKIPPED_NO_CHANGES short-circuit) instead of bumping every
+    downstream artifact just because a new profiling_snapshot row exists.
+    column_changes is always empty here — profiling has no column-shape
+    concept of its own; that is schema_snapshots' contract, untouched.
+    """
+    if old is None:
+        return ChangeSet(
+            added_tables=list(new.keys()),
+            removed_tables=[],
+            modified_tables=[],
+            column_changes=[],
+            is_first_scan=True,
+        )
+
+    old_fqns = set(old.keys())
+    new_fqns = set(new.keys())
+
+    added_tables = [fqn for fqn in new if fqn not in old_fqns]
+    removed_tables = [fqn for fqn in old if fqn not in new_fqns]
+    modified_tables = [
+        fqn for fqn in new
+        if fqn in old_fqns and old[fqn] != new[fqn]
+    ]
+
+    return ChangeSet(
+        added_tables=added_tables,
+        removed_tables=removed_tables,
+        modified_tables=modified_tables,
+        column_changes=[],
+        is_first_scan=False,
+    )
+
+
+def merge_change_sets(schema_change: ChangeSet, profiling_change: ChangeSet) -> ChangeSet:
+    """Union two ChangeSets (schema-diff + profiling-classification-diff)
+    into one combined ChangeSet, so the rest of run_autonomous_lifecycle
+    (affected_table_fqns/has_changes gating, governance-impact detection)
+    runs completely unchanged regardless of which side(s) actually changed.
+
+    removed_tables is schema-only: detect_schema_drift's "table removed
+    from source schema" wording is specifically a schema-removal claim, and
+    a table dropping out of profiling scope while still existing in the
+    schema is not that — keeping it schema-only avoids a mislabeled
+    governance review task for a shape this module doesn't otherwise
+    produce (profiling scope only ever grows to match the schema; see
+    profiling_snapshot_resolver's own coverage-never-regresses note).
+    is_first_scan carries schema_change's own value only, for the same
+    reason: it names a schema-scan event, not a profiling one.
+    """
+    def _dedup(*lists: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for lst in lists:
+            for fqn in lst:
+                if fqn not in seen:
+                    seen.add(fqn)
+                    out.append(fqn)
+        return out
+
+    return ChangeSet(
+        added_tables=_dedup(schema_change.added_tables, profiling_change.added_tables),
+        removed_tables=list(schema_change.removed_tables),
+        modified_tables=_dedup(schema_change.modified_tables, profiling_change.modified_tables),
+        column_changes=list(schema_change.column_changes),
+        is_first_scan=schema_change.is_first_scan,
+    )

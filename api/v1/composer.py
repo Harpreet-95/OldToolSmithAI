@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Request
@@ -12,11 +11,7 @@ from pydantic import BaseModel, field_validator
 
 from auth.jwt_auth import AuthenticatedUser, require_jwt
 from core.errors.error_response import build_error_response
-from core.orchestrator import (
-    EnterpriseOrchestrator,
-    IntentType,
-    OrchestratorRequest,
-)
+from core.orchestrator.models import IntentType
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +34,8 @@ class ComposerRequest(BaseModel):
     request_options: Optional[Dict[str, Any]] = None
     clarification_selection: Optional[List[Dict[str, Any]]] = None
     cancel_clarification: bool = False
-    # Milestone M-31 — round-tripped core.orchestrator.agent.ConversationContext
-    # .to_dict(), returned as this same field's name on the previous agent
-    # response's "conversation_state" key. Deliberately a new field, not a
-    # reinterpretation of conversation_context above (that field's existing
-    # List[Dict] shape/contract is untouched for back-compat).
+    # Bounded AI-first follow-up state returned by the previous response.
+    # The backend remains stateless; the client round-trips this opaque value.
     conversation_state: Optional[Dict[str, Any]] = None
 
     @field_validator("message")
@@ -897,6 +889,25 @@ def _answer_report_generation(
     }
 
 
+def _answer_report_source_required() -> dict:
+    return {
+        "answer": (
+            "I couldn't tell which data source to generate the report from. "
+            "Select a connected data source or dataset and ask again."
+        ),
+        "answer_type": "report_generation_failed",
+        "source_summary": "No data source or dataset selected.",
+        "confidence": 0.0,
+        "limitations": [
+            "Report generation requires an explicit data source or dataset — "
+            "none was selected for this request."
+        ],
+        "next_suggested_action": "Select a data source (or dataset) and retry.",
+        "report_id": None,
+        "report_title": None,
+    }
+
+
 def _generate_answer(package) -> dict:
     """
     Deterministic business-facing answer from EvidencePackage.
@@ -948,59 +959,6 @@ def _generate_answer(package) -> dict:
 # Milestone M-31 — Conversation Context
 # ---------------------------------------------------------------------------
 
-def _build_conversation_context(body: "ComposerRequest", user_id: str):
-    """
-    Resolves the core.orchestrator.agent.ConversationContext to pass into
-    answer_business_question() for this request, or None when there is
-    nothing to carry — a plain fresh question with no clarification resume/
-    cancel and no round-tripped prior turn.
-
-    This is the one place a round-tripped conversation_state's own
-    conversation_id is checked against an independent reference (this
-    request's own session_id) — a mismatch discards the prior turn (prior=
-    None) rather than reusing it, since there is no server-side conversation
-    registry to check it against otherwise. source_id/user_id are re-checked
-    here AND independently inside core.orchestrator.agent.
-    _resolve_conversation_context (defense in depth, and the only isolation
-    guarantee available to any OTHER caller of answer_business_question).
-
-    clarification_selection/cancel_clarification always come from THIS
-    request's own top-level fields, never from the round-tripped prior
-    turn — a resume/cancel is a one-turn instruction, not carried state.
-    """
-    from core.orchestrator.agent import ConversationContext
-
-    if not (body.conversation_state or body.clarification_selection or body.cancel_clarification):
-        return None
-
-    prior = ConversationContext.from_dict(body.conversation_state) if body.conversation_state else None
-    if prior is not None and (
-        prior.conversation_id != body.session_id
-        or prior.source_id != body.selected_data_source
-        or prior.user_id != user_id
-    ):
-        prior = None  # cross-conversation/source/user — never reused
-
-    return ConversationContext(
-        conversation_id=body.session_id,
-        source_id=body.selected_data_source,
-        user_id=user_id,
-        turn_number=(prior.turn_number + 1) if prior else 1,
-        created_at=datetime.now(timezone.utc).isoformat(),
-        previous_question=prior.previous_question if prior else None,
-        previous_effective_question=prior.previous_effective_question if prior else None,
-        previous_query_plan=prior.previous_query_plan if prior else None,
-        previous_business_plan=prior.previous_business_plan if prior else None,
-        selected_tables=prior.selected_tables if prior else (),
-        metric=prior.metric if prior else None,
-        dimensions=prior.dimensions if prior else (),
-        filters=prior.filters if prior else (),
-        time_range=prior.time_range if prior else None,
-        clarification_selection=tuple(body.clarification_selection) if body.clarification_selection else None,
-        cancel_clarification=bool(body.cancel_clarification),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -1011,13 +969,12 @@ def composer_ask(
     user: AuthenticatedUser = Depends(require_jwt),
 ) -> dict:
     """
-    Enterprise Composer API — Phase 2.
+    Single entry point for interactive answers.
 
-    Accepts a Composer request, resolves intent via the EnterpriseOrchestrator,
-    collects read-only evidence from registered services, and returns a
-    structured EvidencePackage.
-
-    No AI generation. No SQL execution. No writes. Read-only.
+    Connected SQL sources use the AI-first fast path. Uploaded datasets use
+    their existing dataset-report pipeline. With neither selected, the API
+    returns selection guidance; catalog features remain available through
+    their dedicated Dictionary and Search routes.
     """
     request_id = str(uuid.uuid4())
     t0 = time.perf_counter()
@@ -1029,246 +986,144 @@ def composer_ask(
         str(user.user_id),
     )
 
-    # ── Milestone M-30/M-31 — Production Route Integration ─────────────────
-    # A business-data question — fresh, a clarification resume/cancel, or a
-    # recognized bounded follow-up (M-31) — is routed through the one shared
-    # agent entry point (core.orchestrator.agent.answer_business_question)
-    # instead of the orchestrator's legacy live_query adapter — using the
-    # SAME IntentResolver this endpoint already relies on (via
-    # EnterpriseOrchestrator.process()) to decide whether the agent applies,
-    # so metadata/dictionary/domain/profiling/governance/relationship/
-    # knowledge_graph/review/report_generation/workflow/search questions are
-    # completely unaffected and keep going through
-    # EnterpriseOrchestrator.process() below, unchanged.
+    # ── Phase 8A — single question-answering route ─────────────────────────
+    # Any request that names a connected SQL datasource is answered by ONE
+    # architecture: the AI-first fast path (api/v1/ai_first_composer_
+    # execution -> core.sqlservice.ai_first_fast_path_service), which itself
+    # consults the in-memory/durable validated-plan caches, validates SQL
+    # deterministically, and executes it live on every request. Follow-up
+    # resolution, clarification handling, greeting/destructive-request
+    # classification, and non-data rejection all happen INSIDE that one
+    # model call -- never in a keyword intent classifier. There is no
+    # fallback of any kind into another pipeline: a request the fast path
+    # cannot safely answer returns a clarification or a typed error.
     #
-    # A recognized follow-up (e.g. "What about last quarter?") often carries
-    # no SQL_REQUEST signal of its own on the bare phrase — is_recognized_
-    # follow_up covers that case independently of _resolved_intent_for_
-    # routing, only when a round-tripped conversation_state is present.
-    #
-    # One case deliberately stays on the legacy path rather than the agent:
-    # the CCPP "classes/courses ... enrollment" question pattern
-    # (core.orchestrator.context_builder._class_enrollment_ranking_entity) —
-    # this hardcoded, source-verified business-model override lives inside
-    # _live_query, not the agent (out of scope for M-28/M-29) — matching
-    # questions keep going through the legacy path, where the override still
-    # applies unchanged; _is_verified_ccpp_source's own fail-closed check
-    # still falls through to the generic pipeline for every other source
-    # exactly as it does today.
-    try:
-        from core.orchestrator.context_builder import _class_enrollment_ranking_entity
-        from core.orchestrator.intent_resolver import IntentResolver
+    # Only a request with NO datasource (e.g. an uploaded-dataset report,
+    # or a metadata/dictionary question) continues to the orchestrator
+    # below -- those are not database question-answering requests.
+    if body.selected_data_source is not None:
+        from api.v1.ai_first_composer_execution import answer_with_fast_path
 
-        _resolved_intent_for_routing = IntentResolver().resolve(body.message)
-    except Exception:  # noqa: BLE001
-        logger.warning("composer.ask: intent pre-resolution for agent routing failed request_id=%s", request_id)
-        _resolved_intent_for_routing = None
-
-    is_recognized_follow_up = False
-    if body.conversation_state and not body.clarification_selection and not body.cancel_clarification:
-        from core.orchestrator.agent import _classify_follow_up
-
-        is_recognized_follow_up = _classify_follow_up(body.message) is not None
-
-    if (
-        _resolved_intent_for_routing is not None
-        and body.selected_data_source is not None
-        and _class_enrollment_ranking_entity(body.message) is None
-        and (
-            _resolved_intent_for_routing.intent_type == IntentType.SQL_REQUEST
-            or bool(body.clarification_selection)
-            or body.cancel_clarification
-            or is_recognized_follow_up
-        )
-    ):
         try:
-            from api.v1.agent_response_adapters import build_composer_agent_response, build_conversation_state
-            from core.orchestrator.agent import answer_business_question
-
-            conversation_context = _build_conversation_context(body, str(user.user_id))
-            state = answer_business_question(
-                body.selected_data_source, str(user.user_id), body.message,
-                conversation_context=conversation_context,
-            )
-            execution_time = round(time.perf_counter() - t0, 4)
-            this_turn_number = conversation_context.turn_number if conversation_context else 1
-            conversation_state = build_conversation_state(
-                state, conversation_id=body.session_id, source_id=body.selected_data_source,
-                user_id=str(user.user_id), turn_number=this_turn_number,
-            )
-            response = build_composer_agent_response(
-                state=state, resolved_intent=_resolved_intent_for_routing,
-                session_id=body.session_id, request_id=request_id, execution_time=execution_time,
-                conversation_state=conversation_state,
+            response = answer_with_fast_path(
+                source_id=body.selected_data_source,
+                user_id=str(user.user_id),
+                message=body.message,
+                conversation_state=body.conversation_state,
+                clarification_selection=body.clarification_selection,
+                cancel_clarification=bool(body.cancel_clarification),
+                session_id=body.session_id,
+                request_id=request_id,
+                start_time=t0,
             )
         except Exception:
-            logger.exception("composer.ask agent path failed request_id=%s", request_id)
+            logger.exception("composer.ask fast path route failed request_id=%s", request_id)
             return JSONResponse(
                 status_code=500,
                 content=build_error_response("Internal orchestration failure"),
             )
 
         logger.info(
-            "composer.ask complete via agent request_id=%s session_id=%s agent_status=%s duration=%.4fs",
-            request_id, body.session_id, response.get("agent_status"), execution_time,
+            "composer.ask complete via ai_first_fast_path request_id=%s session_id=%s "
+            "agent_status=%s plan_cache=%s duration=%.4fs",
+            request_id, body.session_id, response.get("agent_status"),
+            response.get("plan_cache_status"), response.get("execution_time"),
         )
         return response
 
-    try:
-        orch_request = OrchestratorRequest(
-            query=body.message,
-            source_id=body.selected_data_source,
-            user_id=str(user.user_id),
-            params={
-                "workspace_id": body.workspace_id,
-                "session_id": body.session_id,
-                "selected_dataset": body.selected_dataset,
-                "selected_table": body.selected_table,
-                "clarification_selection": body.clarification_selection,
-                "cancel_clarification": body.cancel_clarification,
-            },
-            request_id=request_id,
-        )
-
-        orchestrator = EnterpriseOrchestrator()
-        package = orchestrator.process(orch_request)
-
-    except Exception as exc:
-        logger.error(
-            "composer.ask internal failure request_id=%s type=%s",
-            request_id,
-            type(exc).__name__,
-        )
-        return JSONResponse(
-            status_code=500,
-            content=build_error_response("Internal orchestration failure"),
-        )
-
     execution_time = round(time.perf_counter() - t0, 4)
 
-    # ── Report generation delegation ──────────────────────────────────────────
-    # When the intent is REPORT_GENERATION, delegate to the existing report
-    # pipeline instead of the normal evidence collection path.
-    # Existing dataset ownership and trust guards are enforced by the pipeline.
-    if package.intent.intent_type == IntentType.REPORT_GENERATION:
+    # Phase 8B — no-datasource routing is explicit and field-driven. Uploaded
+    # datasets keep their existing report pipeline; SQL sources already took
+    # the fast path above. Dictionary, Search, datasource lifecycle, exports,
+    # email, downloads and scheduling have dedicated API routes and are not
+    # reclassified from chat text here.
+    if body.dataset_id is not None:
         business_answer = _answer_report_generation(
             user_id=str(user.user_id),
             dataset_id=body.dataset_id,
             intent_text=body.message,
         )
-        report_id   = business_answer.get("report_id")
-        rpt_status  = "success" if report_id else "partial"
-
+        report_id = business_answer.get("report_id")
+        status = "success" if report_id else "partial"
         logger.info(
-            "composer.ask report_generation request_id=%s report_id=%s status=%s duration=%.4fs",
-            package.request_id,
+            "composer.ask dataset report request_id=%s report_id=%s status=%s duration=%.4fs",
+            request_id,
             report_id,
-            rpt_status,
+            status,
             execution_time,
         )
-
         return {
-            "status": rpt_status,
-            "request_id": package.request_id,
+            "status": status,
+            "request_id": request_id,
             "session_id": body.session_id,
             "business_answer": business_answer,
             "report_id": report_id,
             "report_title": business_answer.get("report_title"),
+            "executive_report": None,
             "resolved_intent": {
-                "intent_type": package.intent.intent_type.value,
-                "confidence": package.intent.confidence,
-                "required_capabilities": [
-                    c.value for c in package.intent.required_capabilities
-                ],
-                "secondary_intents": [
-                    i.value for i in package.intent.secondary_intents
-                ],
-                "keywords_matched": package.intent.keywords_matched,
+                "intent_type": "dataset_report",
+                "confidence": 1.0,
+                "required_capabilities": ["dataset_report_pipeline"],
+                "secondary_intents": [],
+                "keywords_matched": [],
             },
-            "services_selected": ["report_pipeline"],
+            "services_selected": ["dataset_report_pipeline"],
             "evidence_summary": {
                 "total_items": 1 if report_id else 0,
                 "services_attempted": 1,
                 "services_succeeded": 1 if report_id else 0,
                 "has_errors": business_answer["answer_type"] == "report_generation_failed",
             },
-            "evidence_package": _serialize_package(package),
+            "evidence_package": None,
             "governance_state": None,
-            "confidence": package.intent.confidence,
+            "confidence": 1.0,
             "execution_time": execution_time,
             "warnings": [],
             "errors": [],
+            "enterprise_answer": None,
+            "execution_strategy": None,
         }
 
-    status           = _determine_status(package)
-    governance_state = _extract_governance_state(package)
-    warnings         = _extract_warnings(package)
-    business_answer  = _generate_answer(package)
-
-    # ── Enterprise Answer Generation Layer — Phase 10 ──────────────────────
-    # Purely additive: reuses the same package computed above (no second
-    # evidence-gathering pass) plus the Execution Planner (Phase 9) to
-    # produce a richer, deterministic enterprise_answer alongside the
-    # existing business_answer. No AI. Every existing response field is
-    # unchanged — this only adds two new top-level keys.
-    try:
-        from core.answering.answer_planner import AnswerPlanner
-        from core.execution.planner import ExecutionPlanner
-
-        execution_strategy = ExecutionPlanner().plan(
-            body.message, body.selected_data_source, str(user.user_id)
-        )
-        enterprise_answer = AnswerPlanner().build(execution_strategy, package)
-    except Exception:
-        logger.exception(
-            "composer.ask enterprise_answer generation failed request_id=%s", request_id
-        )
-        execution_strategy = None
-        enterprise_answer = None
-
+    business_answer = _answer_report_source_required()
+    business_answer["answer"] = (
+        "Select a connected database or uploaded dataset, then ask your question. "
+        "Use Dictionary and Search from the navigation for catalog discovery."
+    )
+    business_answer["answer_type"] = "data_selection_required"
     logger.info(
-        "composer.ask complete request_id=%s session_id=%s intent=%s "
-        "services=%d/%d status=%s duration=%.4fs",
+        "composer.ask selection required request_id=%s session_id=%s duration=%.4fs",
         request_id,
         body.session_id,
-        package.intent.intent_type.value,
-        package.services_succeeded,
-        package.services_attempted,
-        status,
         execution_time,
     )
-
     return {
-        "status": status,
-        "request_id": package.request_id,
+        "status": "partial",
+        "request_id": request_id,
         "session_id": body.session_id,
         "business_answer": business_answer,
         "resolved_intent": {
-            "intent_type": package.intent.intent_type.value,
-            "confidence": package.intent.confidence,
-            "required_capabilities": [
-                c.value for c in package.intent.required_capabilities
-            ],
-            "secondary_intents": [
-                i.value for i in package.intent.secondary_intents
-            ],
-            "keywords_matched": package.intent.keywords_matched,
+            "intent_type": "selection_required",
+            "confidence": 1.0,
+            "required_capabilities": [],
+            "secondary_intents": [],
+            "keywords_matched": [],
         },
-        "services_selected": [c.service_id for c in package.service_calls],
+        "services_selected": [],
         "evidence_summary": {
-            "total_items": package.total_evidence_items,
-            "services_attempted": package.services_attempted,
-            "services_succeeded": package.services_succeeded,
-            "has_errors": bool(package.errors),
+            "total_items": 0,
+            "services_attempted": 0,
+            "services_succeeded": 0,
+            "has_errors": False,
         },
-        "evidence_package": _serialize_package(package),
-        "governance_state": governance_state,
-        "confidence": package.intent.confidence,
+        "evidence_package": None,
+        "governance_state": None,
+        "confidence": 1.0,
         "execution_time": execution_time,
-        "warnings": warnings,
-        "errors": package.errors,
-        "enterprise_answer": enterprise_answer.to_dict() if enterprise_answer else None,
-        "execution_strategy": execution_strategy.to_dict() if execution_strategy else None,
+        "warnings": ["No datasource or dataset is selected."],
+        "errors": [],
+        "enterprise_answer": None,
+        "execution_strategy": None,
     }
 
 

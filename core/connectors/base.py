@@ -36,8 +36,13 @@ class DataSourceConnector(ABC):
     def discover_schema(self, config: DataSourceConfig) -> SchemaSnapshot: ...
 
     @abstractmethod
-    def open_connection(self, config: DataSourceConfig):
-        """Return a live DBAPI2-compatible connection. Caller is responsible for closing it."""
+    def open_connection(self, config: DataSourceConfig, timeout_s: int | None = None):
+        """Return a live DBAPI2-compatible connection. Caller is responsible for closing it.
+
+        timeout_s overrides the connector's normal connect timeout when given —
+        used by best-effort/optional callers (e.g. relationship overlap
+        validation) that want a short bound instead of the default tuned for
+        a user actively waiting on a real query or connection test."""
         ...
 
     @abstractmethod

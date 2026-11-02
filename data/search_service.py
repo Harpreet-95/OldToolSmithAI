@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +45,81 @@ _MAX_CANDIDATES = 2000  # cap DB rows before Python scoring
 
 _PHRASE_BONUS               = 150  # awarded when the full query phrase appears verbatim in a key text field
 _MULTI_FIELD_BONUS_PER_FIELD = 25  # awarded per additional distinct field hit beyond the first
+
+# ---------------------------------------------------------------------------
+# Per-source metadata cache (Phase B / metadata-retrieval latency fix)
+#
+# A single plan_business_query() call issues search_metadata() many times
+# (base search, per-term diversity, domain rescue) — profiling on real CCPP
+# data showed 127 sqlite fetchall() calls in one planning call, 82% of total
+# latency. The table-level path (_discovered_tables/_table_enrichment) was
+# reloading the same small per-source dataset (~26K profiling rows, ~1.4K
+# dictionary rows) from scratch on every call; caching it here is a safe,
+# behavior-identical win. The column-level path's dominant cost
+# (profiling_column_profiles, 343K+ rows on real CCPP, LIKE-filtered per
+# call) was NOT fixed the same way — caching that table's full unfiltered
+# contents in Python was tried and reverted (see git history for
+# _column_base_rows/_row_matches_tokens/_filter_column_rows): it caused a
+# MemoryError that _retrieve()'s error handling silently downgraded to zero
+# candidate tables, and was slower even before hitting that limit. The
+# column path still runs its original per-call LIKE-filtered SQL query,
+# unchanged. TTL, not an event-driven invalidation hooked into every
+# dictionary/profiling/governance write path — deliberately: this module
+# has no dependency on those services (would risk circular imports and
+# coupling a search concern to every write path), and 60s is short enough
+# that a governance edit is visible within roughly one turn of
+# conversation, while comfortably covering every call inside a single
+# planning pass.
+#
+# Caches only the RAW per-source data — every filter (schema/domain/entity/
+# pii/dictionary_status/classification/profile_status), every token match,
+# and every relevance score is still computed exactly as before, just
+# against a cached row set instead of a fresh query. No ranking, scoring,
+# governance, or PII logic changes.
+# ---------------------------------------------------------------------------
+_METADATA_CACHE_TTL_SECONDS = 60
+
+# Keyed by (db_path, source_id), not source_id alone — source_id is only
+# unique within one database. Different databases (each test's own temp
+# SQLite file, swapped in via data.db.DB_PATH) can reuse the same small
+# integer source_id for unrelated data; without db_path in the key, a
+# cache entry populated against one database would be wrongly served to a
+# later call against a different database at the same source_id.
+_CacheKey = tuple[str, int]
+_discovered_tables_cache: dict[_CacheKey, tuple[float, list[dict]]] = {}
+_table_enrichment_cache: dict[_CacheKey, tuple[float, dict[str, dict]]] = {}
+
+
+def _cache_key(source_id: int) -> _CacheKey:
+    import data.db as _db_module
+    return (str(_db_module.DB_PATH), source_id)
+
+
+def _cache_get(cache: dict, source_id: int):
+    """Returns the cached value if present and still within TTL, else None."""
+    entry = cache.get(_cache_key(source_id))
+    if entry is None:
+        return None
+    cached_at, value = entry
+    if (time.monotonic() - cached_at) >= _METADATA_CACHE_TTL_SECONDS:
+        return None
+    return value
+
+
+def _cache_put(cache: dict, source_id: int, value) -> None:
+    cache[_cache_key(source_id)] = (time.monotonic(), value)
+
+
+def clear_metadata_cache(source_id: Optional[int] = None) -> None:
+    """Drop cached per-source metadata immediately rather than waiting out
+    the TTL. Not currently wired into any write path (see module docstring
+    above for why) — available for tests and for a future caller that wants
+    to force freshness right after a metadata-changing operation."""
+    for cache in (_discovered_tables_cache, _table_enrichment_cache):
+        if source_id is None:
+            cache.clear()
+        else:
+            cache.pop(_cache_key(source_id), None)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +665,17 @@ _COLUMN_BASE_SQL = """
 # ---------------------------------------------------------------------------
 
 def _discovered_tables(conn, source_id: int) -> list[dict]:
+    """Cached wrapper over _discovered_tables_uncached — see the per-source
+    metadata cache section near the top of this module."""
+    cached = _cache_get(_discovered_tables_cache, source_id)
+    if cached is not None:
+        return cached
+    result = _discovered_tables_uncached(conn, source_id)
+    _cache_put(_discovered_tables_cache, source_id, result)
+    return result
+
+
+def _discovered_tables_uncached(conn, source_id: int) -> list[dict]:
     """Every table/view in the source's latest schema_snapshots row.
     Returns [] on no snapshot, a missing schema_snapshots table (older
     fixtures/callers that never populated it), or a parse failure — never
@@ -627,15 +714,43 @@ def _discovered_tables(conn, source_id: int) -> list[dict]:
 
 
 def _table_enrichment(conn, source_id: int) -> dict[str, dict]:
+    """Cached wrapper over _table_enrichment_uncached — see the per-source
+    metadata cache section near the top of this module."""
+    cached = _cache_get(_table_enrichment_cache, source_id)
+    if cached is not None:
+        return cached
+    result = _table_enrichment_uncached(conn, source_id)
+    _cache_put(_table_enrichment_cache, source_id, result)
+    return result
+
+
+def _table_enrichment_uncached(conn, source_id: int) -> dict[str, dict]:
     """Per-table_fqn profiling/dictionary/domain/entity data for the source,
     where it exists. A table_fqn with no matching row here simply has none
     of these keys — callers must treat every key as optional."""
     enrichment: dict[str, dict] = {}
 
-    for r in conn.execute(
-        "SELECT table_fqn, table_class, pii_column_count, profiling_status, updated_at "
-        "FROM profiling_table_profiles WHERE source_id = ?", (source_id,),
-    ).fetchall():
+    # Latency milestone (2026-08-17) — profiling_table_profiles accumulates
+    # one row PER historical profiling run (live-confirmed: 27,227 rows for
+    # one real source across 21 snapshots vs 1,401 in the latest snapshot
+    # alone). Unfiltered, this scanned/updated the enrichment dict from every
+    # old snapshot's rows too, with no ordering guarantee that the LATEST
+    # snapshot's row is what setdefault(...).update(...) ends up keeping —
+    # scoping to the same "latest COMPLETE, else latest" snapshot every other
+    # consumer already treats as authoritative removes both the extra scan
+    # cost and that latent nondeterminism (this cache is itself refreshed at
+    # most once per 60s TTL, so the extra lookup cost is amortized).
+    from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
+
+    latest_ref = get_latest_profiling_snapshot(source_id, conn=conn)
+    table_profile_sql = "SELECT table_fqn, table_class, pii_column_count, profiling_status, updated_at " \
+        "FROM profiling_table_profiles WHERE source_id = ?"
+    table_profile_params: tuple = (source_id,)
+    if latest_ref is not None:
+        table_profile_sql += " AND profiling_snapshot_id = ?"
+        table_profile_params = (source_id, latest_ref.id)
+
+    for r in conn.execute(table_profile_sql, table_profile_params).fetchall():
         d = dict(r)
         enrichment.setdefault(d["table_fqn"], {}).update({
             "table_class":      d["table_class"],
@@ -968,6 +1083,17 @@ def search_metadata(
                 })
 
         # ── Column-level search ───────────────────────────────────────────────
+        # Reverted to a live, LIKE-filtered SQL query for every call (see
+        # module docstring near _column_base_rows: a cached full-source
+        # fetch was tried here and reverted — profiling_column_profiles is
+        # too large (343K+ rows on real CCPP) to materialize unfiltered in
+        # Python; doing so was both slower than the live query and caused a
+        # MemoryError that _retrieve()'s error handling silently downgraded
+        # to zero candidate tables. _column_base_rows/_row_matches_tokens/
+        # _filter_column_rows are unused dead code pending a properly-scoped
+        # fix (e.g. a bounded query-result cache or an FTS index) — left in
+        # place rather than deleted so that follow-up work doesn't have to
+        # re-derive the same field-parity analysis.
         if include_columns:
             where = _where_block(_COLUMN_SEARCH_FIELDS, len(expanded_tokens))
             sql   = _COLUMN_BASE_SQL.format(where=where)
@@ -976,6 +1102,43 @@ def search_metadata(
             if source_id is not None:
                 sql += " AND pcp.source_id = ?"
                 params.append(source_id)
+                # Latency milestone (2026-08-17) — profiling_column_profiles
+                # accumulates one row set PER historical profiling run, never
+                # pruned (live-confirmed: 21 accumulated snapshots for one
+                # real source, 360,914 total rows vs 18,703 in the latest
+                # snapshot alone — a 19x inflation). This query previously had
+                # no profiling_snapshot_id filter at all, so it scanned/
+                # LIKE-matched every historical snapshot's rows, live-measured
+                # at up to ~0.6s per call before this fix, and — worse — let
+                # a stale row from an OLD snapshot compete for this query's
+                # _MAX_CANDIDATES cap (ORDER BY table_fqn, NOT by recency)
+                # against a genuinely current row, on pure alphabetical luck.
+                # Scoping to the same "latest COMPLETE, else latest" snapshot
+                # every other consumer in this codebase already treats as
+                # authoritative (data.profiling_snapshot_resolver
+                # .get_latest_profiling_snapshot — get_table_business_
+                # contexts_batch, get_related_tables, etc. all already read
+                # ONLY this snapshot) is not a new ranking decision, it is
+                # this one query catching up to the existing convention.
+                # Session-cached under the exact same key
+                # get_table_business_contexts_batch already uses, so a
+                # request that already resolved this snapshot elsewhere pays
+                # nothing extra here.
+                from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
+
+                def _resolve_latest_snapshot_id() -> int | None:
+                    ref = get_latest_profiling_snapshot(source_id, conn=conn)
+                    return ref.id if ref else None
+
+                if session is not None:
+                    latest_snapshot_id = session.get_or_compute(
+                        f"latest_profiling_snapshot_id:{source_id}", _resolve_latest_snapshot_id,
+                    )
+                else:
+                    latest_snapshot_id = _resolve_latest_snapshot_id()
+                if latest_snapshot_id is not None:
+                    sql += " AND pcp.profiling_snapshot_id = ?"
+                    params.append(latest_snapshot_id)
             if asset_type == "dictionary":
                 sql += " AND (ddc.business_label IS NOT NULL OR ddc.meaning IS NOT NULL)"
 
@@ -1007,6 +1170,7 @@ def search_metadata(
                 sql += " AND pcp.profiling_status = ?"
                 params.append(profile_status)
 
+            sql += " ORDER BY pcp.table_fqn ASC, pcp.column_name ASC"
             sql += f" LIMIT {_MAX_CANDIDATES}"
             rows = cursor.execute(sql, params).fetchall()
 

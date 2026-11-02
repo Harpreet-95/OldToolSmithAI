@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 
+import pytest
 from cryptography.fernet import Fernet
 
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -26,6 +27,24 @@ os.environ.setdefault("USER_ID_SALT", "test-phase10-salt-long-enough-value-12345
 from data.sql_planning_service import build_sql_plan
 
 _NOW = "2026-06-30T00:00:00+00:00"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_metadata_db(tmp_path, monkeypatch):
+    """build_sql_plan() unconditionally consults get_table_business_context
+    for PII state, so even the hand-built-query-plan unit tests below need a
+    working (schema-initialized, otherwise empty) metadata DB connection --
+    a previously missing fixture that silently fell through to the real
+    DB_PATH default before the Phase 5 Step 6C guard existed. _setup_pii_db
+    below layers its own PII-specific rows on top of this for the tests
+    that actually assert on PII behavior."""
+    import data.db as db_module
+    import data.models as models
+
+    db_path = str(tmp_path / "phase10_default.db")
+    monkeypatch.setattr(db_module, "DB_PATH", db_path)
+    models.init_db()
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +132,7 @@ def test_measure_and_dimension_group_by():
     plan = build_sql_plan(1, "u1", qp)
     assert plan["validation"]["valid"] is True
     assert len(plan["select"]) == 2
-    assert plan["group_by"] == [{"table_fqn": "dbo.orders", "column_name": "status"}]
+    assert plan["group_by"] == [{"table_fqn": "dbo.orders", "column_name": "status", "alias": "status"}]
     # measure must not appear in group_by
     assert not any(g["column_name"] == "amount" for g in plan["group_by"])
 
@@ -190,6 +209,77 @@ def test_valid_filter_accepted():
     assert plan["validation"]["valid"] is True
     assert len(plan["where"]) == 1
     assert plan["where"][0]["operator"] == "="
+
+
+# ---------------------------------------------------------------------------
+# 4a. NEXT MILESTONE, Part 2/26 — semantic-completeness: status filter
+# POLARITY. A plan whose intent requested a NEGATED status condition
+# ("classes that are not active") but whose actual filters carry a
+# polarity="positive" tag (i.e. some future regression silently dropped the
+# negation again, the exact class of bug Part 1 fixed) must be REJECTED —
+# never silently executed as if it answered the opposite question.
+# Adversarial: proves the opposite polarity cannot silently pass validation.
+# ---------------------------------------------------------------------------
+
+def test_negated_intent_with_positive_filter_is_blocked():
+    qp = _base_plan(
+        measures=[_measure("revenue", "dbo.orders", "amount")],
+        columns={"dbo.orders": ["amount", "status"]},
+        filters=[{
+            "column": "status", "operator": "=", "value": "Active", "resolved": True,
+            "table_fqn": "dbo.orders", "filter_kind": "status", "polarity": "positive",
+        }],
+        join_plan={"required": False, "tables": ["dbo.orders"], "primary_table": "dbo.orders",
+                   "steps": [], "fanout_risk": None, "confidence": 100},
+    )
+    qp["intent"]["status_value"] = "Active"
+    qp["intent"]["status_negated"] = True
+
+    plan = build_sql_plan(1, "u1", qp)
+    assert plan["validation"]["valid"] is False
+    assert plan["validation"]["checks"]["status_polarity_consistent"] is False
+    assert any("polarity" in r.lower() for r in plan["validation"]["blocking_reasons"])
+
+
+def test_negated_intent_with_negative_filter_is_valid():
+    qp = _base_plan(
+        measures=[_measure("revenue", "dbo.orders", "amount")],
+        columns={"dbo.orders": ["amount", "status"]},
+        filters=[{
+            "column": "status", "operator": "!=", "value": "Active", "resolved": True,
+            "table_fqn": "dbo.orders", "filter_kind": "status", "polarity": "negative",
+        }],
+        join_plan={"required": False, "tables": ["dbo.orders"], "primary_table": "dbo.orders",
+                   "steps": [], "fanout_risk": None, "confidence": 100},
+    )
+    qp["intent"]["status_value"] = "Active"
+    qp["intent"]["status_negated"] = True
+
+    plan = build_sql_plan(1, "u1", qp)
+    assert plan["validation"]["valid"] is True
+    assert plan["validation"]["checks"]["status_polarity_consistent"] is True
+    assert plan["where"][0]["operator"] == "!="
+
+
+def test_ordinary_positive_status_question_unaffected_by_polarity_check():
+    # Regression guard: an ORDINARY (non-negated) status question with a
+    # positive filter must not be blocked by the new check.
+    qp = _base_plan(
+        measures=[_measure("revenue", "dbo.orders", "amount")],
+        columns={"dbo.orders": ["amount", "status"]},
+        filters=[{
+            "column": "status", "operator": "=", "value": "Active", "resolved": True,
+            "table_fqn": "dbo.orders", "filter_kind": "status", "polarity": "positive",
+        }],
+        join_plan={"required": False, "tables": ["dbo.orders"], "primary_table": "dbo.orders",
+                   "steps": [], "fanout_risk": None, "confidence": 100},
+    )
+    qp["intent"]["status_value"] = "Active"
+    qp["intent"]["status_negated"] = False
+
+    plan = build_sql_plan(1, "u1", qp)
+    assert plan["validation"]["valid"] is True
+    assert plan["validation"]["checks"]["status_polarity_consistent"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +360,12 @@ def _setup_pii_db(tmp_path, monkeypatch):
     return db_path
 
 
-def test_pii_warning_blocks_by_default(tmp_path, monkeypatch):
+def test_ordinary_pii_no_longer_blocks_by_default(tmp_path, monkeypatch):
+    """2026-08-24 "remove standard-PII blocking" milestone — an ordinary
+    business identity/contact column (email) no longer blocks planning by
+    default; only a restricted category does (own coverage in
+    tests/test_pii_access_policy.py and this file's restricted-category
+    test below). Replaces the old test_pii_warning_blocks_by_default."""
     _setup_pii_db(tmp_path, monkeypatch)
     qp = _base_plan(
         dimensions=[_dimension("email", "dbo.customers", "email")],
@@ -281,9 +376,8 @@ def test_pii_warning_blocks_by_default(tmp_path, monkeypatch):
     )
     plan = build_sql_plan(1, "u1", qp)
     pii_warnings = [w for w in plan["warnings"] if w["type"] == "pii_involved"]
-    assert pii_warnings and pii_warnings[0]["severity"] == "HIGH"
-    assert plan["validation"]["valid"] is False
-    assert any("PII" in r for r in plan["validation"]["blocking_reasons"])
+    assert pii_warnings and pii_warnings[0]["severity"] == "LOW"
+    assert plan["validation"]["valid"] is True
 
 
 def test_pii_allowed_when_explicitly_overridden(tmp_path, monkeypatch):
@@ -611,3 +705,401 @@ def test_semantic_context_present_on_none_query_plan():
     plan = build_sql_plan(1, "u1", None)
     assert plan["semantic_context"] == []
     assert plan["validation"]["valid"] is False
+
+
+# ---------------------------------------------------------------------------
+# Enterprise AI Analyst Agent — bare entity list routing (M-26)
+#
+# query_planning_service._build_intent routes a confidently-resolved, single
+# bare-concept question ("Show clients") to intent.type == "list_entities".
+# Concepts carry no column_name (they resolve to a whole table, not a
+# measure/dimension column), so build_sql_plan must build SELECT from that
+# table's own known columns instead of leaving it empty.
+# ---------------------------------------------------------------------------
+
+def _concept(term, table_fqn, *, selected=True):
+    sel = {
+        "table_fqn": table_fqn, "business_name": None, "business_description": None,
+        "domain": None, "entity": None, "is_approved": True, "governance": {},
+        "relationships_summary": {"outbound_count": 0, "inbound_count": 0},
+        "score": 0.9, "name_score": 0.9, "authority_bonus": 0.0,
+        "ranking_reasons": [], "generated_vocabulary_term": None,
+    } if selected else None
+    return {
+        "term": term, "resolved": selected, "selected": sel,
+        "candidates": [sel] if sel else [], "confidence": 0.9 if selected else 0.0,
+        "ambiguity_reason": None if selected else f"No confident match for concept '{term}'.",
+    }
+
+
+def test_list_entities_select_built_from_single_resolved_concept():
+    qp = _base_plan(
+        columns={"dbo.adf_clients": ["id", "name", "email"]},
+        aggregation=None,
+    )
+    qp["intent"]["type"] = "list_entities"
+    qp["concepts"] = [_concept("clients", "dbo.adf_clients")]
+
+    plan = build_sql_plan(1, "u1", qp)
+
+    assert plan["validation"]["valid"] is True
+    assert plan["from"]["table_fqn"] == "dbo.adf_clients"
+    assert {r["column_name"] for r in plan["select"]} == {"id", "name", "email"}
+    assert all(r["aggregation"] is None and not r["distinct"] for r in plan["select"])
+
+
+def test_list_entities_column_list_capped():
+    columns = [f"col_{i}" for i in range(40)]
+    qp = _base_plan(columns={"dbo.wide_table": columns}, aggregation=None)
+    qp["intent"]["type"] = "list_entities"
+    qp["concepts"] = [_concept("things", "dbo.wide_table")]
+
+    plan = build_sql_plan(1, "u1", qp)
+
+    assert plan["validation"]["valid"] is True
+    assert len(plan["select"]) == 25
+
+
+def test_list_entities_unresolved_concept_still_blocks():
+    # Defensive: even under intent.type == "list_entities", an unresolved
+    # (ambiguous) concept must not produce a guessed SELECT — same
+    # never-guess-on-genuine-ambiguity rule as every other resolver path.
+    qp = _base_plan(columns={"dbo.adf_clients": ["id", "name"]}, aggregation=None)
+    qp["intent"]["type"] = "list_entities"
+    qp["concepts"] = [_concept("clients", "dbo.adf_clients", selected=False)]
+
+    plan = build_sql_plan(1, "u1", qp)
+
+    assert plan["validation"]["valid"] is False
+    assert plan["select"] == []
+
+
+# ---------------------------------------------------------------------------
+# Day 3, Task 1 — Multi-Entity Relationship Questions
+#
+# query_planning_service._try_build_relationship_plan routes a bare "show
+# <entity> and their <entity>" question (2-3 fully-grounded entities, no
+# measure/dimension) to intent.type == "relationship_list". build_sql_plan
+# mirrors the list_entities carve-out above, just for every grounded entity
+# instead of requiring exactly one, with entity-prefixed aliases so same-
+# named columns across tables (e.g. both tables having an "Id") can never
+# collide in the result row.
+# ---------------------------------------------------------------------------
+
+def test_relationship_list_select_built_with_entity_prefixed_aliases():
+    qp = _base_plan(
+        columns={
+            "dbo.adf_recruiters": ["id", "name"],
+            "dbo.adf_placements": ["id", "status"],
+        },
+        join_plan={
+            "required": True, "tables": ["dbo.adf_recruiters", "dbo.adf_placements"],
+            "primary_table": "dbo.adf_recruiters",
+            "steps": [_join_step("dbo.adf_placements", "recruiter_id", "dbo.adf_recruiters", "id")],
+            "fanout_risk": "LOW", "confidence": 90,
+        },
+    )
+    qp["intent"]["type"] = "relationship_list"
+    qp["concepts"] = [
+        _concept("recruiters", "dbo.adf_recruiters"),
+        _concept("placements", "dbo.adf_placements"),
+    ]
+
+    plan = build_sql_plan(1, "u1", qp)
+
+    assert plan["validation"]["valid"] is True
+    aliases = {r["alias"] for r in plan["select"]}
+    assert aliases == {"recruiters__id", "recruiters__name", "placements__id", "placements__status"}
+    # No alias collision: every SELECT row keeps a distinct table_fqn/alias
+    # pair even though both entities have a same-named "id" column.
+    assert len(aliases) == len(plan["select"])
+
+
+def test_relationship_list_untrusted_join_refuses():
+    # No Cartesian join, no silent drop: an entity with no trusted
+    # (AUTO/APPROVED) path to the other reuses build_sql_plan's existing
+    # untrusted-join check (the same one every other multi-table plan is
+    # already subject to) and refuses rather than guessing a join.
+    qp = _base_plan(
+        columns={
+            "dbo.adf_clients": ["id", "name"],
+            "dbo.adf_invoices": ["id", "amount"],
+        },
+        join_plan={
+            "required": True, "tables": ["dbo.adf_clients", "dbo.adf_invoices"],
+            "primary_table": "dbo.adf_clients",
+            "steps": [_join_step("dbo.adf_clients", None, "dbo.adf_invoices", None, path_found=False)],
+            "fanout_risk": None, "confidence": 0,
+        },
+    )
+    qp["intent"]["type"] = "relationship_list"
+    qp["concepts"] = [
+        _concept("clients", "dbo.adf_clients"),
+        _concept("invoices", "dbo.adf_invoices"),
+    ]
+
+    plan = build_sql_plan(1, "u1", qp)
+
+    assert plan["validation"]["valid"] is False
+    assert any("trusted" in r.lower() for r in plan["validation"]["blocking_reasons"])
+
+
+# ---------------------------------------------------------------------------
+# A7.1 — PII-aware bare-entity-list column selection
+#
+# The list_entities auto-select pool was previously the table's raw known
+# column names, unfiltered — real PII columns entered SELECT even though
+# the user never named them, and Step 8 then correctly refused the whole
+# query. These tests exercise _select_safe_list_entity_columns via
+# build_sql_plan directly, using the same real-DB fixture pattern as the
+# PII tests above (get_table_business_context needs real dictionary/
+# profiling rows, same as get_column_business_context does).
+# ---------------------------------------------------------------------------
+
+def _setup_list_entity_db(tmp_path, monkeypatch, *, table_fqn, columns):
+    """
+    columns: list of dicts, each with at least "name", plus any of
+    pii_risk, pii_confirmed, pii_name_heuristic, is_id, is_date,
+    is_dimension, semantic_type, business_label, is_primary_key.
+    """
+    import data.models as models
+    db_path = str(tmp_path / "phase10_a71.db")
+    import data.db as db_module
+    monkeypatch.setattr(db_module, "DB_PATH", db_path)
+    models.init_db()
+    monkeypatch.setattr("data.business_knowledge_service.get_connection", lambda p=db_path: _db_conn(p))
+
+    conn = _db_conn(db_path)
+    conn.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        " encrypted_config_json, config_schema_version, capabilities_json, "
+        " metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (1,'u1','Test','mssql','RELATIONAL','{}',1,'[]','{}','ACTIVE',1,?,?)",
+        (_NOW, _NOW),
+    )
+    conn.execute(
+        "INSERT INTO schema_snapshots "
+        "(id, source_id, snapshot_version, source_type, table_count, snapshot_json, "
+        " discovered_at, created_at) VALUES (1,1,1,'mssql',1,'{}',?,?)", (_NOW, _NOW),
+    )
+    conn.execute(
+        "INSERT INTO profiling_snapshots "
+        "(id, source_id, schema_snapshot_id, snapshot_version, created_at) "
+        "VALUES (1,1,1,1,?)", (_NOW,),
+    )
+    name = table_fqn.split(".")[-1]
+    schema = table_fqn.split(".")[0]
+    conn.execute(
+        "INSERT INTO data_dictionary_tables "
+        "(source_id, snapshot_id, table_fqn, table_name, schema_name, table_type, "
+        " business_name, is_approved, generation_method, created_at, updated_at) "
+        "VALUES (1,1,?,?,?,'TABLE',?,1,'rule_based',?,?)",
+        (table_fqn, name, schema, name.capitalize(), _NOW, _NOW),
+    )
+    conn.execute(
+        "INSERT INTO profiling_table_profiles "
+        "(profiling_snapshot_id, source_id, table_fqn, table_name, schema_name, "
+        " table_class, profiling_status, exact_row_count, created_at, updated_at) "
+        "VALUES (1,1,?,?,?,'Master','COMPLETE',100,?,?)",
+        (table_fqn, name, schema, _NOW, _NOW),
+    )
+    for i, col in enumerate(columns):
+        conn.execute(
+            "INSERT INTO profiling_column_profiles "
+            "(profiling_snapshot_id, source_id, table_fqn, column_name, data_type, "
+            " is_primary_key, ordinal_position, pii_name_heuristic, pii_confirmed, "
+            " created_at, updated_at) "
+            "VALUES (1,1,?,?,'TEXT',?,?,?,?,?,?)",
+            (table_fqn, col["name"], int(bool(col.get("is_primary_key"))), i,
+             int(bool(col.get("pii_name_heuristic"))), int(bool(col.get("pii_confirmed"))),
+             _NOW, _NOW),
+        )
+        conn.execute(
+            "INSERT INTO data_dictionary_columns "
+            "(source_id, snapshot_id, table_fqn, column_name, business_label, semantic_type, "
+            " is_dimension, is_date, is_id, pii_risk, is_approved, generation_method, "
+            " created_at, updated_at) "
+            "VALUES (1,1,?,?,?,?,?,?,?,?,1,'rule_based',?,?)",
+            (table_fqn, col["name"], col.get("business_label"), col.get("semantic_type"),
+             int(bool(col.get("is_dimension"))), int(bool(col.get("is_date"))),
+             int(bool(col.get("is_id"))), int(bool(col.get("pii_risk"))), _NOW, _NOW),
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def _list_entities_plan(table_fqn, columns):
+    qp = _base_plan(columns={table_fqn: [c["name"] for c in columns]}, aggregation=None)
+    qp["intent"]["type"] = "list_entities"
+    qp["concepts"] = [_concept("things", table_fqn)]
+    return qp
+
+
+def test_list_entities_excludes_unconfirmed_pii_columns(tmp_path, monkeypatch):
+    table_fqn = "dbo.candidates"
+    columns = [
+        {"name": "id", "is_id": True, "is_primary_key": True},
+        {"name": "name", "business_label": "Name"},
+        {"name": "email", "pii_risk": True, "pii_name_heuristic": True, "pii_confirmed": False},
+    ]
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    selected = {r["column_name"] for r in plan["select"]}
+    assert "email" not in selected
+    assert selected == {"id", "name"}
+    assert plan["validation"]["valid"] is True
+
+
+def test_list_entities_excludes_confirmed_pii_columns(tmp_path, monkeypatch):
+    # No masking policy exists in this codebase (confirmed by investigation) —
+    # auto-population stays conservative for BOTH confirmed and unconfirmed
+    # PII, since the user never asked for the column by name either way.
+    table_fqn = "dbo.candidates"
+    columns = [
+        {"name": "id", "is_id": True, "is_primary_key": True},
+        {"name": "name", "business_label": "Name"},
+        {"name": "ssn", "pii_risk": True, "pii_name_heuristic": True, "pii_confirmed": True},
+    ]
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    selected = {r["column_name"] for r in plan["select"]}
+    assert "ssn" not in selected
+    assert selected == {"id", "name"}
+    assert plan["validation"]["valid"] is True
+
+
+def test_list_entities_keeps_safe_non_pii_columns(tmp_path, monkeypatch):
+    table_fqn = "dbo.projects"
+    columns = [
+        {"name": "id", "is_id": True, "is_primary_key": True},
+        {"name": "project_name", "business_label": "Project Name"},
+        {"name": "status", "semantic_type": "STATUS"},
+        {"name": "start_date", "is_date": True},
+        {"name": "region", "is_dimension": True},
+    ]
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    selected = {r["column_name"] for r in plan["select"]}
+    assert selected == {"id", "project_name", "status", "start_date", "region"}
+    assert plan["validation"]["valid"] is True
+
+
+def test_list_entities_keeps_identifier_when_available(tmp_path, monkeypatch):
+    table_fqn = "dbo.clients"
+    columns = [
+        {"name": "client_id", "is_id": True, "is_primary_key": True},
+        {"name": "notes"},
+        {"name": "phone", "pii_risk": True, "pii_name_heuristic": True},
+    ]
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    selected = {r["column_name"] for r in plan["select"]}
+    assert "client_id" in selected
+    assert "phone" not in selected
+
+
+def test_list_entities_cap_still_enforced_after_pii_filtering(tmp_path, monkeypatch):
+    table_fqn = "dbo.wide_safe_table"
+    safe_columns = [{"name": f"col_{i}", "business_label": f"Col {i}"} for i in range(30)]
+    pii_columns = [{"name": f"pii_{i}", "pii_risk": True, "pii_name_heuristic": True} for i in range(5)]
+    columns = safe_columns + pii_columns
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    assert len(plan["select"]) == 25
+    selected = {r["column_name"] for r in plan["select"]}
+    assert not any(name.startswith("pii_") for name in selected)
+
+
+def test_list_entities_never_produces_select_star(tmp_path, monkeypatch):
+    table_fqn = "dbo.candidates"
+    columns = [
+        {"name": "id", "is_id": True, "is_primary_key": True},
+        {"name": "email", "pii_risk": True, "pii_name_heuristic": True},
+    ]
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    assert all(r["column_name"] not in (None, "*") for r in plan["select"])
+
+
+def test_list_entities_no_safe_columns_refuses_with_precise_reason(tmp_path, monkeypatch):
+    table_fqn = "dbo.all_pii_table"
+    columns = [
+        {"name": "email", "pii_risk": True, "pii_name_heuristic": True},
+        {"name": "ssn", "pii_risk": True, "pii_name_heuristic": True, "pii_confirmed": True},
+    ]
+    _setup_list_entity_db(tmp_path, monkeypatch, table_fqn=table_fqn, columns=columns)
+
+    plan = build_sql_plan(1, "u1", _list_entities_plan(table_fqn, columns))
+
+    assert plan["select"] == []
+    assert plan["validation"]["valid"] is False
+    assert any(w["type"] == "no_safe_columns_available" for w in plan["warnings"])
+    assert any("No measures or dimensions resolved" in r for r in plan["validation"]["blocking_reasons"])
+
+
+def test_explicit_identity_pii_request_allowed_for_authorized_user(tmp_path, monkeypatch):
+    # An explicit SSN dimension is identity PII, but it is not an
+    # authentication/cryptographic secret. The current product policy allows
+    # authorized users to query it while keeping it out of logs and caches.
+    db_path = _setup_pii_db(tmp_path, monkeypatch)
+    conn = _db_conn(db_path)
+    conn.execute(
+        "INSERT INTO profiling_column_profiles "
+        "(id, profiling_snapshot_id, source_id, table_fqn, column_name, data_type, "
+        " pii_name_heuristic, pii_confirmed, created_at, updated_at) "
+        "VALUES (2,1,1,'dbo.customers','ssn','TEXT',1,1,?,?)", (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+
+    qp = _base_plan(
+        dimensions=[_dimension("ssn", "dbo.customers", "ssn")],
+        columns={"dbo.customers": ["ssn"]},
+        join_plan={"required": False, "tables": ["dbo.customers"], "primary_table": "dbo.customers",
+                   "steps": [], "fanout_risk": None, "confidence": 100},
+        aggregation=None,
+    )
+    plan = build_sql_plan(1, "u1", qp)
+    assert plan["validation"]["valid"] is True
+    assert plan["validation"]["blocking_reasons"] == []
+
+    plan_override = build_sql_plan(1, "u1", qp, allow_unconfirmed_pii=True)
+    assert plan_override["validation"]["valid"] is True
+
+
+def test_aggregate_query_unaffected_by_list_entity_pii_filtering():
+    # aggregation intent never reaches the list_entities branch at all —
+    # confirms the A7.1 change is scoped exactly to the bare-entity-list
+    # auto-select path and nothing else.
+    qp = _base_plan(
+        measures=[_measure("revenue", "dbo.orders", "amount")],
+        columns={"dbo.orders": ["amount"]},
+    )
+    plan = build_sql_plan(1, "u1", qp)
+    assert plan["validation"]["valid"] is True
+    assert plan["select"][0]["column_name"] == "amount"
+
+
+def test_dimension_query_unaffected_by_list_entity_pii_filtering():
+    qp = _base_plan(
+        measures=[_measure("revenue", "dbo.orders", "amount")],
+        dimensions=[_dimension("status", "dbo.orders", "status")],
+        columns={"dbo.orders": ["amount", "status"]},
+    )
+    plan = build_sql_plan(1, "u1", qp)
+    assert plan["validation"]["valid"] is True
+    assert {r["column_name"] for r in plan["select"]} == {"amount", "status"}

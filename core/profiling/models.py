@@ -197,8 +197,19 @@ class ColumnProfile:
 
     # PII
     pii_name_heuristic:    bool       = False  # from existing pii_detector.detect_pii()
-    pii_confirmed:         bool       = False  # confirmed by profiling pattern rates
+    pii_confirmed:         bool       = False  # True iff pii_classification == CONFIRMED_PII
     pii_signals:           list[str]  = field(default_factory=list)
+
+    # Autonomous PII classification (core.dictionary.pii_classifier) — the
+    # tri-state decision layered on top of pii_name_heuristic/pii_confirmed.
+    # See data/pii_classification_service.py for the write path and
+    # precedence rules (manual override always wins over automatic).
+    pii_classification:            str | None  = None  # CONFIRMED_PII|CONFIRMED_NON_PII|UNCERTAIN
+    pii_classification_confidence: float | None = None  # 0.0-1.0
+    pii_classification_evidence:   str | None  = None
+    pii_classification_source:     str | None  = None  # AUTO_RULE|MANUAL
+    pii_classified_at:             str | None  = None
+    pii_manual_override:           bool        = False
 
     # Value samples — always empty for PII columns
     top_values:           list[dict]  = field(default_factory=list)  # [{value, count, percentage}]

@@ -36,7 +36,11 @@ _BRAND_HEX = {
 }
 
 ALLOWED_FORMATS = {"xlsx", "csv", "pdf"}
-_TERMINAL_SUCCESS_AGENT_STATUS = "answered"
+# "answered" is the legacy agent-routed success status; "ok" is the AI-first
+# fast path's success status (api/v1/ai_first_composer_adapter). Both mean a
+# successfully answered question. Every other status (clarification, refusal,
+# non_data, unsupported, not_enabled, failures) stays non-exportable.
+_SUCCESS_AGENT_STATUSES = frozenset({"answered", "ok"})
 _NON_EXPORTABLE_ANSWER_TYPES = {"clarification_needed"}
 _MAX_TABLE_ROWS_PDF = 40  # a PDF is a one-pager-oriented document; xlsx/csv carry the full result_preview
 
@@ -51,7 +55,7 @@ def check_exportable(enterprise_answer: "dict | None", agent_status: "str | None
         return "No answer is available to export."
     if enterprise_answer.get("answer_type") in _NON_EXPORTABLE_ANSWER_TYPES:
         return "This question needs clarification before it can be exported."
-    if agent_status is not None and agent_status != _TERMINAL_SUCCESS_AGENT_STATUS:
+    if agent_status is not None and agent_status not in _SUCCESS_AGENT_STATUSES:
         return "This question was not successfully answered, so there is nothing to export."
     return None
 
@@ -351,7 +355,7 @@ def build_pdf_bytes(question: str, enterprise_answer: dict) -> bytes:
                 pdf.cell(col_w, 6, str(val)[:30], border=0, fill=fill, align="L")
             pdf.ln(6)
         if len(rows) > _MAX_TABLE_ROWS_PDF:
-            pdf.set_font(font, "I", 8)
+            pdf.set_font(font, "", 8)  # only regular/bold are registered (see _register_fonts); "I" raised for >40-row results
             pdf.set_text_color(*rgb["text_muted"])
             pdf.cell(0, 6, f"+ {len(rows) - _MAX_TABLE_ROWS_PDF} more row(s) — see the Excel/CSV export for the full table.",
                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)

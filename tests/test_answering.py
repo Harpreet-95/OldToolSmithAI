@@ -4,8 +4,7 @@ Enterprise Answer Generation Layer (Phase 10) — tests.
 Most scenarios hand-build an EvidencePackage in-memory (mirroring
 tests/test_composer_api.py::TestDeterministicAnswer's own convention) since
 core/answering/ is a pure, deterministic transform over already-collected
-evidence — no database needed to test it. A few tests exercise the real
-orchestrator/composer integration end to end.
+evidence — no database needed to test it.
 
 Run from the project root:
     python -m pytest tests/test_answering.py -v
@@ -25,11 +24,9 @@ os.environ.setdefault("USER_ID_SALT", "test-phase10-salt-long-enough-value-12345
 from core.answering.answer_planner import AnswerPlanner
 from core.answering.models import AnswerType, CitationType
 from core.execution.execution_strategy import ExecutionStrategy, StrategyType
-from core.orchestrator import EnterpriseOrchestrator, OrchestratorRequest
 from core.orchestrator.models import (
     EvidenceItem, EvidencePackage, IntentType, ResolvedIntent, ServiceCapability,
 )
-from core.orchestrator.registry import ServiceRegistry
 
 
 def _item(source_service, data, governance_state=None):
@@ -168,9 +165,8 @@ class TestSupportedAnswers:
 
 
 # ---------------------------------------------------------------------------
-# live_query SQL-generation-refusal — the evidence shape
-# core.orchestrator.context_builder._live_query() returns when
-# generate_sql() refuses (no "status" key at all, unlike a real QueryResult).
+# Live-query SQL-generation refusal evidence has no "status" key, unlike a
+# successful QueryResult.
 # Previously fell through to the status check and rendered
 # "status: None"; must now be detected before that and explained clearly.
 # ---------------------------------------------------------------------------
@@ -234,7 +230,11 @@ class TestLiveQuerySqlGenerationRefusal:
 
         assert answer.answer_type == AnswerType.LIVE_QUERY
         assert "10 row" in answer.answer
-        assert answer.confidence == 95
+        # Rule G — no hardcoded 95%: with no business_plan on this raw dict
+        # (no plan-level confidence signal), the final confidence falls back
+        # to the package's own real intent confidence (0.9 -> 90), not a
+        # flat constant.
+        assert answer.confidence == 90
         assert "could not be translated" not in answer.answer.lower()
         assert "status: none" not in answer.answer.lower()
 
@@ -254,11 +254,9 @@ class TestLiveQuerySqlGenerationRefusal:
 
 
 # ---------------------------------------------------------------------------
-# Milestone M-25 — Enterprise Answer Value Rendering.
+# Enterprise Answer Value Rendering.
 #
-# core.orchestrator.context_builder._live_query()'s success branch now
-# attaches a "business_plan" dict (see _build_business_plan) alongside the
-# QueryResult fields. These tests hand-build that combined evidence shape and
+# These tests hand-build the historical combined business-plan/result shape and
 # assert the resulting EnterpriseAnswer renders real business language
 # instead of a technical row/column-count sentence, across every result
 # shape in the milestone brief. A live_query dict with NO "business_plan" key
@@ -495,11 +493,10 @@ class TestLiveQueryBusinessValueRendering:
 
 
 # ---------------------------------------------------------------------------
-# Milestone Phase 6.6 — Enterprise Clarification Intelligence.
+# Enterprise Clarification Intelligence.
 #
-# core.orchestrator.context_builder._live_query() returns a
-# "clarification_required" evidence shape (see there) whenever
-# query_planning_service's own ranking left a measure/dimension ambiguous
+# The "clarification_required" evidence shape is used whenever
+# ranking left a measure/dimension ambiguous
 # (selected=None, an "ambiguous_*" warning, >=2 ranked candidates) instead
 # of guessing. These tests exercise the resulting EnterpriseAnswer directly
 # against that hand-built evidence shape, the same convention as
@@ -575,6 +572,288 @@ class TestClarificationNeeded:
 
         labels = [o["label"] for o in answer.clarification["options"]]
         assert labels == ["Widget Orders", "Widget Returns"]
+
+    # -----------------------------------------------------------------
+    # Accuracy Program A4, Fix #2 — business-friendly label precedence.
+    # dictionary business_name > entity-assignment name (excluding
+    # Unknown/Generic) > existing business_label > humanized table name >
+    # raw table_fqn. Display-only: must not touch score/order/selection.
+    # -----------------------------------------------------------------
+
+    def test_dictionary_business_name_used_first(self):
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{
+                    "term": "candidates", "kind": "measure",
+                    "candidates": [{
+                        "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+                        "business_label": "BH Candidate Records",
+                        "table_business_name": "Candidates",
+                        "entity_name": "Candidate",
+                        "score": 0.6,
+                    }],
+                }],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["label"] == "Candidates"
+
+    def test_entity_assignment_used_when_business_name_absent(self):
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{
+                    "term": "candidates", "kind": "measure",
+                    "candidates": [{
+                        "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+                        "business_label": "BH Candidate Records",
+                        "table_business_name": None,
+                        "entity_name": "Candidate",
+                        "score": 0.6,
+                    }],
+                }],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["label"] == "Candidate"
+
+    def test_unknown_entity_name_ignored(self):
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{
+                    "term": "candidates", "kind": "measure",
+                    "candidates": [{
+                        "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+                        "business_label": "BH Candidate Records",
+                        "table_business_name": None,
+                        "entity_name": "Unknown",
+                        "score": 0.6,
+                    }, {
+                        "table_fqn": "dbo.ADF_BHCandidates2", "column_name": None,
+                        "business_label": "BH Candidate Records 2",
+                        "table_business_name": None,
+                        "entity_name": "Generic",
+                        "score": 0.5,
+                    }],
+                }],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        labels = [o["label"] for o in answer.clarification["options"]]
+        assert labels == ["BH Candidate Records", "BH Candidate Records 2"]
+
+    def test_business_label_remains_fallback_after_entity(self):
+        # No dictionary business_name, no usable entity name -> falls to the
+        # existing column-level business_label, not the humanized table name.
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{
+                    "term": "candidates", "kind": "measure",
+                    "candidates": [{
+                        "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+                        "business_label": "BH Candidate Records",
+                        "table_business_name": None,
+                        "entity_name": None,
+                        "score": 0.6,
+                    }],
+                }],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["label"] == "BH Candidate Records"
+
+    def test_raw_table_fqn_is_final_fallback(self):
+        # No dictionary/entity/business_label metadata AND humanizing the
+        # table name itself yields nothing usable (trailing-dot fqn) -> the
+        # raw table_fqn is shown rather than an empty label.
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show widgets",
+                "ambiguous_terms": [{
+                    "term": "widgets", "kind": "measure",
+                    "candidates": [{
+                        "table_fqn": "dbo.", "column_name": None,
+                        "business_label": None, "table_business_name": None,
+                        "entity_name": None, "score": 0.5,
+                    }],
+                }],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["label"] == "dbo."
+
+    def test_fix1_and_fix2_behavior_remains_intact_with_fix3_fields_present(self):
+        # Accuracy Program A4, Fix #3 — the option contract intentionally
+        # grows five additive fields; table_fqn/score/label/description keep
+        # their exact pre-Fix-#3 values and semantics (no raw table_fqn or
+        # confidence number in description; label still Fix #2's precedence).
+        candidate = {
+            "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+            "business_label": "BH Candidate Records",
+            "table_business_name": "Candidates", "entity_name": "Candidate",
+            "score": 0.8734,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{"term": "candidates", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        option = answer.clarification["options"][0]
+        assert set(option.keys()) == {
+            "id", "term", "table_fqn", "column_name", "label", "description", "score",
+            "object_type", "business_name", "domain", "entity", "why_relevant",
+        }
+        assert option["table_fqn"] == "dbo.ADF_BHCandidates"
+        assert option["score"] == 0.8734
+        assert option["label"] == "Candidates"  # Fix #2: dictionary business_name wins
+        assert "dbo.ADF_BHCandidates" not in option["description"]
+        assert "0.87" not in option["description"] and "confidence" not in option["description"].lower()
+
+    # -----------------------------------------------------------------
+    # Accuracy Program A4, Fix #3 — additive safe clarification metadata
+    # (object_type/business_name/domain/entity/why_relevant). Display and
+    # evidence only: must not affect score, order, selection, or resume.
+    # -----------------------------------------------------------------
+
+    def test_object_type_included_when_available(self):
+        candidate = {
+            "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+            "business_label": None, "table_object_type": "VIEW", "score": 0.5,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{"term": "candidates", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["object_type"] == "VIEW"
+
+    def test_business_name_field_included_safely(self):
+        candidate = {
+            "table_fqn": "dbo.ADF_BHCandidates", "column_name": None,
+            "business_label": None, "table_business_name": "  Candidates  ", "score": 0.5,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show candidates",
+                "ambiguous_terms": [{"term": "candidates", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["business_name"] == "Candidates"
+
+    def test_unknown_generic_domain_and_entity_excluded(self):
+        candidate = {
+            "table_fqn": "dbo.T004", "column_name": None, "business_label": None,
+            "domain_name": "Unknown", "entity_name": "Generic", "score": 0.5,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show widgets",
+                "ambiguous_terms": [{"term": "widgets", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        option = answer.clarification["options"][0]
+        assert option["domain"] is None
+        assert option["entity"] is None
+
+    def test_why_relevant_deterministic_and_capped_at_three(self):
+        candidate = {
+            "table_fqn": "dbo.placements", "column_name": "placement_id",
+            "business_label": None, "table_business_name": "Placements",
+            "entity_name": "Placement", "domain_name": "Operations",
+            "relationship_related_tables": ["dbo.candidates", "dbo.clients"],
+            "score": 0.7,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show placements",
+                "ambiguous_terms": [{"term": "placements", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer1 = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        answer2 = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        why1 = answer1.clarification["options"][0]["why_relevant"]
+        why2 = answer2.clarification["options"][0]["why_relevant"]
+        assert why1 == why2  # deterministic: identical input -> identical output
+        assert len(why1) <= 3
+        assert why1[0] == "Business name matches the requested term."
+
+    def test_why_relevant_empty_when_no_factual_reason_available(self):
+        candidate = {
+            "table_fqn": "dbo.T004", "column_name": None, "business_label": None, "score": 0.5,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show widgets",
+                "ambiguous_terms": [{"term": "widgets", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        assert answer.clarification["options"][0]["why_relevant"] == []
+
+    def test_why_relevant_never_contains_score_or_sql_or_sensitive_values(self):
+        candidate = {
+            "table_fqn": "dbo.placements", "column_name": "placement_id",
+            "business_label": None, "table_business_name": "Placements",
+            "entity_name": "Placement", "domain_name": "Operations",
+            "relationship_related_tables": ["dbo.candidates", "dbo.clients"],
+            "score": 0.913482,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show placements",
+                "ambiguous_terms": [{"term": "placements", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        why = answer.clarification["options"][0]["why_relevant"]
+        joined = " ".join(why).lower()
+        assert "0.91" not in joined and "confidence" not in joined
+        assert "select" not in joined and "from" not in joined
+        assert "dbo.placements" not in joined  # raw table_fqn stays out of why_relevant text
+
+    def test_old_candidates_missing_fix3_metadata_still_serialize_safely(self):
+        # Pre-Fix-#3-shaped candidate (Fix #1/#2 only) — no crash, all five
+        # new fields present with safe defaults.
+        candidate = {
+            "table_fqn": "dbo.widget_orders", "column_name": None,
+            "business_label": "Widget Orders", "score": 0.5,
+        }
+        pkg = _package(IntentType.SQL_REQUEST, [
+            _item("live_query", {
+                "executed": False, "reason": "clarification_required",
+                "question": "show widgets",
+                "ambiguous_terms": [{"term": "widgets", "kind": "measure", "candidates": [candidate]}],
+            }),
+        ])
+        answer = AnswerPlanner().build(_strategy(strategy_type=StrategyType.SQL_REQUIRED), pkg)
+        option = answer.clarification["options"][0]
+        assert option["object_type"] is None
+        assert option["business_name"] is None
+        assert option["domain"] is None
+        assert option["entity"] is None
+        assert option["why_relevant"] == []
+        assert option["label"] == "Widget Orders"
 
     def test_multiple_ambiguous_terms_in_one_question(self):
         pkg = _package(IntentType.SQL_REQUEST, [
@@ -688,6 +967,195 @@ class TestCitations:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3, Step 4 — remembered-terminology explainability
+# ---------------------------------------------------------------------------
+
+class TestRememberedTerminologyExplainability:
+    def _remembered(self, answer):
+        return [c for c in answer.citations if c.source_type == CitationType.REMEMBERED_TERMINOLOGY]
+
+    def test_remembered_synonym_creates_one_evidence_citation(self):
+        plan = _business_plan(remembered_terminology=[{
+            "evidence_type": "remembered_terminology",
+            "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert len(self._remembered(answer)) == 1
+
+    def test_citation_preserves_original_and_canonical_terms(self):
+        plan = _business_plan(remembered_terminology=[{
+            "evidence_type": "remembered_terminology",
+            "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        citation = self._remembered(answer)[0]
+        assert citation.detail == {
+            "evidence_type": "remembered_terminology",
+            "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+        }
+
+    def test_no_evidence_when_key_absent(self):
+        # No remembered_terminology key at all — the ordinary case for
+        # every source with nothing taught, or a term with no synonym.
+        plan = _business_plan()
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert self._remembered(answer) == []
+
+    def test_no_evidence_when_list_is_explicitly_empty(self):
+        plan = _business_plan(remembered_terminology=[])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert self._remembered(answer) == []
+
+    def test_multiple_records_each_produce_their_own_citation(self):
+        plan = _business_plan(remembered_terminology=[
+            {"evidence_type": "remembered_terminology", "original_term": "clients",
+             "canonical_term": "customer", "source": "user_memory"},
+            {"evidence_type": "remembered_terminology", "original_term": "revenue",
+             "canonical_term": "sales_amount", "source": "user_memory"},
+        ])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert len(self._remembered(answer)) == 2
+
+    def test_conversational_wording(self):
+        plan = _business_plan(remembered_terminology=[{
+            "evidence_type": "remembered_terminology",
+            "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        citation = self._remembered(answer)[0]
+        assert citation.label == 'Resolved using your remembered terminology: "clients" → "customer"'
+
+    def test_no_governance_jargon_in_label(self):
+        plan = _business_plan(remembered_terminology=[{
+            "evidence_type": "remembered_terminology",
+            "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        citation = self._remembered(answer)[0]
+        for banned in ("governance", "auto_approved", "human_approved", "confidence", "lifecycle"):
+            assert banned not in citation.label.lower()
+
+    def test_existing_scalar_count_answer_unchanged_when_nothing_remembered(self):
+        # Pins TestLiveQueryBusinessValueRendering.test_scalar_count's own
+        # assertions exactly — proves this feature is purely additive.
+        plan = _business_plan(
+            aggregation="COUNT", aggregation_target="entity_count", entity_label="clients",
+            select=[{"table_fqn": "dbo.Client", "column_name": None, "alias": "row_count",
+                     "aggregation": "COUNT", "distinct": False}],
+        )
+        data = _success_data(plan, row_count=1, columns=[{"name": "row_count"}],
+                              rows=[{"row_count": 2218}])
+        answer = _build_live_query_answer(data)
+        assert answer.answer == "There are 2,218 clients in the database."
+        assert answer.actual_value == 2218
+        assert self._remembered(answer) == []
+
+
+# ---------------------------------------------------------------------------
+# Enterprise Phase 4 — generated-vocabulary explainability
+# ---------------------------------------------------------------------------
+
+class TestGeneratedVocabularyExplainability:
+    def _generated(self, answer):
+        return [c for c in answer.citations if c.source_type == CitationType.GENERATED_VOCABULARY]
+
+    def test_generated_vocabulary_creates_one_evidence_citation(self):
+        plan = _business_plan(generated_vocabulary_evidence=[{
+            "original_term": "clients", "generated_term": "organizations",
+            "source": "generated_vocabulary",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert len(self._generated(answer)) == 1
+
+    def test_citation_preserves_original_and_generated_terms(self):
+        plan = _business_plan(generated_vocabulary_evidence=[{
+            "original_term": "clients", "generated_term": "organizations",
+            "source": "generated_vocabulary",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        citation = self._generated(answer)[0]
+        assert citation.detail == {
+            "original_term": "clients", "generated_term": "organizations",
+            "source": "generated_vocabulary",
+        }
+
+    def test_no_evidence_when_key_absent(self):
+        plan = _business_plan()
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert self._generated(answer) == []
+
+    def test_no_evidence_when_list_is_explicitly_empty(self):
+        plan = _business_plan(generated_vocabulary_evidence=[])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        assert self._generated(answer) == []
+
+    def test_conversational_wording_distinguishes_from_remembered_terminology(self):
+        plan = _business_plan(generated_vocabulary_evidence=[{
+            "original_term": "clients", "generated_term": "organizations",
+            "source": "generated_vocabulary",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        citation = self._generated(answer)[0]
+        assert citation.label == 'Resolved using database vocabulary: "clients" → "organizations"'
+
+    def test_no_governance_jargon_in_label(self):
+        plan = _business_plan(generated_vocabulary_evidence=[{
+            "original_term": "clients", "generated_term": "organizations",
+            "source": "generated_vocabulary",
+        }])
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        citation = self._generated(answer)[0]
+        for banned in ("governance", "auto_approved", "human_approved", "confidence", "tier"):
+            assert banned not in citation.label.lower()
+
+    def test_both_remembered_and_generated_can_coexist_additively(self):
+        plan = _business_plan(
+            remembered_terminology=[{
+                "evidence_type": "remembered_terminology",
+                "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+            }],
+            generated_vocabulary_evidence=[{
+                "original_term": "revenue", "generated_term": "sales amount",
+                "source": "generated_vocabulary",
+            }],
+        )
+        data = _success_data(plan, rows=[{"row_count": 5}])
+        answer = _build_live_query_answer(data)
+        remembered = [c for c in answer.citations if c.source_type == CitationType.REMEMBERED_TERMINOLOGY]
+        generated = self._generated(answer)
+        assert len(remembered) == 1
+        assert len(generated) == 1
+
+    def test_existing_scalar_count_answer_unchanged_when_nothing_generated(self):
+        # Pins TestLiveQueryBusinessValueRendering.test_scalar_count's own
+        # assertions exactly — proves this feature is purely additive.
+        plan = _business_plan(
+            aggregation="COUNT", aggregation_target="entity_count", entity_label="clients",
+            select=[{"table_fqn": "dbo.Client", "column_name": None, "alias": "row_count",
+                     "aggregation": "COUNT", "distinct": False}],
+        )
+        data = _success_data(plan, row_count=1, columns=[{"name": "row_count"}],
+                              rows=[{"row_count": 2218}])
+        answer = _build_live_query_answer(data)
+        assert answer.answer == "There are 2,218 clients in the database."
+        assert answer.actual_value == 2218
+        assert self._generated(answer) == []
+
+
+# ---------------------------------------------------------------------------
 # No-AI guarantee
 # ---------------------------------------------------------------------------
 
@@ -708,70 +1176,3 @@ class TestNoAI:
                 else:
                     continue
                 assert not (names & banned), f"{path} imports {names & banned}"
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator integration + backward compatibility
-# ---------------------------------------------------------------------------
-
-class TestOrchestratorIntegration:
-    def test_registry_has_nineteen_services(self):
-        assert len(ServiceRegistry().get_all()) == 19
-
-    def test_run_enterprise_answer_is_additive_over_process(self):
-        req = OrchestratorRequest(query="show me the dictionary definitions", source_id=None, user_id="u1")
-        orchestrator = EnterpriseOrchestrator()
-        baseline = orchestrator.process(req)
-        enriched = orchestrator.run_enterprise_answer(req)
-
-        assert enriched.total_evidence_items == baseline.total_evidence_items + 1
-        baseline_services = [e.source_service for e in baseline.evidence]
-        enriched_services = [e.source_service for e in enriched.evidence]
-        assert enriched_services[:-1] == baseline_services
-        assert enriched_services[-1] == "enterprise_answer"
-
-        extra = enriched.evidence[-1].data
-        assert "enterprise_answer" in extra
-        assert "execution_strategy" in extra
-
-
-# ---------------------------------------------------------------------------
-# Composer API backward compatibility — calls the real endpoint function
-# ---------------------------------------------------------------------------
-
-class TestComposerBackwardCompatibility:
-    _ORIGINAL_KEYS = {
-        "status", "request_id", "session_id", "business_answer", "resolved_intent",
-        "services_selected", "evidence_summary", "evidence_package",
-        "governance_state", "confidence", "execution_time", "warnings", "errors",
-    }
-
-    def test_response_keeps_all_original_keys_and_adds_two_new_ones(self):
-        from auth.api_key import AuthenticatedUser
-        from api.v1.composer import ComposerRequest, composer_ask
-
-        body = ComposerRequest(session_id="sess-1", message="show me the dictionary")
-        user = AuthenticatedUser(role="user", user_id="u1")
-
-        response = composer_ask(body, user)
-
-        assert self._ORIGINAL_KEYS.issubset(response.keys())
-        assert "enterprise_answer" in response
-        assert "execution_strategy" in response
-        assert response["business_answer"] is not None  # existing field unaffected
-
-    def test_enterprise_answer_present_and_shaped_correctly(self):
-        from auth.api_key import AuthenticatedUser
-        from api.v1.composer import ComposerRequest, composer_ask
-
-        body = ComposerRequest(session_id="sess-2", message="show me the dictionary")
-        user = AuthenticatedUser(role="user", user_id="u1")
-
-        response = composer_ask(body, user)
-
-        assert response["enterprise_answer"] is not None
-        for key in ("answer", "summary", "answer_type", "confidence", "citations",
-                    "recommendations", "follow_up_questions", "next_actions"):
-            assert key in response["enterprise_answer"]
-        assert response["execution_strategy"] is not None
-        assert "strategy_type" in response["execution_strategy"]

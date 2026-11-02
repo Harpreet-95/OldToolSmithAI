@@ -148,6 +148,7 @@ def _patch_deps(
     """Patch _load_source_connection, _governance_recheck, and log_audit_event."""
     _conn = db_conn or _make_db_conn(_make_cursor([], []))
 
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(
         svc, "_load_source_connection",
         lambda sid, uid: (_conn, source_type),
@@ -362,6 +363,7 @@ def test_timeout_returns_timeout_status(monkeypatch):
     cursor.execute.side_effect = _slow_execute
     conn          = _make_db_conn(cursor)
 
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", lambda s, u: (conn, "mssql"))
     monkeypatch.setattr(svc, "_governance_recheck", _no_governance)
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
@@ -378,10 +380,11 @@ def test_timeout_returns_timeout_status(monkeypatch):
 # ===========================================================================
 
 def test_unconfirmed_pii_column_blocks_execution(monkeypatch):
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", lambda s, u: (MagicMock(), "mssql"))
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
 
-    def _pii_blocked(sid, uid, plan):
+    def _pii_blocked(sid, uid, plan, **_kw):
         return (
             ["dbo.orders.customer_email"],
             set(),
@@ -406,11 +409,12 @@ def test_confirmed_pii_values_masked(monkeypatch):
     rows = [(100.0, "alice@example.com"), (200.0, "bob@example.com")]
     cursor = _make_cursor(rows, ["amount", "email"])
     conn   = _make_db_conn(cursor)
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", lambda s, u: (conn, "mssql"))
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
 
     # "email" alias is confirmed PII → must be masked
-    def _pii_confirmed(sid, uid, plan):
+    def _pii_confirmed(sid, uid, plan, **_kw):
         return (
             [],
             {"email"},  # alias set for masking
@@ -491,6 +495,32 @@ def test_no_connection_opened_when_plan_invalid(monkeypatch):
 
 
 # ===========================================================================
+# ── 14b: live_query_enabled=False blocks execution before any connection ────
+# ===========================================================================
+
+def test_live_query_disabled_blocks_execution(monkeypatch):
+    """A connection with live_query_enabled=False must be blocked here the
+    same way core.live.query_engine.LiveQueryEngine.execute() already blocks
+    it via LiveConnectionResolver (see test_live_query_pipeline.py::
+    test_live_query_enabled_false_blocks_execution) — this is the
+    POST /v1/sources/{id}/execute-query path, which previously had no
+    equivalent check and would open a live connection regardless."""
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: False)
+
+    def _should_not_be_called(sid, uid):
+        raise AssertionError("_load_source_connection must not be called when unauthorized")
+
+    monkeypatch.setattr(svc, "_load_source_connection", _should_not_be_called)
+    monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)
+
+    result = execute_generated_query(1, "u1", _gen_result(), _sql_plan())
+
+    assert result["status"] == "governance_block"
+    assert "not enabled" in result["error"].lower()
+    assert result["row_count"] == 0
+
+
+# ===========================================================================
 # ── 15: Value serialization ─────────────────────────────────────────────────
 # ===========================================================================
 
@@ -555,6 +585,7 @@ def test_connection_failure_returns_failed_status(monkeypatch):
     def _fail(sid, uid):
         raise RuntimeError("ODBC driver not found")
 
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", _fail)
     monkeypatch.setattr(svc, "_governance_recheck", _no_governance)
     monkeypatch.setattr(svc, "log_audit_event", _no_op_audit)

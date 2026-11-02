@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 from core.connectors.base import DataSourceConfig
@@ -20,6 +21,10 @@ from core.profiling.models import (
 )
 from core.secrets.manager import get_secret_manager
 from data.db import get_connection
+from data.profiling_snapshot_resolver import (
+    get_latest_profiling_snapshot,
+    get_latest_profiling_snapshot_detail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -439,26 +444,32 @@ def get_column_profiles(
             "SELECT id FROM data_source_connections WHERE id = ? AND user_id = ?",
             (source_id, user_id),
         ).fetchone()
-        if owns is None:
-            return None
+    finally:
+        conn.close()
 
-        snap = conn.execute(
-            "SELECT id FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
-        if snap is None:
-            return {
-                "snapshot_id": None,
-                "source_id":   source_id,
-                "total":       0,
-                "limit":       limit,
-                "offset":      offset,
-                "columns":     [],
-            }
+    if owns is None:
+        return None
 
-        snap_id = snap["id"]
+    # Phase 1A migration: snapshot selection now owned by
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # reproduces the exact query this used to run inline (highest
+    # snapshot_version for source_id, status-independent) — no behavior
+    # change, just removing the duplicated SQL from this call site.
+    snap = get_latest_profiling_snapshot(source_id)
+    if snap is None:
+        return {
+            "snapshot_id": None,
+            "source_id":   source_id,
+            "total":       0,
+            "limit":       limit,
+            "offset":      offset,
+            "columns":     [],
+        }
 
+    snap_id = snap.id
+
+    conn = get_connection()
+    try:
         filters: list[str] = ["profiling_snapshot_id = ?"]
         params:  list      = [snap_id]
 
@@ -581,6 +592,98 @@ def get_column_profile_by_name(
     return dict(row) if row else None
 
 
+def list_table_relevance_signals(source_id: int, user_id: str) -> list[dict] | None:
+    """Executive Report V3 (bounded cold-start discovery) — one cheap,
+    already-persisted row per table from the latest profiling snapshot,
+    carrying exactly the generic signal core.profiling.engine.
+    _score_table_priority already uses to prioritize which tables receive
+    live statistical profiling first (table_class, fk_count,
+    referenced_by_count, has_date_column, pk_column_count, plus name/row-
+    count context) — reused here, read-only, to rank which tables are worth
+    a bounded amount of targeted dictionary/domain/entity preparation before
+    a cold Executive Report. No live query: every column here was populated
+    by STRUCTURAL_ONLY profiling at connect time (schema-derived only).
+
+    Also reports whether each table already has ANY data_dictionary_tables /
+    domain_assignments row, so a caller can skip tables a prior discovery
+    pass (or the legacy full pipeline) already covered — the basis for
+    "partially learned source only fills gaps" (never re-does already-
+    evidenced tables).
+
+    Executive Report V4 (bounded discovery reuse) — also surfaces each
+    table's highest-confidence entity_assignments row, if any
+    (assigned_entity/assigned_entity_confidence/has_entity). entity_
+    assignments can exist WITHOUT a dictionary/domain row: core.analysis.
+    business_map.build_database_business_map already calls data.
+    entity_service.promote_unresolved_entities_via_semantic_contracts before
+    every report, and normal single-question Q&A's own on-demand candidate
+    resolution can promote a table's entity the same way — this is real,
+    already-validated business evidence the report's own discovery ranking
+    (core.analysis.cold_start_discovery) previously never consulted, even
+    though it was sitting right there. Read-only surface of an existing
+    table; not a new discovery/classification mechanism.
+
+    Returns None when source_id does not belong to user_id. Returns an empty
+    list when no profiling snapshot exists yet (e.g. discovery hasn't run —
+    callers should treat this the same as "nothing to rank").
+    """
+    conn = get_connection()
+    try:
+        owns = conn.execute(
+            "SELECT id FROM data_source_connections WHERE id = ? AND user_id = ?",
+            (source_id, user_id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if owns is None:
+        return None
+
+    snap = get_latest_profiling_snapshot(source_id)
+    if snap is None:
+        return []
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                tp.table_fqn, tp.table_name, tp.schema_name, tp.table_type,
+                tp.estimated_row_count, tp.exact_row_count, tp.has_date_column,
+                tp.column_count, tp.pk_column_count, tp.fk_count, tp.referenced_by_count,
+                tp.is_junction_table, tp.is_root_table, tp.table_class,
+                EXISTS(
+                    SELECT 1 FROM data_dictionary_tables ddt
+                    WHERE ddt.source_id = tp.source_id AND ddt.table_fqn = tp.table_fqn
+                ) AS has_dictionary,
+                EXISTS(
+                    SELECT 1 FROM domain_assignments da
+                    WHERE da.source_id = tp.source_id AND da.table_fqn = tp.table_fqn
+                ) AS has_domain,
+                EXISTS(
+                    SELECT 1 FROM entity_assignments ea
+                    WHERE ea.source_id = tp.source_id AND ea.table_fqn = tp.table_fqn
+                ) AS has_entity,
+                (
+                    SELECT ea.entity FROM entity_assignments ea
+                    WHERE ea.source_id = tp.source_id AND ea.table_fqn = tp.table_fqn
+                    ORDER BY ea.confidence DESC LIMIT 1
+                ) AS assigned_entity,
+                (
+                    SELECT ea.confidence FROM entity_assignments ea
+                    WHERE ea.source_id = tp.source_id AND ea.table_fqn = tp.table_fqn
+                    ORDER BY ea.confidence DESC LIMIT 1
+                ) AS assigned_entity_confidence
+            FROM profiling_table_profiles tp
+            WHERE tp.profiling_snapshot_id = ?
+            """,
+            (snap.id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_table_profile_detail(
     source_id: int,
     user_id: str,
@@ -599,19 +702,25 @@ def get_table_profile_detail(
             "SELECT id FROM data_source_connections WHERE id = ? AND user_id = ?",
             (source_id, user_id),
         ).fetchone()
-        if owns is None:
-            return None
+    finally:
+        conn.close()
 
-        snap = conn.execute(
-            "SELECT id FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
-        if snap is None:
-            return {"table": None, "columns": []}
+    if owns is None:
+        return None
 
-        snap_id = snap["id"]
+    # Phase 1B migration: snapshot selection now owned by
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # reproduces the exact query this used to run inline (highest
+    # snapshot_version for source_id, status-independent) — no behavior
+    # change, just removing the duplicated SQL from this call site.
+    snap = get_latest_profiling_snapshot(source_id)
+    if snap is None:
+        return {"table": None, "columns": []}
 
+    snap_id = snap.id
+
+    conn = get_connection()
+    try:
         table_row = conn.execute(
             """
             SELECT
@@ -835,6 +944,50 @@ def start_batch_profiling(
         if mode.upper() == "STRUCTURAL_ONLY"
         else ProfilingMode.FULL
     )
+
+    # ── Cross-snapshot resume ──────────────────────────────────────────────────
+    # A prior batch attempt for this exact (source, schema_snapshot, mode) that
+    # was CANCELLED before reaching every table already has a correct
+    # next_table_index and resumable_state_json. Re-running from index 0 would
+    # silently discard that progress and walk the same deterministic table
+    # order to the same stopping point again. Resume the existing row in place
+    # instead of creating a fresh one. RUNNING snapshots are deliberately left
+    # out of this match — an active RUNNING job is still handled by the
+    # existing_running guard below, so two callers never drive the same
+    # snapshot's next_table_index concurrently.
+    rconn = get_connection()
+    try:
+        resumable = rconn.execute(
+            "SELECT * FROM profiling_snapshots "
+            "WHERE source_id = ? AND schema_snapshot_id = ? AND mode = ? "
+            "AND status = ? "
+            "ORDER BY snapshot_version DESC LIMIT 1",
+            (
+                source_id, schema_snapshot_id, prof_mode.value,
+                ProfilingStatus.CANCELLED.value,
+            ),
+        ).fetchone()
+    finally:
+        rconn.close()
+
+    if resumable is not None and (resumable["next_table_index"] or 0) < (resumable["tables_total"] or 0):
+        rconn = get_connection()
+        try:
+            rconn.execute(
+                "UPDATE profiling_snapshots SET status = ?, cancel_requested = 0 WHERE id = ?",
+                (ProfilingStatus.RUNNING.value, resumable["id"]),
+            )
+            rconn.commit()
+        finally:
+            rconn.close()
+        return ProfilingBatchState(
+            profiling_snapshot_id=resumable["id"],
+            next_table_index=resumable["next_table_index"] or 0,
+            total_tables=resumable["tables_total"] or 0,
+            completed_tables=resumable["tables_profiled"] or 0,
+            status=ProfilingStatus.RUNNING,
+        )
+
     config = ProfilingConfig(
         mode=prof_mode,
         max_tables=max_tables,
@@ -1033,11 +1186,29 @@ def continue_batch_profiling(
         live_conn = batch_connector_cls().open_connection(
             DataSourceConfig(source_type=batch_source_type, params=params)
         )
+        # Enforce ProfilingConfig.timeout_per_table_s (previously defined but
+        # never read — a hanging query, e.g. lock contention on a huge table,
+        # blocked continue_batch_profiling indefinitely with no isolation).
+        # pyodbc's Connection.timeout maps to SQL_ATTR_QUERY_TIMEOUT and raises
+        # pyodbc.Error on expiry instead of hanging; not every DBAPI2 driver
+        # exposes this, so failing to set it is not fatal to the batch.
+        try:
+            live_conn.timeout = ProfilingConfig().timeout_per_table_s
+        except Exception:
+            logger.debug("Connector for source id=%s does not support a query timeout attribute.", source_id)
 
     # ── Profile the batch ──────────────────────────────────────────────────────
+    # Each table is isolated in its own try/except: previously one unhandled
+    # exception anywhere in this loop (a hanging/erroring query, an
+    # unclassifiable value) discarded the ENTIRE batch — next_table_index was
+    # never advanced, the whole request raised as HTTP 500, and the frontend's
+    # polling loop treated that as terminal and stopped, permanently stalling
+    # the run at whatever table triggered it. A single bad table must not
+    # block the other 49 in its batch or any table after it.
     batch_profiles = []
     stat_count = 0
     struct_count = 0
+    failed_count = 0
 
     try:
         for fqn in batch_fqns:
@@ -1048,23 +1219,35 @@ def continue_batch_profiling(
             ref_count = ref_idx.get(fqn, 0)
             tp        = _profile_table_structural(table, source_id, profiling_snapshot_id, ref_count)
 
-            is_stat = (
-                fqn in statistical_fqns
-                and (max_col == 0 or len(table.columns) <= max_col)
-                and (row_limit == 0
-                     or tp.estimated_row_count is None
-                     or tp.estimated_row_count <= row_limit)
-            )
+            try:
+                is_stat = (
+                    fqn in statistical_fqns
+                    and (max_col == 0 or len(table.columns) <= max_col)
+                    and (row_limit == 0
+                         or tp.estimated_row_count is None
+                         or tp.estimated_row_count <= row_limit)
+                )
 
-            if is_stat and live_conn is not None:
-                _run_statistical_pass(live_conn, tp, ProfilingConfig(mode=ProfilingMode.FULL), builder)
-                _classify_table(tp)
-                stat_count += 1
-            else:
-                struct_count += 1
+                if is_stat and live_conn is not None:
+                    _run_statistical_pass(live_conn, tp, ProfilingConfig(mode=ProfilingMode.FULL), builder)
+                    _classify_table(tp)
+                    stat_count += 1
+                else:
+                    _classify_table(tp)
+                    struct_count += 1
 
-            _classify_columns(tp)
-            _enrich_quality_columns(tp)
+                _classify_columns(tp)
+                _enrich_quality_columns(tp)
+            except Exception as exc:
+                logger.warning(
+                    "continue_batch_profiling: table %s failed for source id=%s, "
+                    "recorded FAILED and continuing with the rest of the batch: %s",
+                    fqn, source_id, exc,
+                )
+                tp.profiling_status = ProfilingStatus.FAILED
+                tp.skip_reason = str(exc)[:500]
+                failed_count += 1
+
             batch_profiles.append(tp)
     finally:
         if live_conn is not None:
@@ -1084,6 +1267,7 @@ def continue_batch_profiling(
             """UPDATE profiling_snapshots SET
                 next_table_index   = ?,
                 tables_profiled    = COALESCE(tables_profiled, 0) + ?,
+                tables_failed      = COALESCE(tables_failed, 0) + ?,
                 columns_profiled   = COALESCE(columns_profiled, 0) + ?,
                 pii_columns_found  = COALESCE(pii_columns_found, 0) + ?,
                 classifications_complete = COALESCE(classifications_complete, 0) + ?,
@@ -1091,7 +1275,7 @@ def continue_batch_profiling(
                 completed_at       = CASE WHEN ? = 'COMPLETE' THEN ? ELSE completed_at END
             WHERE id = ?""",
             (
-                new_next, tables_saved, cols_saved, pii_saved, tables_saved,
+                new_next, tables_saved, failed_count, cols_saved, pii_saved, tables_saved,
                 new_status, new_status, now,
                 profiling_snapshot_id,
             ),
@@ -1105,6 +1289,31 @@ def continue_batch_profiling(
         ).fetchone()
     finally:
         iconn.close()
+
+    if is_done:
+        # Automatic downstream semantic refresh — the ONE choke point every
+        # profiling-advance path (scheduler tick via
+        # continue_all_active_profiling_batches, a resumed run, the manual
+        # "continue profiling" API route) already funnels through, so this
+        # covers all of them without touching any caller. Fires exactly once
+        # per snapshot completion: the early return above (status already
+        # COMPLETE/CANCELLED) means this branch is only ever reached on the
+        # RUNNING -> COMPLETE transition itself, never again for the same
+        # snapshot. Best-effort — dictionary/domain/entity/vocabulary
+        # generation failing must never leave profiling itself looking
+        # failed; the lifecycle run's own failure is fully recorded via
+        # metadata_lifecycle_runs regardless.
+        try:
+            from core.lifecycle.models import LifecycleTrigger
+            from core.lifecycle.runner import run_autonomous_lifecycle
+            run_autonomous_lifecycle(
+                source_id, user_id, trigger=LifecycleTrigger.PROFILING_COMPLETE, job_id=None,
+            )
+        except Exception:
+            logger.exception(
+                "continue_batch_profiling: automatic semantic refresh failed for "
+                "source id=%s profiling_snapshot_id=%s", source_id, profiling_snapshot_id,
+            )
 
     # Count statistical vs structural from DB for accurate cumulative totals
     iconn = get_connection()
@@ -1237,6 +1446,128 @@ def get_active_profiling_snapshot(source_id: int, user_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Automatic batch continuation
+#
+# start_batch_profiling/continue_batch_profiling (above) are single-batch
+# primitives originally designed to be driven by a browser tab polling in a
+# loop. That means large schemas only ever finished profiling if a user kept
+# a tab open for the whole run — closing it (or a single batch failing before
+# the per-table isolation added above) left the snapshot stuck RUNNING with
+# nothing left to advance it. The functions below let a source-agnostic
+# caller (a scheduler tick, or a script) drive an existing batch job to
+# completion in bounded, resumable chunks, reusing start_batch_profiling's
+# resume path and continue_batch_profiling's per-table isolation — no new
+# profiling engine, just a driver loop around the existing primitives.
+# ---------------------------------------------------------------------------
+
+def advance_batch_profiling_for_source(
+    source_id: int,
+    user_id: str,
+    profiling_snapshot_id: int | None = None,
+    time_budget_s: float = 45.0,
+) -> ProfilingBatchState | None:
+    """Call continue_batch_profiling repeatedly until COMPLETE/CANCELLED or the
+    time budget is exhausted, whichever comes first.
+
+    Bounded so a single call never blocks indefinitely on a very large
+    schema — call it again (or let the scheduler tick call it again) to keep
+    advancing from wherever it stopped; next_table_index is always persisted
+    after each batch. Returns None if profiling_snapshot_id is not supplied
+    and no RUNNING/PENDING snapshot is active for this source.
+    """
+    if profiling_snapshot_id is None:
+        active = get_active_profiling_snapshot(source_id, user_id)
+        if active is None:
+            return None
+        profiling_snapshot_id = active["profiling_snapshot_id"]
+
+    t0 = time.monotonic()
+    state: ProfilingBatchState | None = None
+    while time.monotonic() - t0 < time_budget_s:
+        state = continue_batch_profiling(source_id, user_id, profiling_snapshot_id)
+        if state is None or state.status in (ProfilingStatus.COMPLETE, ProfilingStatus.CANCELLED):
+            break
+    return state
+
+
+def _sources_with_incomplete_profiling() -> list[dict]:
+    """Return {snapshot_id, source_id, user_id, status, mode} for every
+    source whose latest profiling_snapshots row is RUNNING or CANCELLED with
+    tables still remaining. Used by continue_all_active_profiling_batches to
+    find work each scheduler tick without scanning every source blindly."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT ps.id AS snapshot_id, ps.source_id, ps.status, ps.mode,
+                   ps.next_table_index, ps.tables_total, dsc.user_id
+            FROM profiling_snapshots ps
+            JOIN data_source_connections dsc ON dsc.id = ps.source_id
+            JOIN (
+                SELECT source_id, MAX(snapshot_version) AS max_v
+                FROM profiling_snapshots
+                GROUP BY source_id
+            ) latest ON latest.source_id = ps.source_id AND latest.max_v = ps.snapshot_version
+            WHERE ps.status IN (?, ?) AND dsc.is_active = 1
+            """,
+            (ProfilingStatus.RUNNING.value, ProfilingStatus.CANCELLED.value),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [
+        dict(r) for r in rows
+        if (r["next_table_index"] or 0) < (r["tables_total"] or 0)
+    ]
+
+
+def continue_all_active_profiling_batches(time_budget_s: float = 45.0) -> list[dict]:
+    """Advance every source's in-progress or stalled-but-resumable batch
+    profiling job by one bounded tick each. Intended to be called
+    periodically (see api/app.py scheduler wiring) so a large schema reaches
+    full coverage automatically without a browser tab driving it, and so a
+    batch stalled by a since-fixed transient error (network blip, connector
+    hiccup) is retried on the next tick rather than sitting CANCELLED
+    forever. Never raises — a failure advancing one source is logged and
+    does not block the others.
+    """
+    summaries: list[dict] = []
+    for src in _sources_with_incomplete_profiling():
+        source_id = src["source_id"]
+        user_id = src["user_id"]
+        try:
+            if src["status"] == ProfilingStatus.CANCELLED.value:
+                # Route through start_batch_profiling so its resume path
+                # flips the existing snapshot back to RUNNING in place
+                # rather than continue_batch_profiling being called on a
+                # snapshot still marked CANCELLED (which is a no-op).
+                resumed = start_batch_profiling(source_id, user_id, mode=src["mode"])
+                if resumed is None:
+                    continue
+                snapshot_id = resumed.profiling_snapshot_id
+            else:
+                snapshot_id = src["snapshot_id"]
+
+            state = advance_batch_profiling_for_source(
+                source_id, user_id, snapshot_id, time_budget_s=time_budget_s,
+            )
+            if state is not None:
+                summaries.append({
+                    "source_id": source_id,
+                    "profiling_snapshot_id": state.profiling_snapshot_id,
+                    "next_table_index": state.next_table_index,
+                    "total_tables": state.total_tables,
+                    "status": state.status.value,
+                })
+        except Exception:
+            logger.exception(
+                "continue_all_active_profiling_batches: failed to advance source id=%s",
+                source_id,
+            )
+    return summaries
+
+
+# ---------------------------------------------------------------------------
 # Profile Review Tasks
 # ---------------------------------------------------------------------------
 
@@ -1301,6 +1632,68 @@ def _review_summary(tasks: list[dict]) -> dict:
     }
 
 
+def list_pii_classifications(source_id: int, user_id: str) -> dict | None:
+    """Full PII classification inventory for the PII admin view (Part 21):
+    every column the name/type heuristic ever flagged, with its current
+    classification/confidence/evidence/source/override state and the
+    resulting policy effect (BLOCKED/MASKED/ALLOWED — mirrors
+    data.query_execution_service._governance_recheck's own gate, not
+    re-derived logic). Returns None if source_id is not owned by user_id.
+    """
+    conn = get_connection()
+    try:
+        owns = conn.execute(
+            "SELECT id FROM data_source_connections WHERE id = ? AND user_id = ?",
+            (source_id, user_id),
+        ).fetchone()
+        if owns is None:
+            return None
+
+        detail = get_latest_profiling_snapshot_detail(source_id)
+        if detail is None:
+            return {"columns": [], "total_count": 0}
+
+        rows = conn.execute(
+            """SELECT pcp.table_fqn, pcp.column_name, ptp.table_name, ptp.schema_name,
+                      pcp.pii_confirmed, pcp.pii_classification,
+                      pcp.pii_classification_confidence, pcp.pii_classification_evidence,
+                      pcp.pii_classification_source, pcp.pii_classified_at,
+                      pcp.pii_manual_override
+               FROM profiling_column_profiles pcp
+               JOIN profiling_table_profiles ptp
+                 ON ptp.profiling_snapshot_id = pcp.profiling_snapshot_id
+                AND ptp.table_fqn = pcp.table_fqn
+               WHERE pcp.profiling_snapshot_id = ? AND pcp.pii_name_heuristic = 1
+               ORDER BY ptp.table_name, pcp.column_name""",
+            (detail.id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    columns = []
+    for r in rows:
+        if r["pii_confirmed"]:
+            policy_effect = "MASKED"
+        elif r["pii_classification"] == "CONFIRMED_NON_PII":
+            policy_effect = "ALLOWED"
+        else:
+            policy_effect = "BLOCKED"
+        columns.append({
+            "table_fqn":    r["table_fqn"],
+            "table_name":   r["table_name"],
+            "schema_name":  r["schema_name"],
+            "column_name":  r["column_name"],
+            "classification":       r["pii_classification"] or "UNCLASSIFIED",
+            "confidence":           r["pii_classification_confidence"],
+            "evidence":             r["pii_classification_evidence"],
+            "classification_source": r["pii_classification_source"],
+            "classified_at":        r["pii_classified_at"],
+            "manual_override":      bool(r["pii_manual_override"]),
+            "policy_effect":        policy_effect,
+        })
+    return {"columns": columns, "total_count": len(columns)}
+
+
 def get_profile_review_tasks(
     source_id: int,
     user_id: str,
@@ -1324,31 +1717,50 @@ def get_profile_review_tasks(
         if owns is None:
             return None
 
-        snap = conn.execute(
-            "SELECT id, created_at FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
-        if snap is None:
+        # Phase 1F.1 migration: snapshot selection now owned by
+        # data.profiling_snapshot_resolver.get_latest_profiling_snapshot_detail,
+        # which reproduces the exact query this used to run inline (highest
+        # snapshot_version for source_id, status-independent) — no behavior
+        # change, just removing the duplicated SQL from this call site.
+        detail = get_latest_profiling_snapshot_detail(source_id)
+        if detail is None:
             return {"tasks": [], "summary": _review_summary([]), "total_count": 0}
 
-        snap_id: int = snap["id"]
-        snap_ts: str = snap["created_at"] or ""
+        snap_id: int = detail.id
+        snap_ts: str = detail.created_at or ""
         tasks: list[dict] = []
 
         # ── 1. PII detected but not confirmed (CRITICAL) ─────────────────────
+        # Autonomous classification (data.pii_classification_service) already
+        # resolves the unambiguous cases: CONFIRMED_PII sets pii_confirmed=1
+        # (excluded by the WHERE below) and CONFIRMED_NON_PII/manual clears
+        # are excluded via pii_manual_override — what remains here is
+        # genuinely UNCERTAIN evidence (or not-yet-classified legacy rows),
+        # i.e. exactly the cases the milestone brief says must fail
+        # conservatively rather than auto-resolve.
         rows = conn.execute(
-            """SELECT pcp.table_fqn, pcp.column_name, ptp.table_name, ptp.schema_name
+            """SELECT pcp.table_fqn, pcp.column_name, ptp.table_name, ptp.schema_name,
+                      pcp.pii_classification, pcp.pii_classification_confidence,
+                      pcp.pii_classification_evidence
                FROM profiling_column_profiles pcp
                JOIN profiling_table_profiles ptp
                  ON ptp.profiling_snapshot_id = pcp.profiling_snapshot_id
                 AND ptp.table_fqn = pcp.table_fqn
                WHERE pcp.profiling_snapshot_id = ?
                  AND pcp.pii_name_heuristic = 1
-                 AND pcp.pii_confirmed = 0""",
+                 AND pcp.pii_confirmed = 0
+                 AND COALESCE(pcp.pii_manual_override, 0) = 0""",
             (snap_id,),
         ).fetchall()
         for r in rows:
+            if r["pii_classification_evidence"]:
+                reason = (
+                    f"PII signals detected but classification is uncertain "
+                    f"(confidence {r['pii_classification_confidence']:.2f}): "
+                    f"{r['pii_classification_evidence']}. Needs human review."
+                )
+            else:
+                reason = "PII signals detected by heuristic but not yet confirmed by a human reviewer."
             tasks.append(_make_review_task(
                 task_type="Review PII Classification",
                 asset_type="column",
@@ -1357,7 +1769,7 @@ def get_profile_review_tasks(
                 table_name=r["table_name"],
                 schema_name=r["schema_name"],
                 column_name=r["column_name"],
-                reason="PII signals detected by heuristic but not yet confirmed by a human reviewer.",
+                reason=reason,
                 severity="CRITICAL",
                 nav_target={"tab": "profile", "table_fqn": r["table_fqn"], "column_name": r["column_name"]},
                 created_at=snap_ts,

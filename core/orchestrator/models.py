@@ -19,6 +19,12 @@ class IntentType(str, Enum):
     KNOWLEDGE_GRAPH    = "knowledge_graph"
     REPORTS            = "reports"
     REPORT_GENERATION  = "report_generation"
+    # Data Analyst Agent V1 — open-ended analytical/investigative requests
+    # ("analyze enrollment performance", "why did X change", "give me
+    # insights"), distinct from REPORT_GENERATION's fixed-KPI-slate report
+    # requests. Routes to core.analysis.data_analyst_agent, never to
+    # SQL_REQUEST's single-answer path.
+    BUSINESS_ANALYSIS  = "business_analysis"
     SQL_REQUEST        = "sql_request"
     WORKFLOW           = "workflow"
     REVIEW             = "review"

@@ -37,7 +37,8 @@ except ImportError:
 _ALLOWED_KEYS = frozenset({
     "entities", "measures", "dimensions", "filters", "date_range",
     "sorting", "requested_attributes", "relationship_intent",
-    "expected_result_shape", "clarification_required", "clarification_reason",
+    "relationship_semantics", "expected_result_shape",
+    "clarification_required", "clarification_reason",
 })
 
 _ALLOWED_RESULT_SHAPES = frozenset({"list", "detail", "count", "aggregate", "unknown"})
@@ -45,6 +46,46 @@ _ALLOWED_RELATIONSHIP_INTENTS = frozenset({
     "single_entity", "list_with_related", "scoped_count", "scoped_aggregate",
 })
 _ALLOWED_SORT_DIRECTIONS = frozenset({"asc", "desc"})
+
+# Step 5 — generic relationship_intent normalization.
+#
+# Live-confirmed failure (smoke test, "top 10 clients by revenue last
+# quarter compared to the previous quarter"): the model returned
+# relationship_intent="list" — a valid expected_result_shape value, but not
+# a valid relationship_intent value — and the WHOLE interpretation was
+# discarded even though every other field was correct. Root cause is
+# generic, not specific to that one question: relationship_intent and
+# expected_result_shape share overlapping vocabulary ("list"/"count"/
+# "aggregate"), and any executive question whose surface phrasing leans on
+# that shared vocabulary (ranking, plain lists, grouped/aggregate questions
+# with no explicit second entity) can trigger the same confusion — verified
+# by the parametrized alias tests below, not just the one triggering
+# question.
+#
+# This is a closed, deterministic alias table — not a fuzzy/permissive
+# change. A value not in this table (or in _ALLOWED_RELATIONSHIP_INTENTS)
+# still fails closed exactly as before; validation strictness is unchanged,
+# only its vocabulary tolerance is widened to match what the model's own
+# prompt vocabulary can plausibly produce. Same "harden the contract against
+# the model's own observed output" pattern as _enforce_count_language_rule
+# below (a correction of the model's output, not a new AI call).
+_RELATIONSHIP_INTENT_ALIASES: dict[str, str] = {
+    # expected_result_shape vocabulary bleeding into this field — the
+    # observed failure mode. A plain ranked/grouped/detail list of one
+    # entity, with no second related entity named, is "single_entity".
+    "list": "single_entity",
+    "detail": "single_entity",
+    "unknown": "single_entity",
+    # Ranking/grouping/comparison phrasing the model sometimes names
+    # directly instead of picking one of the four canonical values.
+    "ranking": "single_entity",
+    "ranked_list": "single_entity",
+    "grouped": "single_entity",
+    "grouped_aggregate": "scoped_aggregate",
+    "comparison": "scoped_aggregate",
+    "aggregate": "scoped_aggregate",
+    "count": "scoped_count",
+}
 
 # Day 1 rule 3 — "The model must not generate SQL or physical identifiers."
 # Any business-term string containing SQL vocabulary, statement punctuation,
@@ -83,6 +124,15 @@ class AIQuestionInterpretation:
     sorting: dict[str, Any] | None = None
     requested_attributes: tuple[str, ...] = ()
     relationship_intent: str | None = None
+    # AI Physical Planner Coverage Expansion, Part F — a word that describes
+    # HOW two entities relate ("enrolled", "assigned", "registered"), as
+    # distinct from a requested output column. Only meaningful alongside
+    # relationship_intent="list_with_related"; never a physical join
+    # condition or column name (same "business term, not identifier"
+    # contract as every other field here). Used by the physical planner as
+    # evidence for CHOOSING among real schema relationship-path candidates
+    # between the named entities, never as an output attribute itself.
+    relationship_semantics: tuple[str, ...] = ()
     expected_result_shape: str = "unknown"
     clarification_required: bool = False
     clarification_reason: str | None = None
@@ -102,8 +152,9 @@ Return ONLY a JSON object with these keys (omit a key entirely if it does not ap
   "filters": [{"attribute": "<business attribute>", "operator": "<=, !=, >, <, contains, between>", "value": "<business value, e.g. 'active', 'Northeast'>"}],
   "date_range": {"label": "<e.g. 'this year', 'this quarter'>", "grain": "<year|quarter|month|week|day>"},
   "sorting": {"by": "<business attribute or measure>", "direction": "asc|desc", "limit": <integer or null>},
-  "requested_attributes": ["<specific business fields the user wants shown>"],
-  "relationship_intent": "<one of: single_entity, list_with_related, scoped_count, scoped_aggregate>",
+  "requested_attributes": ["<specific business fields the user wants shown, e.g. 'email', 'phone' — never a word that only describes HOW two entities relate>"],
+  "relationship_intent": "<one of exactly: single_entity, list_with_related, scoped_count, scoped_aggregate — use single_entity for a ranking, grouping, or plain-list question about ONE business object with no second related object named; list_with_related only when a second, distinct related object is explicitly part of the answer>",
+  "relationship_semantics": ["<only when relationship_intent is list_with_related: a VERB or PARTICIPLE (often ending in -ed/-ing) describing the ACTION that connects the two entities, e.g. 'enrolled' in 'students and their ENROLLED classes', 'assigned' in 'instructors and their ASSIGNED classes'. NEVER a noun naming a thing to show — a noun (e.g. 'accounts', 'details', 'email') always belongs in requested_attributes instead, never here, even when it appears right next to one of the entity words.>"],
   "expected_result_shape": "<one of: list, detail, count, aggregate, unknown>",
   "clarification_required": <true|false>,
   "clarification_reason": "<short reason, only if clarification_required is true>"
@@ -127,6 +178,11 @@ Strict rules:
   number", "distinct count"). A plain list/show/display/return request is "list"/ \
   "list_with_related" even when it also carries a status filter — a filter narrows WHICH \
   rows come back, it never turns a list request into a count.
+- A word that only describes HOW two named entities relate (e.g. "enrolled" in "students \
+  and their enrolled classes", "assigned" in "instructors and their assigned classes") goes \
+  in relationship_semantics, never in requested_attributes and never treated as a third \
+  entity. requested_attributes is reserved for an actual output FIELD the user wants shown \
+  (e.g. "student email", "class location").
 
 Examples:
 Question: "Active invoices"
@@ -144,6 +200,48 @@ Question: "List open job orders"
   "relationship_intent": "single_entity",
   "expected_result_shape": "list"
 }
+
+Question: "Top 10 clients by revenue last quarter compared to the previous quarter"
+{
+  "entities": ["client"],
+  "measures": ["revenue"],
+  "date_range": {"label": "last quarter", "grain": "quarter"},
+  "sorting": {"by": "revenue", "direction": "desc", "limit": 10},
+  "relationship_intent": "single_entity",
+  "expected_result_shape": "list"
+}
+
+Question: "Placements grouped by recruiter"
+{
+  "entities": ["placement"],
+  "dimensions": ["recruiter"],
+  "relationship_intent": "single_entity",
+  "expected_result_shape": "list"
+}
+
+Question: "Which clients have open job orders?"
+{
+  "entities": ["client", "job order"],
+  "filters": [{"attribute": "status", "operator": "=", "value": "open"}],
+  "relationship_intent": "list_with_related",
+  "expected_result_shape": "list"
+}
+
+Question: "Show students and their enrolled classes"
+{
+  "entities": ["student", "class"],
+  "relationship_intent": "list_with_related",
+  "relationship_semantics": ["enrolled"],
+  "expected_result_shape": "list"
+}
+
+Question: "Show students and their user accounts"
+{
+  "entities": ["student", "user"],
+  "requested_attributes": ["account"],
+  "relationship_intent": "list_with_related",
+  "expected_result_shape": "list"
+}
 """
 
 
@@ -159,6 +257,51 @@ def _build_user_prompt(question: str, known_vocabulary: dict[str, list[str]] | N
             lines.append(f"- Known entities: {', '.join(entities_hint[:_MAX_LIST_ITEMS])}")
         if domains_hint:
             lines.append(f"- Known business domains: {', '.join(domains_hint[:_MAX_LIST_ITEMS])}")
+
+    # Ranking Semantics Completion milestone, Part 13 (ORIGINAL design,
+    # SUPERSEDED below) — the connection-time Business Learning Layer's
+    # preliminary map (core.orchestrator.business_learning) used to be
+    # rendered here as a separately-labeled UNVALIDATED prompt section.
+    #
+    # Business Learning Trust Hardening milestone — the preliminary map is
+    # now NEVER rendered into the interpreter's prompt at all, in any form
+    # (not candidate_measures, not major_entities, not even a single generic
+    # `likely_domain` phrase). This was arrived at in three steps, each
+    # live-tested against Fixture A/C/E: (1) dropping candidate_measures
+    # alone fixed the exact live-reproduced Section O#2 mechanism ("Which
+    # account has the highest total order amount?" summing the wrong-but-
+    # real Invoices.Amount instead of Orders.TotalAmount) in isolation, but
+    # (2) this milestone's own regression testing then showed major_entities
+    # ALONE reproduces the SAME class of defect plus the independent O#1
+    # WHERE-filter-drop defect ("How many enterprise accounts are there?"
+    # losing its WHERE AccountTier='Enterprise' filter). (3) Stripping to
+    # ONLY `likely_domain` (one short, non-enumerable descriptive phrase,
+    # e.g. "commerce") still reproduced BOTH failures — the Invoices-over-
+    # Orders measure pick persisted, and the filter question moved from
+    # "wrong answer" to "safe refusal" rather than "correct" — even though
+    # a bare domain phrase has no lexical connection to "Invoices" or
+    # "AccountTier" at all. That result shows the mechanism is not really
+    # about the SPECIFIC business content of the hint: merely inserting any
+    # extra "UNVALIDATED hint" prompt block measurably destabilizes the
+    # LLM's response on these already-borderline disambiguations (two real
+    # "amount" columns on different tables; an implicit categorical filter
+    # requiring extra investigation). Since no smaller footprint reliably
+    # closed the gap, and this architecture's own principle is that a
+    # preliminary hint must NEVER be able to change a final measure/filter/
+    # dimension decision, the robust, verifiable choice is to stop injecting
+    # it into question-time interpretation entirely. Business Learning's
+    # other outputs remain fully intact and useful: the persisted
+    # preliminary_business_map itself (operator-facing), the connect-time
+    # BusinessLearningTrace (Part 21 observability), and the provenance-
+    # tagged dictionary/entity/domain rows ensure_business_evidence writes
+    # (still real, still speed up on-demand generation by pre-populating a
+    # bounded set of tables — see data.query_planning_service.
+    # _dictionary_is_preliminary and data.entity_service.get_entity_summary's
+    # exclude_preliminary for how those stay non-definitive elsewhere).
+    # Honestly reported in Part 13/17 of the trust-hardening report: this
+    # closes off Business Learning's only current live question-answering
+    # channel, so its measured live usefulness for Q&A itself is now ~zero —
+    # WRONG=0 dominates per this milestone's own Part 21 GO criteria.
     return "\n".join(lines)
 
 
@@ -171,11 +314,24 @@ def build_grounding_vocabulary(source_id: int, user_id: str) -> dict[str, list[s
     (unowned source, no assignments generated yet, etc.) so a missing
     grounding signal never blocks interpretation.
     """
+    # Business Learning Trust Hardening milestone — exclude_preliminary=True
+    # on both lookups below. This "known business vocabulary — prefer these
+    # terms when they match" block is rendered with no caveat at all (unlike
+    # the separately-labeled UNVALIDATED preliminary_business_map block
+    # further down), so it must only ever contain entity/domain assignments
+    # generated through the normal on-demand path (or human-approved), never
+    # an unverified guess written by core.orchestrator.business_learning's
+    # blind, pre-question connect-time discovery pass. Live-confirmed this
+    # mattered: that pass's own entity_assignments rows, when included here
+    # unlabeled, measurably suppressed the qualifier-resolution investigation
+    # that a WHERE-filter-bearing question (e.g. "enterprise accounts")
+    # otherwise correctly triggers under a fresh connection with no prior
+    # vocabulary at all.
     entities: list[str] = []
     domains: list[str] = []
     try:
         from data.entity_service import get_entity_summary
-        summary = get_entity_summary(source_id=source_id, user_id=user_id)
+        summary = get_entity_summary(source_id=source_id, user_id=user_id, exclude_preliminary=True)
         if summary:
             entities = [
                 name for name in (summary.get("entity_counts") or {}).keys()
@@ -186,7 +342,7 @@ def build_grounding_vocabulary(source_id: int, user_id: str) -> dict[str, list[s
 
     try:
         from data.domain_service import get_domain_summary
-        summary = get_domain_summary(source_id=source_id, user_id=user_id)
+        summary = get_domain_summary(source_id=source_id, user_id=user_id, exclude_preliminary=True)
         if summary:
             domains = [
                 name for name in (summary.get("domain_counts") or {}).keys()
@@ -195,7 +351,17 @@ def build_grounding_vocabulary(source_id: int, user_id: str) -> dict[str, list[s
     except Exception:  # noqa: BLE001
         logger.debug("AI interpreter: domain vocabulary lookup failed", exc_info=True)
 
-    return {"entities": entities, "domains": domains}
+    preliminary_business_map: dict = {}
+    try:
+        from data.datasource_service import get_preliminary_business_map
+        preliminary_business_map = get_preliminary_business_map(source_id, user_id) or {}
+    except Exception:  # noqa: BLE001
+        logger.debug("AI interpreter: preliminary business map lookup failed", exc_info=True)
+
+    return {
+        "entities": entities, "domains": domains,
+        "preliminary_business_map": preliminary_business_map,
+    }
 
 
 def _clean_term(value: Any) -> str | None:
@@ -287,8 +453,12 @@ def _validate(raw: dict[str, Any]) -> AIQuestionInterpretation:
 
     relationship_intent = raw.get("relationship_intent")
     if relationship_intent is not None:
-        if not isinstance(relationship_intent, str) or relationship_intent not in _ALLOWED_RELATIONSHIP_INTENTS:
+        if not isinstance(relationship_intent, str):
             raise SchemaViolation(f"invalid relationship_intent: {relationship_intent!r}")
+        if relationship_intent not in _ALLOWED_RELATIONSHIP_INTENTS:
+            relationship_intent = _RELATIONSHIP_INTENT_ALIASES.get(relationship_intent)
+            if relationship_intent is None:
+                raise SchemaViolation(f"invalid relationship_intent: {raw.get('relationship_intent')!r}")
 
     expected_shape = raw.get("expected_result_shape", "unknown")
     if not isinstance(expected_shape, str) or expected_shape not in _ALLOWED_RESULT_SHAPES:
@@ -311,6 +481,7 @@ def _validate(raw: dict[str, Any]) -> AIQuestionInterpretation:
         sorting=_clean_sorting(raw.get("sorting")),
         requested_attributes=_clean_term_list(raw.get("requested_attributes")),
         relationship_intent=relationship_intent,
+        relationship_semantics=_clean_term_list(raw.get("relationship_semantics")),
         expected_result_shape=expected_shape,
         clarification_required=clarification_required,
         clarification_reason=clarification_reason,

@@ -4,16 +4,22 @@ Safe Read-Only Query Execution Service — Program 3 Phase 6.1.
 Executes SQL produced by generate_sql() against connected data sources.
 Every execution path enforces:
   1. Pre-execution safety gate  — validates sql_result flags and SQL structure.
-  2. Governance re-check        — blocks unconfirmed PII; marks confirmed PII for masking.
+  2. Governance re-check        — blocks restricted-category columns (credentials/
+                                   secrets/government-ID/payment); ordinary business
+                                   identity/contact PII is queryable, unmasked, by any
+                                   authorized user (2026-08-24 policy — see
+                                   core.governance.pii_access_policy).
   3. Row cap via fetchmany      — never fetchall; default 1 000, max 5 000.
   4. Thread timeout             — closes connection if query exceeds DEFAULT_QUERY_TIMEOUT_S.
-  5. PII masking                — confirmed PII column values replaced with "***".
-  6. Audit logging              — records execution event; never logs raw SQL or values.
+  5. Audit logging              — records execution event; never logs raw SQL or values.
 
 This module does NOT:
   - Accept raw SQL from callers.
   - Execute write statements.
-  - Return unmasked confirmed PII values.
+  - Return a restricted-category (credential/secret) column's values.
+  - Reconstruct, infer, or otherwise circumvent masking already applied by the
+    connected database itself — a database-masked value is returned exactly as
+    the database returned it.
   - Create the query_execution_log table (Phase 6.2).
 """
 
@@ -29,6 +35,8 @@ from datetime import date, datetime, timedelta, timezone
 import core.connectors.registry as _registry
 from core.connectors.base import DataSourceConfig
 from core.secrets.manager import get_secret_manager
+from core.config import APP_ENV
+from core.security.encryption import decrypt, encrypt
 from data.audit import log_audit_event
 from data.business_knowledge_service import get_column_business_contexts_batch
 from data.db import get_connection
@@ -48,7 +56,7 @@ MAX_ROW_LIMIT: int = 5_000
 # ---------------------------------------------------------------------------
 
 RATE_LIMIT_WINDOW_S: int      = 2     # minimum seconds between per-user executions
-DAILY_LIMIT: int              = 500   # max execution attempts per user per UTC day
+DAILY_LIMIT: int              = 1_000_000 if APP_ENV == "development" else 500  # per-user/UTC-day cap; disabled in local dev (APP_ENV) — prod stays 500
 SOURCE_RATE_PER_MINUTE: int   = 60    # max executions per source per 60-second window
 REPEATED_QUERY_WINDOW_S: int  = 300   # look-back window (seconds) for repeated-query detection
 REPEATED_QUERY_THRESHOLD: int = 3     # inclusive count at which the warning fires
@@ -139,14 +147,38 @@ def _governance_recheck(
     source_id: int,
     user_id: str,
     sql_plan: dict,
+    *,
+    user_role: str = "user",
 ) -> tuple[list[str], set[str], list[dict]]:
     """Re-check PII and approval state for every selected column.
 
+    2026-08-24 "remove standard-PII blocking for live SQL" milestone —
+    core.governance.pii_access_policy.decide_pii_access no longer varies by
+    who is asking: ordinary business identity/contact data (names, emails,
+    phone numbers, addresses, ...) is queryable, unmasked, by any authorized
+    ToolSmithAI user. Only the restricted category (credentials/secrets/
+    government-ID/payment — core.dictionary.pii_detector.
+    is_restricted_category) is still blocked, for every requester, with no
+    override. user_role is still accepted and threaded through to
+    _write_pii_access_audit purely for audit-trail purposes (who accessed
+    what) — it no longer affects the access decision itself; do not
+    reintroduce a role/ownership check into decide_pii_access to solve a
+    future problem (see that module's own docstring).
+
     Returns:
-      blocked_cols   — list of "table_fqn.column_name" strings for unconfirmed PII
-      pii_aliases    — set of alias names (lowercased) whose values must be masked
+      blocked_cols   — list of "table_fqn.column_name" strings blocked
+                       (restricted-category columns only)
+      pii_aliases    — set of alias names (lowercased) whose values must be
+                       masked. Always empty under the current policy (no
+                       column both reaches ALLOW-with-masking and BLOCK no
+                       longer has a masked middle ground) — kept as part of
+                       the return shape for every existing caller
+                       (LiveQueryEngine.execute(pii_aliases=...)) rather than
+                       changing this function's signature.
       warnings       — warning dicts to surface to the caller
     """
+    from core.governance.pii_access_policy import ALLOW, BLOCK, decide_pii_access
+
     blocked_cols: list[str] = []
     pii_aliases:  set[str]  = set()
     warnings:     list[dict] = []
@@ -190,38 +222,52 @@ def _governance_recheck(
         )
 
         if pii_flagged:
-            confirmed   = bool(prof and prof.get("pii_confirmed"))
-            aggregation = sel.get("aggregation")
-            if aggregation:
-                # COUNT/SUM/AVG etc. emit a derived number — not the raw cell value.
-                # PII on the source column does not apply to the aggregate result.
-                warnings.append({
-                    "type":     "pii_aggregated",
-                    "severity": "LOW",
-                    "message":  (
-                        f"{table_fqn}.{column_name} has a PII flag but is "
-                        f"aggregated ({aggregation}) — no raw values are returned."
-                    ),
-                })
-            elif confirmed:
-                pii_aliases.add(alias)
-                warnings.append({
-                    "type":     "pii_masked",
-                    "severity": "MEDIUM",
-                    "message":  (
-                        f"{table_fqn}.{column_name} is confirmed PII — "
-                        "returned values are masked."
-                    ),
-                })
-            else:
+            confirmed      = bool(prof and prof.get("pii_confirmed"))
+            classification = prof.get("pii_classification") if prof else None
+            aggregation    = sel.get("aggregation")
+
+            decision = decide_pii_access(
+                table_fqn=table_fqn,
+                column_name=column_name,
+                classification=classification,
+                confirmed=confirmed,
+                aggregation=aggregation,
+            )
+
+            if decision.action == ALLOW:
+                if decision.policy == "pii.confirmed_non_pii":
+                    warnings.append({
+                        "type":     "pii_cleared",
+                        "severity": "LOW",
+                        "message":  (
+                            f"{table_fqn}.{column_name} matched a PII name pattern but was "
+                            "classified/confirmed non-PII — returned unmasked."
+                        ),
+                    })
+                elif decision.policy == "pii.aggregate_exempt":
+                    warnings.append({
+                        "type":     "pii_aggregated",
+                        "severity": "LOW",
+                        "message":  (
+                            f"{table_fqn}.{column_name} has a PII flag but is "
+                            f"aggregated ({aggregation}) — no raw values are returned."
+                        ),
+                    })
+                else:  # pii.standard_identity_allow / pii.standard_identity_allow_unclassified
+                    warnings.append({
+                        "type":     "pii_standard_access",
+                        "severity": "LOW",
+                        "message":  (
+                            f"{table_fqn}.{column_name} is standard business identity/contact "
+                            "data — returned unmasked under the current product access policy."
+                        ),
+                    })
+            else:  # BLOCK — restricted category only under the current policy
                 blocked_cols.append(f"{table_fqn}.{column_name}")
                 warnings.append({
-                    "type":     "pii_blocked",
+                    "type":     "pii_restricted",
                     "severity": "HIGH",
-                    "message":  (
-                        f"{table_fqn}.{column_name} has unconfirmed PII — "
-                        "column blocked from execution."
-                    ),
+                    "message":  f"{table_fqn}.{column_name} is a restricted category — column blocked.",
                 })
 
         if not (dic and dic.get("is_approved")):
@@ -253,23 +299,46 @@ def execute_governed_query(
     execution_kind: str = "user_query",
     existing_connection: object = None,
     connection_box: "dict | None" = None,
+    user_role: str = "user",
+    ai_planning_trace: "dict | None" = None,
 ):
     """The one governed entry point for executing SQL derived from a
     business question (chat, execute-query REST route, and every
     context_builder._live_query branch).
+
+    user_role — the requester's role, threaded through to
+    _write_pii_access_audit for the audit trail only (2026-08-24 "remove
+    standard-PII blocking" milestone: core.governance.pii_access_policy.
+    decide_pii_access no longer varies by role — see that module's own
+    docstring). Defaults to "user" for every caller that omits it; this has
+    no effect on which columns are blocked or returned unmasked, only on
+    what gets recorded as "who ran this."
 
     existing_connection/connection_box (Day 4, Capability 6, Task 4) —
     passed straight through to LiveQueryEngine.execute(); see its own
     docstring. Every existing caller that omits them gets byte-identical
     behavior to before these parameters existed.
 
-    Runs _governance_recheck and enforces both halves of its result before
-    any row is returned: unconfirmed PII (blocked_cols) blocks execution
-    outright; confirmed PII (pii_aliases) is passed through to
-    LiveQueryEngine.execute() for masking. No caller should call
+    ai_planning_trace (RETIRE-LEGACY-FALLBACK MILESTONE, Part 17) —
+    optional caller-supplied summary of which planner/AI stages actually
+    ran for this question (core.orchestrator.agent's AgentState fields,
+    e.g. {"question_interpreter": bool, "physical_planner_attempted": bool,
+    "physical_planner_valid": bool, "candidate_adjudicator": bool,
+    "legacy_semantic_planner": bool, ...}), forwarded unchanged into
+    build_pipeline_trace()'s ai_used= parameter below so the persisted
+    trace can finally show which architecture answered a question — it
+    could not before, since no caller ever passed this. Every existing
+    caller that omits it gets byte-identical behavior to before this
+    parameter existed (build_pipeline_trace treats ai_used=None as
+    "unknown", not "false").
+
+    Runs _governance_recheck and enforces its result before any row is
+    returned: a restricted-category column (blocked_cols — credentials/
+    secrets/government-ID/payment; see core.dictionary.pii_detector.
+    is_restricted_category) blocks execution outright. Ordinary business
+    identity/contact PII is never blocked or masked. No caller should call
     LiveQueryEngine.execute() directly with SQL derived from an NL question
-    — doing so would apply masking but silently skip the unconfirmed-PII
-    block.
+    — doing so would silently skip the restricted-category block.
 
     Returns (query_result, governance_warnings) — governance_warnings is the
     structured {"type", "severity", "message"} list from _governance_recheck.
@@ -289,7 +358,7 @@ def execute_governed_query(
 
     with stage_timer.measure("governance_pii_recheck"):
         blocked_cols, pii_aliases, gov_warnings = _governance_recheck(
-            source_id, user_id, sql_plan
+            source_id, user_id, sql_plan, user_role=user_role,
         )
 
     if blocked_cols:
@@ -306,9 +375,11 @@ def execute_governed_query(
             executed_at=started_at.isoformat(),
             duration_ms=0,
             warnings=[w["message"] for w in gov_warnings],
-            error=f"Blocked: unconfirmed PII column(s): {', '.join(blocked_cols)}",
+            error=f"Blocked: restricted-category column(s): {', '.join(blocked_cols)}",
         )
         return blocked_result, gov_warnings
+
+    _write_pii_access_audit(user_id, source_id, user_role, gov_warnings)
 
     result = LiveQueryEngine().execute(
         source_id, user_id, sql,
@@ -324,8 +395,14 @@ def execute_governed_query(
 # Connection loading
 # ---------------------------------------------------------------------------
 
-def _load_source_connection(source_id: int, user_id: str):
+def _load_source_connection(source_id: int, user_id: str, timeout_s: int | None = None):
     """Load and decrypt the data source config, then open a DBAPI2 connection.
+
+    timeout_s overrides the connector's default connect timeout when given —
+    pass a short bound for best-effort/optional callers (e.g.
+    data.relationship_service's overlap validation) that must not stall on a
+    slow/unreachable source. Omitted (None) keeps each connector's normal
+    default, unchanged for the real query-execution path below.
 
     Returns (db_conn, source_type).
 
@@ -365,8 +442,29 @@ def _load_source_connection(source_id: int, user_id: str):
         )
 
     config  = DataSourceConfig(source_type=source_type, params=params)
-    db_conn = connector_cls().open_connection(config)
+    db_conn = connector_cls().open_connection(config, timeout_s=timeout_s)
     return db_conn, source_type
+
+
+def _check_live_query_authorized(source_id: int, user_id: str) -> bool:
+    """True only when source_id is owned by user_id AND its connection has
+    live_query_enabled set — the same authorization
+    core.live.connection_resolver.LiveConnectionResolver.resolve(
+    required_capability="sql_query") already enforces for the composer/ask
+    path. Never raises: an unowned/missing source or a lookup failure is
+    "not authorized", not an error, matching this function's use as a
+    pre-execution gate rather than a hard dependency."""
+    from data.datasource_service import get_connection_config
+
+    try:
+        record = get_connection_config(source_id, user_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "_check_live_query_authorized: lookup failed for source_id=%s",
+            source_id,
+        )
+        return False
+    return bool(record and record.get("live_query_enabled"))
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +593,50 @@ def _write_audit(
     except Exception:
         logger.warning(
             "_write_audit: log_audit_event failed [source_id=%s user_id=%s]",
+            source_id, user_id,
+        )
+
+
+def _write_pii_access_audit(
+    user_id: str, source_id: int, user_role: str, gov_warnings: list[dict],
+) -> None:
+    """Accountable audit trail for PII access decisions, separate from the
+    pass/fail execution audit _write_audit already writes — table_fqn/
+    column_name only, never a raw cell value. A no-op when no column on this
+    execution was PII-flagged at all (the common case).
+
+    2026-08-24 "remove standard-PII blocking" milestone — the decision is no
+    longer role-gated (see core.governance.pii_access_policy), so this no
+    longer distinguishes "allowed because owner/admin" vs "masked because
+    standard user"; it records how many PII-flagged columns were returned
+    unmasked under the current standard-identity policy (pii_cleared /
+    pii_standard_access / pii_aggregated) purely for accountability — who
+    accessed what, when. user_role is still recorded for that same reason,
+    not because it affected the outcome."""
+    allowed = [
+        w for w in gov_warnings
+        if w.get("type") in ("pii_cleared", "pii_standard_access", "pii_aggregated")
+    ]
+    if not allowed:
+        return
+    try:
+        payload = json.dumps({
+            "source_id":      source_id,
+            "user_role":      user_role,
+            "pii_flagged_columns_returned_count": len(allowed),
+            "messages": [w["message"] for w in allowed],
+        })
+        log_audit_event(
+            {
+                "task_type":      "pii_access_decision",
+                "original_input": payload,
+                "status":         "allowed_unmasked",
+            },
+            user_id=user_id,
+        )
+    except Exception:
+        logger.warning(
+            "_write_pii_access_audit: log_audit_event failed [source_id=%s user_id=%s]",
             source_id, user_id,
         )
 
@@ -635,6 +777,7 @@ def log_query_execution(
     error_code: "str | None",
     executed_at: str,
     execution_kind: str = "user_query",
+    pipeline_trace: "dict | None" = None,
 ) -> None:
     """Persist one row to query_execution_log.
 
@@ -653,11 +796,22 @@ def log_query_execution(
     _check_user_rate_limit for the real execution that follows them in the
     same turn. Daily/source-rate/repeated-query safeguards are unaffected —
     they intentionally keep counting every row regardless of kind.
+
+    pipeline_trace (Reconnect Reliability milestone, Part 14) — optional;
+    when provided (typically core.observability.pipeline_trace.
+    build_pipeline_trace()'s output), stored encrypted
+    (core.security.encryption.encrypt, same pattern data/audit.py already
+    uses) in pipeline_trace_encrypted. None (the default) writes NULL,
+    unchanged from every pre-existing call site's behavior — purely
+    additive, no existing caller needs to change.
     """
     try:
         sql_hash       = hashlib.sha256(sql.encode("utf-8")).hexdigest() if sql else None
         tables_json    = json.dumps(_extract_tables(sql_plan))
         created_at_str = _now_iso()
+        trace_encrypted = (
+            encrypt(json.dumps(pipeline_trace, default=str)) if pipeline_trace is not None else None
+        )
 
         conn = get_connection()
         try:
@@ -667,14 +821,14 @@ def log_query_execution(
                     (execution_id, user_id, source_id, sql_hash,
                      tables_accessed_json, param_count, row_count, truncated,
                      duration_ms, status, error_code, executed_at, created_at,
-                     execution_kind)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     execution_kind, pipeline_trace_encrypted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     execution_id, user_id, source_id, sql_hash,
                     tables_json, param_count, row_count, 1 if truncated else 0,
                     duration_ms, status, error_code, executed_at, created_at_str,
-                    execution_kind,
+                    execution_kind, trace_encrypted,
                 ),
             )
             conn.commit()
@@ -684,6 +838,41 @@ def log_query_execution(
         logger.warning(
             "log_query_execution: DB write failed [execution_id=%s]", execution_id
         )
+
+
+def get_pipeline_trace(execution_id: str, *, require_user_id: "str | None" = None) -> "dict | None":
+    """Return the decrypted pipeline trace for one execution, or None if the
+    row doesn't exist, has no trace stored, or (when require_user_id is
+    given) is not owned by that user.
+
+    require_user_id is None for the admin read path (cross-user visibility
+    is the whole point of a diagnostic trace endpoint) and set for any
+    future self-service/non-admin path that should stay ownership-scoped
+    like get_query_execution_log already is.
+    """
+    conn = get_connection()
+    try:
+        if require_user_id is not None:
+            row = conn.execute(
+                "SELECT pipeline_trace_encrypted FROM query_execution_log "
+                "WHERE execution_id = ? AND user_id = ?",
+                (execution_id, require_user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT pipeline_trace_encrypted FROM query_execution_log WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None or row["pipeline_trace_encrypted"] is None:
+        return None
+    try:
+        return json.loads(decrypt(row["pipeline_trace_encrypted"]))
+    except (ValueError, TypeError):
+        logger.warning("get_pipeline_trace: failed to decode trace [execution_id=%s]", execution_id)
+        return None
 
 
 def get_query_execution_log(execution_id: str, user_id: str) -> "dict | None":
@@ -951,6 +1140,8 @@ def execute_generated_query(
     user_id: str,
     generated_sql_result: dict,
     sql_plan: dict,
+    *,
+    user_role: str = "user",
 ) -> dict:
     """Execute a validated, generated SELECT statement against a connected data source.
 
@@ -1031,6 +1222,32 @@ def execute_generated_query(
             warnings,
         )
 
+    # ── STEP 0d: Connection-level live-query authorization ────────────────────
+    # LiveQueryEngine.execute() (the POST /v1/composer/ask path) already
+    # refuses execution via LiveConnectionResolver.resolve(required_capability
+    # ="sql_query") when the connection's live_query_enabled flag is off —
+    # the same flag metadata_preparation_service.prepare_selected_tables
+    # already respects for its own probe. This function (the POST
+    # /v1/sources/{id}/execute-query path, via execute_query_route) is the
+    # only other place that opens a live connection to run generated SQL and
+    # had no equivalent check, so a connection explicitly configured with
+    # live_query_enabled=False could still be queried through this route.
+    if not _check_live_query_authorized(source_id, user_id):
+        _dur = _elapsed_ms(started_at)
+        log_query_execution(
+            execution_id, user_id, source_id, sql, sql_plan,
+            param_count=param_count, row_count=0, truncated=False,
+            duration_ms=_dur, status="governance_block",
+            error_code="live_query_disabled", executed_at=started_at.isoformat(),
+        )
+        _write_audit("query_execution", "governance_block", user_id, source_id,
+                     execution_id=execution_id)
+        return _block_result(
+            execution_id, source_id, started_at,
+            ["Live query execution is not enabled for this connection."],
+            warnings,
+        )
+
     # ── STEP 1: Safety gate (all checks before opening any connection) ────────
     # sql already extracted above (before rate limit checks)
     blocks = _safety_gate(sql, generated_sql_result, sql_plan)
@@ -1048,7 +1265,7 @@ def execute_generated_query(
 
     # ── STEP 2: Governance re-check per column ────────────────────────────────
     blocked_cols, pii_aliases, gov_warnings = _governance_recheck(
-        source_id, user_id, sql_plan
+        source_id, user_id, sql_plan, user_role=user_role,
     )
     warnings.extend(gov_warnings)
     if blocked_cols:
@@ -1063,7 +1280,7 @@ def execute_generated_query(
                      execution_id=execution_id)
         return _block_result(
             execution_id, source_id, started_at,
-            [f"Blocked: unconfirmed PII column(s): {', '.join(blocked_cols)}"],
+            [f"Blocked: restricted-category column(s): {', '.join(blocked_cols)}"],
             warnings,
         )
 
@@ -1160,7 +1377,20 @@ def execute_generated_query(
 
         # ── STEP 6: Row cap — never fetchall ──────────────────────────────────
         rows_raw  = rows_raw or []
-        truncated = len(rows_raw) > row_limit
+        # NEXT MILESTONE — REAL BUSINESS Q&A COMPLETION, Part 30. Same
+        # defect, same fix, as core.live.query_engine.LiveQueryEngine.
+        # execute() — a separate, duplicate row-cap implementation for this
+        # module's own execution path. The generated SQL always carries its
+        # own TOP/LIMIT clause matching row_limit, so the DB driver
+        # structurally never returns MORE rows than the limit — `len(
+        # rows_raw) > row_limit` can essentially never be true, making
+        # `truncated` false by construction even when the real underlying
+        # result set is far larger (live-confirmed: a real relationship
+        # query hit exactly row_limit=1000 rows and reported
+        # truncated=False alongside has_more=True). Hitting the limit
+        # exactly is itself the only observable signal available here that
+        # more rows likely exist upstream.
+        truncated = len(rows_raw) >= row_limit
         rows_raw  = rows_raw[:row_limit]
 
         # ── STEP 7: Build column metadata ─────────────────────────────────────
@@ -1179,11 +1409,18 @@ def execute_generated_query(
 
     # ── STEP 9: Audit + execution log ────────────────────────────────────────
     _dur = _elapsed_ms(started_at)
+    try:
+        from core.observability.pipeline_trace import build_pipeline_trace
+        _trace = build_pipeline_trace(sql_plan, ai_used=ai_planning_trace)
+    except Exception:
+        logger.warning("execute_governed_query: pipeline trace build failed", exc_info=True)
+        _trace = None
     log_query_execution(
         execution_id, user_id, source_id, sql, sql_plan,
         param_count=param_count, row_count=len(rows), truncated=truncated,
         duration_ms=_dur, status="success",
         error_code=None, executed_at=started_at.isoformat(),
+        pipeline_trace=_trace,
     )
 
     # ── STEP 10: Repeated-query detection (warn only, never block) ───────────

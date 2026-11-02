@@ -72,6 +72,18 @@ _GENERATED_VOCAB_MEDIUM_FLOOR = 50_000.0
 # so slicing keeps the strongest candidates.
 _GENERATED_VOCAB_PER_TERM_LIMIT = 5
 
+# Reserved separately from _GENERATED_VOCAB_PER_TERM_LIMIT above — a small,
+# bounded, ADDITIONAL slice for column_name_token evidence specifically (see
+# _is_column_token_evidence), so a large tie among table-identity candidates
+# for the same term (e.g. many entity_assignment rows sharing one score)
+# cannot consume the entire per-term budget and leave zero room for a
+# genuinely different table whose only evidence is a matching column.
+# Deliberately smaller than the table-identity limit — column-level
+# evidence is one inferential hop weaker (a column matching the term is not
+# the same claim as the table itself being about it), so it earns a real
+# but modest reserved lane, not parity.
+_GENERATED_VOCAB_COLUMN_TOKEN_LIMIT = 5
+
 # Bounded per the Sprint 1 scaling requirement. Not search_metadata's own
 # internal _MAX_CANDIDATES pre-scoring cap, which is untouched.
 _RETRIEVAL_TABLE_LIMIT = 25
@@ -91,6 +103,244 @@ _PER_TERM_LIMIT = 5
 # that term's own best unfiltered hit — see _RESCUE_RELEVANCE_RATIO.
 _RESCUE_LIMIT = 5
 _RESCUE_RELEVANCE_RATIO = 0.5
+
+# ---------------------------------------------------------------------------
+# Business Learning Candidate Discovery milestone (Parts 3-5).
+#
+# core.orchestrator.business_learning's connect-time PRELIMINARY business
+# map (data.datasource_service.get_preliminary_business_map) is accurate
+# enough to be useful but, per the prior Trust Hardening milestone, is
+# structurally forbidden from ever reaching the AI Interpreter's prompt as
+# free text (docs/validation/business_learning_trust_hardening_report.md).
+# This is the ONE channel it is allowed to reach question-answering
+# through instead: a bounded, deterministic (no LLM call), question-
+# relevant, PROVENANCE-TAGGED additive candidate source merged into this
+# module's existing multi-source retrieval (_retrieve, see the approved-
+# mapping/generated-vocabulary merges above for the established pattern —
+# this is the same idiom, one rung lower).
+#
+# A preliminary candidate can only ever WIDEN the bounded table_fqn SET
+# get_candidate_tables_with_ranking returns — every downstream consumer
+# (data.query_planning_service._resolve_concept, data.semantic_contract_
+# service.gather_candidate_evidence) scores/selects using ONLY real,
+# independently-computed evidence (dictionary/schema classification,
+# structural business-role, relationships, live-probed values) that never
+# reads this floor or this source at all. Candidate discovery therefore
+# structurally cannot become candidate SELECTION — see the module-level
+# docstring of this file and get_preliminary_candidates' own docstring.
+# ---------------------------------------------------------------------------
+PRELIMINARY_BUSINESS_LEARNING_PROVENANCE = "PRELIMINARY_BUSINESS_LEARNING"
+
+# Deliberately below every validated-evidence floor above
+# (_GENERATED_VOCAB_MEDIUM_FLOOR and up) so a preliminary hint can never
+# outrank a candidate any real evidence source already found for the same
+# table (_merge_best keeps the higher score on collision — validated
+# evidence always wins the merge). Deliberately above _search_all's
+# realistic raw-score ceiling (observed up to ~400 on real data) so a
+# question-relevant preliminary candidate reliably enters the bounded
+# candidate pool when nothing stronger has found it yet — this is
+# precisely the "candidate discovery aid, narrows WHERE to look" role this
+# milestone assigns Business Learning (Part 3d), expressed as the lowest
+# rung of this module's existing floor ladder, not a new mechanism.
+_PRELIMINARY_BUSINESS_LEARNING_FLOOR = 10_000.0
+
+# ---------------------------------------------------------------------------
+# View Semantic Discovery milestone — a curated VIEW's own definition SQL is
+# real, structural, human-authored evidence (unlike Business Learning's
+# single unvalidated LLM guess above), so it earns a floor ABOVE
+# _PRELIMINARY_BUSINESS_LEARNING_FLOOR — but it is still not a human-
+# approved mapping or curated vocabulary, so it stays BELOW
+# _GENERATED_VOCAB_MEDIUM_FLOOR. Same additive-only contract as every other
+# floor here: widens the candidate SET only, never affects scoring/selection
+# (data.semantic_contract_service.gather_candidate_evidence and
+# data.query_planning_service._score_table_authority score every candidate
+# from real, independently-computed evidence regardless of how it entered
+# the set) — so a curated view can never outrank, and can never override, a
+# real table match on conflicting evidence.
+# ---------------------------------------------------------------------------
+CURATED_VIEW_EVIDENCE_PROVENANCE = "CURATED_VIEW_EVIDENCE"
+_CURATED_VIEW_EVIDENCE_FLOOR = 25_000.0
+
+
+def get_curated_view_candidates(
+    source_id: int, user_id: str, question: str, terms: list[str], *, session=None,
+) -> list[dict]:
+    """View Semantic Discovery milestone.
+
+    Reads only `is_curated=1` rows from data.view_semantics_service's
+    connect-time-persisted `view_semantic_evidence` table — a view only
+    earns that flag when its definition resolved, naming-penalty heuristics
+    (data.query_planning_service.compute_naming_penalty — the same generic
+    backup/temp/test/old check _score_table_authority already applies)
+    found no hits, and at least one referenced base table validated against
+    the real catalog. Same qualification discipline as
+    get_preliminary_candidates above: a view only becomes a candidate when
+    ITS OWN name tokens, or the name tokens of a table it structurally reads
+    from, genuinely overlap the question's terms — never a blanket dump of
+    every curated view. Every returned entry carries a fixed synthetic
+    relevance_score at _CURATED_VIEW_EVIDENCE_FLOOR (see that constant's own
+    docstring for the floor ladder) and provenance=CURATED_VIEW_EVIDENCE.
+
+    Never raises; returns [] on any missing table, disabled feature, or
+    failure — the same "degrade to no candidates" contract every other
+    additive source in this module already has.
+    """
+    if not terms:
+        return []
+    question_tokens: set[str] = set()
+    for t in terms:
+        question_tokens.update(_tokenize(t))
+    question_tokens.update(_tokenize(question or ""))
+    if not question_tokens:
+        return []
+
+    own_connection = session is None
+    conn = get_connection() if own_connection else session.conn
+    try:
+        rows = conn.execute(
+            "SELECT table_fqn, referenced_tables_json FROM view_semantic_evidence "
+            "WHERE source_id = ? AND is_curated = 1",
+            (source_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        logger.debug("get_curated_view_candidates: query failed for source_id=%s", source_id, exc_info=True)
+        return []
+    finally:
+        if own_connection:
+            conn.close()
+
+    qualified: dict[str, dict] = {}
+    for row in rows:
+        fqn = row["table_fqn"]
+        name_tokens = set(_tokenize(fqn.rsplit(".", 1)[-1]))
+        try:
+            referenced = json.loads(row["referenced_tables_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            referenced = []
+        ref_tokens: set[str] = set()
+        for ref_fqn in referenced:
+            if isinstance(ref_fqn, str):
+                ref_tokens.update(_tokenize(ref_fqn.rsplit(".", 1)[-1]))
+        if not (question_tokens & (name_tokens | ref_tokens)):
+            continue  # no real name overlap — never qualifies on a weak signal alone
+        # A direct match on the view's OWN name is a slightly stronger
+        # signal than matching only a table it happens to read from.
+        score = _CURATED_VIEW_EVIDENCE_FLOOR + (0.5 if question_tokens & name_tokens else 0.0)
+        qualified[fqn] = {
+            "qualified_name": fqn,
+            "relevance_score": score,
+            "provenance": CURATED_VIEW_EVIDENCE_PROVENANCE,
+            "provenance_reason": "Curated view definition/dependency match",
+        }
+    return list(qualified.values())
+
+
+def get_preliminary_candidates(
+    source_id: int, user_id: str, question: str, terms: list[str], *, session=None,
+) -> list[dict]:
+    """Business Learning Candidate Discovery milestone, Parts 3-5.
+
+    Deterministic, no-LLM-call, question-relevant filter over the
+    connect-time preliminary business map (data.datasource_service.
+    get_preliminary_business_map) — the SAME map the Trust Hardening
+    milestone already made structurally absent from the AI Interpreter's
+    prompt. Reuses `terms` exactly as the caller already computed them
+    (core.semantic.concept_resolver.extract_terms, or an entity's own
+    synonym set for the entity-level gather_candidate_evidence call site —
+    whatever retrieval terms this call already searches with; Part 4 asks
+    for the SAME extraction the rest of the pipeline uses, not a new one).
+
+    A table/column entry from the map only becomes a candidate here when
+    its OWN name tokens (table name, or column name for a measure/date
+    entry) genuinely overlap `terms`' tokens — i.e. only entries plausibly
+    about what THIS question asks, never the whole map dumped in (Part 4a).
+    `likely_domain`/`major_entities` overlap is a real but weak SECONDARY
+    signal: it can only add a small score bonus to an already-qualified
+    candidate, never qualify one on its own — a domain/entity word alone is
+    too broad to trust as question-relevance by itself.
+
+    Every returned entry carries provenance=PRELIMINARY_BUSINESS_LEARNING
+    (Part 5) and a synthetic relevance_score fixed at
+    _PRELIMINARY_BUSINESS_LEARNING_FLOOR (see that constant's own
+    docstring for the floor ladder) — never a higher, "more confident"
+    score for a "better" match: a single unvalidated LLM guess has no
+    meaningfully finer-grained confidence to report, and this module's own
+    floor ladder only ever cares about ORDER relative to other sources'
+    floors, not fine ranking within one source.
+
+    Never raises; returns [] on any missing map, disabled feature, or
+    failure — the same "degrade to no candidates" contract every other
+    additive source in this module already has.
+    """
+    if not terms:
+        return []
+    try:
+        from data.datasource_service import get_preliminary_business_map
+
+        business_map = get_preliminary_business_map(source_id, user_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("get_preliminary_candidates: map read failed for source_id=%s", source_id, exc_info=True)
+        return []
+    if not business_map:
+        return []
+
+    question_tokens: set[str] = set()
+    for t in terms:
+        question_tokens.update(_tokenize(t))
+    question_tokens.update(_tokenize(question or ""))
+    if not question_tokens:
+        return []
+
+    domain_tokens = set(_tokenize(business_map.get("likely_domain") or ""))
+    entity_tokens: set[str] = set()
+    for e in (business_map.get("major_entities") or []):
+        if isinstance(e, str):
+            entity_tokens.update(_tokenize(e))
+    # Weak secondary signal only (see docstring) — a small tie-break bonus,
+    # never sufficient by itself to qualify a candidate below.
+    weak_overlap = bool(question_tokens & (domain_tokens | entity_tokens))
+
+    def _table_name_tokens(fqn: str) -> set[str]:
+        name = fqn.rsplit(".", 1)[-1] if fqn else ""
+        return set(_tokenize(name))
+
+    qualified: dict[str, dict] = {}
+
+    def _consider(fqn, extra_tokens: set[str], reason: str, column_name: str | None = None) -> None:
+        if not isinstance(fqn, str) or not fqn:
+            return
+        name_tokens = _table_name_tokens(fqn) | extra_tokens
+        if not (question_tokens & name_tokens):
+            return  # no real table/column name overlap — likely_domain/major_entities alone never qualifies
+        score = _PRELIMINARY_BUSINESS_LEARNING_FLOOR + (0.5 if weak_overlap else 0.0)
+        entry = {
+            "qualified_name": fqn,
+            "relevance_score": score,
+            "provenance": PRELIMINARY_BUSINESS_LEARNING_PROVENANCE,
+            "provenance_reason": reason,
+        }
+        if column_name:
+            entry["provenance_column_name"] = column_name
+        existing = qualified.get(fqn)
+        if existing is None or score > existing["relevance_score"]:
+            qualified[fqn] = entry
+
+    for fqn in (business_map.get("fact_tables") or []):
+        _consider(fqn, set(), "Business Learning preliminary fact-table classification")
+    for fqn in (business_map.get("dimension_tables") or []):
+        _consider(fqn, set(), "Business Learning preliminary dimension-table classification")
+    for fqn in (business_map.get("bridge_tables") or []):
+        _consider(fqn, set(), "Business Learning preliminary bridge-table classification")
+    for ref in (business_map.get("candidate_measures") or []):
+        fqn, col = (ref or {}).get("table_fqn"), (ref or {}).get("column_name")
+        if isinstance(col, str):
+            _consider(fqn, set(_tokenize(col)), f"Business Learning preliminary measure guess: {col}", column_name=col)
+    for ref in (business_map.get("candidate_dates") or []):
+        fqn, col = (ref or {}).get("table_fqn"), (ref or {}).get("column_name")
+        if isinstance(col, str):
+            _consider(fqn, set(_tokenize(col)), f"Business Learning preliminary date guess: {col}", column_name=col)
+
+    return list(qualified.values())
 
 
 def _rank_domains(question: str, terms: list[str]) -> list[dict]:
@@ -244,6 +494,82 @@ def _expand_relationships(source_id: int, table_fqns: set[str], *, session=None)
             conn.close()
 
 
+# Enterprise Phase 4 — joint/relationship-aware term resolution. A term's
+# best table candidate is sometimes only weakly evidenced on its own (e.g. a
+# business word appearing in just one column's name, not the table's own
+# name or description) but sits a short, trusted hop or two from an entity
+# the question has ALREADY grounded (e.g. "program" -> dbo.ADF_Path, which
+# has no lexical relationship to "program" at all but is directly on the
+# trusted Student -> ClassSignups -> Class -> Path join chain). Bounded BFS,
+# same relationship_status IN ('AUTO','APPROVED') trust filter as
+# _expand_relationships above, so this never proposes a path through an
+# unreviewed/rejected relationship.
+_RELATIONSHIP_DISTANCE_MAX_HOPS = 3
+_RELATIONSHIP_DISTANCE_MAX_TABLES = 300
+
+
+def get_relationship_distance_map(
+    source_id: int, seed_table_fqns: set[str], *,
+    max_hops: int = _RELATIONSHIP_DISTANCE_MAX_HOPS, session=None,
+) -> dict[str, int]:
+    """
+    Read-only bounded BFS over trusted (AUTO/APPROVED) table_relationships
+    edges, starting from `seed_table_fqns` (distance 0). Returns
+    {table_fqn: hop_distance} for every table reached within `max_hops`,
+    seeds included at distance 0. One bulk read of the whole source's
+    trusted relationship edges (not a query per hop/candidate) — cheap and
+    cacheable per (source_id, seeds, max_hops) via `session`, matching this
+    module's own "no expensive per-question scan" discipline. Never raises;
+    returns {} for an empty seed set or on any failure.
+    """
+    if not seed_table_fqns:
+        return {}
+    own_connection = session is None
+    conn = get_connection() if own_connection else session.conn
+    try:
+        if session is not None:
+            snapshot_id = session.get_or_compute(
+                f"latest_schema_snapshot_id:{source_id}",
+                lambda: _latest_snapshot_id(conn, source_id),
+            )
+        else:
+            snapshot_id = _latest_snapshot_id(conn, source_id)
+        if not snapshot_id:
+            return {}
+        rows = conn.execute(
+            """SELECT DISTINCT from_table_fqn, to_table_fqn FROM table_relationships
+               WHERE source_id = ? AND snapshot_id = ?
+                 AND relationship_status IN ('AUTO', 'APPROVED')""",
+            (source_id, snapshot_id),
+        ).fetchall()
+        adjacency: dict[str, set[str]] = {}
+        for r in rows:
+            adjacency.setdefault(r["from_table_fqn"], set()).add(r["to_table_fqn"])
+            adjacency.setdefault(r["to_table_fqn"], set()).add(r["from_table_fqn"])
+
+        distances: dict[str, int] = {t: 0 for t in seed_table_fqns}
+        frontier = set(seed_table_fqns)
+        for hop in range(1, max_hops + 1):
+            next_frontier: set[str] = set()
+            for t in frontier:
+                for neighbor in adjacency.get(t, ()):
+                    if neighbor not in distances:
+                        distances[neighbor] = hop
+                        next_frontier.add(neighbor)
+            if not next_frontier or len(distances) >= _RELATIONSHIP_DISTANCE_MAX_TABLES:
+                break
+            frontier = next_frontier
+        return distances
+    except Exception:  # noqa: BLE001 - never let a graph-traversal failure break resolution
+        logger.warning(
+            "get_relationship_distance_map: failed for source_id=%s", source_id, exc_info=True,
+        )
+        return {}
+    finally:
+        if own_connection:
+            conn.close()
+
+
 def _merge_best(merged: dict[str, dict], results: list[dict]) -> None:
     """Merge *results* into *merged* (keyed by qualified_name), keeping the
     higher relevance_score on collision. Preserves each result dict as-is —
@@ -281,6 +607,75 @@ def _is_column_name_only_evidence(row: dict) -> bool:
     except (json.JSONDecodeError, TypeError):
         return False
     return bool(evidence) and all(e.get("type") == "column_name" for e in evidence)
+
+
+def _is_column_token_evidence(row: dict) -> bool:
+    """True when a generated_business_vocabulary row's *only* supporting
+    evidence is a column_name_token match (a term matching one token of a
+    compound column name, e.g. "program" matching "ProgramType" —
+    vocabulary_bootstrap_service._derive_table_terms's per-token column
+    evidence). Distinct from _is_column_name_only_evidence's "column_name"
+    (a whole column name equals the term) — column_name_token is NOT
+    excluded from the candidate pool (it already survives that filter), but
+    it shares the same table-level MEDIUM score with every other row for
+    the term. Live-confirmed against real CCPP: dbo.ADF_Path's only
+    generated-vocabulary evidence for "program" is its ProgramType column
+    (column_name_token, score 0.35); table-identity evidence for the same
+    term (mostly entity_assignment rows scoring 0.5) numbered 14 tied
+    candidates before this table-level slice even began, so a single
+    combined top-N cut let table-identity ties consume the whole budget and
+    zero column_name_token rows ever survived retrieval — used by
+    _retrieve's generated-vocabulary merge below to reserve column-level
+    evidence its own slice of the per-term budget instead of competing
+    directly against table-level ties for the same slots.
+    """
+    try:
+        evidence = json.loads(row.get("evidence_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return bool(evidence) and all(e.get("type") == "column_name_token" for e in evidence)
+
+
+def get_approved_mapping_tables(
+    source_id: int, terms: list[str], *, session=None,
+) -> set[str]:
+    """
+    2026-08-09 stabilization (D4b) -- the same approved-concept_table_
+    mappings lookup get_candidate_tables_with_ranking's own inclusion merge
+    already does (see _APPROVED_MAPPING_SCORE_FLOOR's docstring just above),
+    factored out so a caller that BYPASSES that function entirely can still
+    consult it. query_planning_service.plan_business_query's own
+    "fully_grounded" fast path (Day 2B, Task 3/6) skips this module's broad
+    search_metadata retrieval altogether once the question's matched entity
+    already has a verified contract, seeding candidates solely from that
+    contract's own tables -- which silently made ANY concept_table_mappings
+    row inert for every OTHER term in the same question (confirmed live: a
+    HUMAN_APPROVED 'program' -> dbo.ADF_Path mapping had zero effect on
+    "How many students are in each program?" because the grounded "Student"
+    entity took the fast path and dbo.ADF_Path was never even considered).
+
+    Read-only, additive-only by contract: returns just the set of table_fqns
+    an APPROVED (AUTO_APPROVED/HUMAN_APPROVED only) mapping exists for among
+    `terms` -- no ranking, no score, no selection. The caller decides how to
+    merge it; this never removes or overrides anything. Never raises;
+    returns an empty set on any failure, same as every other read in this
+    module.
+    """
+    try:
+        approved_by_term = get_all_approved_mappings(source_id, session=session)
+    except Exception:  # noqa: BLE001 - never let a lookup failure block the fast path
+        logger.warning(
+            "get_approved_mapping_tables: read failed for source_id=%s", source_id, exc_info=True,
+        )
+        return set()
+    if not approved_by_term:
+        return set()
+    tables: set[str] = set()
+    for term in terms:
+        for mapping in approved_by_term.get(normalize_term(term), []):
+            if mapping.get("table_fqn"):
+                tables.add(mapping["table_fqn"])
+    return tables
 
 
 def get_candidate_tables(
@@ -334,12 +729,15 @@ def get_candidate_tables_with_ranking(
     Without a session (legacy callers), behavior is unchanged: every call
     runs the full retrieval.
     """
-    if session is None:
-        return _retrieve(source_id, user_id, question, terms)
-    key = ("candidate_tables_with_ranking", source_id, user_id, question, tuple(terms))
-    return session.get_or_compute_search(
-        key, lambda: _retrieve(source_id, user_id, question, terms, session=session)
-    )
+    from core.perf import stage_timer
+
+    with stage_timer.measure("candidate_table_search"):
+        if session is None:
+            return _retrieve(source_id, user_id, question, terms)
+        key = ("candidate_tables_with_ranking", source_id, user_id, question, tuple(terms))
+        return session.get_or_compute_search(
+            key, lambda: _retrieve(source_id, user_id, question, terms, session=session)
+        )
 
 
 def _remembered_terminology_evidence(source_id: int, terms: list[str], *, session=None) -> list[dict]:
@@ -515,14 +913,48 @@ def _retrieve(
         # docstring says must never be silently used — excluded here, as is
         # any row whose only evidence is a column-name match rather than the
         # table's own identity (see _is_column_name_only_evidence).
+        #
+        # Candidate-pool completeness fix: get_generated_vocabulary rows are
+        # ordered (term, confidence_score DESC) only — a large group of rows
+        # tied at the exact same score (e.g. many entity_assignment rows all
+        # scoring 0.5 for a common business entity) falls back to arbitrary
+        # DB insertion order among themselves. Live-confirmed against real
+        # CCPP: 14 "program" rows tied at 0.5 (mostly near-duplicate
+        # InternshipProgram*/Mentorship_Program* variant families) filled
+        # the entire _GENERATED_VOCAB_PER_TERM_LIMIT before dbo.ADF_Path's
+        # own column_name_token evidence (its ProgramType column, score
+        # 0.35) ever got a chance — table-identity ties alone consumed the
+        # whole per-term budget. Two additive corrections, both bounded and
+        # reusing only data already on each row (no new DB reads):
+        #   1. table_fqn length as a secondary tiebreak within an
+        #      equal-score group — a shorter, undecorated name (ADF_Path)
+        #      is preferred over a longer suffixed/derived variant
+        #      (ADF_Mentorship_Activity_SectionBreakdown_1) when confidence
+        #      alone can't distinguish them, the same "prefer the
+        #      undecorated name" instinct query_planning_service's own
+        #      naming-authority scoring already applies elsewhere, applied
+        #      here only to break ties, never to outrank a genuinely
+        #      higher-scored row.
+        #   2. column_name_token evidence (_is_column_token_evidence) gets
+        #      its own small reserved slice of the per-term budget,
+        #      separate from table-identity evidence, so a tie flood in one
+        #      evidence category can never reduce a different category's
+        #      share to zero.
         generated_by_term = get_generated_vocabulary(source_id, session=session)
         if generated_by_term:
             for term in terms:
-                candidates = [
+                eligible = [
                     row for row in generated_by_term.get(normalize_term(term), [])
                     if row.get("confidence_tier") != "LOW"
                     and not _is_column_name_only_evidence(row)
-                ][:_GENERATED_VOCAB_PER_TERM_LIMIT]
+                ]
+                eligible.sort(key=lambda r: (-r.get("confidence_score", 0.0), len(r["table_fqn"])))
+                table_level = [r for r in eligible if not _is_column_token_evidence(r)]
+                column_level = [r for r in eligible if _is_column_token_evidence(r)]
+                candidates = (
+                    table_level[:_GENERATED_VOCAB_PER_TERM_LIMIT]
+                    + column_level[:_GENERATED_VOCAB_COLUMN_TOKEN_LIMIT]
+                )
                 for row in candidates:
                     tier = row.get("confidence_tier")
                     floor = _GENERATED_VOCAB_HIGH_FLOOR if tier == "HIGH" else _GENERATED_VOCAB_MEDIUM_FLOOR
@@ -530,6 +962,30 @@ def _retrieve(
                         "qualified_name": row["table_fqn"],
                         "relevance_score": floor + row.get("confidence_score", 0.0),
                     }])
+
+        # View Semantic Discovery milestone — real, structural evidence
+        # (a curated view's own definition/dependencies), merged additively
+        # like every other source in this ladder: can only widen the
+        # candidate set, never outrank or override real table evidence
+        # (see _CURATED_VIEW_EVIDENCE_FLOOR's own docstring).
+        curated_views = get_curated_view_candidates(source_id, user_id, question, terms, session=session)
+        if curated_views:
+            _merge_best(merged, curated_views)
+
+        # Business Learning Candidate Discovery milestone — lowest-trust
+        # additive source, deliberately merged last (see
+        # _PRELIMINARY_BUSINESS_LEARNING_FLOOR's own docstring for the
+        # floor ladder this respects). Applied unconditionally (not gated
+        # on `merged` being empty) so a genuinely unfamiliar-vocabulary
+        # question that real search alone can't find anything for still
+        # gets a chance at a question-relevant preliminary candidate,
+        # exactly the "unfamiliar vocabulary" discovery scenario this
+        # milestone targets — while a question real search already
+        # resolved confidently is untouched, since _merge_best never lets
+        # this floor outrank an existing higher-scored entry.
+        preliminary = get_preliminary_candidates(source_id, user_id, question, terms)
+        if preliminary:
+            _merge_best(merged, preliminary)
 
         if not merged:
             return set(), [], remembered_terminology

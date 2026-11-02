@@ -160,8 +160,8 @@ def test_domain_entity_governance_maturity_alone_does_not_move_authority_bonus(t
     db, table_fqn = env(tmp_path, monkeypatch)
 
     before = _authority(table_fqn)
-    assert "Domain = Student Lifecycle" in before["reasons"]
-    assert "Entity = Student" in before["reasons"]
+    assert "Domain = Student Lifecycle (confidence 97%)" in before["reasons"]
+    assert "Entity = Student (confidence 97%)" in before["reasons"]
     domain_bonus_before = before["bonus"]
 
     from data.domain_service import auto_mature_domain_assignment
@@ -170,7 +170,7 @@ def test_domain_entity_governance_maturity_alone_does_not_move_authority_bonus(t
     auto_mature_entity_assignment(1, table_fqn, actor_id="system:test-ranking")
 
     after = _authority(table_fqn)
-    assert "Domain = Student Lifecycle" in after["reasons"]
-    assert "Entity = Student" in after["reasons"]
+    assert "Domain = Student Lifecycle (confidence 97%)" in after["reasons"]
+    assert "Entity = Student (confidence 97%)" in after["reasons"]
     # Same reasons, same bonus — governance state change alone moved nothing here.
     assert after["bonus"] == domain_bonus_before

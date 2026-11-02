@@ -223,6 +223,7 @@ def get_table_business_context(
                           min_value, max_value, avg_length,
                           semantic_type, semantic_confidence, semantic_evidence_json,
                           pii_name_heuristic, pii_confirmed, pii_signals_json,
+                          pii_classification, pii_manual_override,
                           profiling_depth, profiling_status
                    FROM profiling_column_profiles
                    WHERE profiling_snapshot_id = ? AND table_fqn = ?
@@ -253,6 +254,38 @@ def get_table_business_context(
                    ORDER BY from_table_fqn, from_column""",
                 (source_id, schema_snap_id, table_fqn),
             ).fetchall()
+
+            # Part 4 — automatic relationship trust. A PENDING edge that
+            # clears data.relationship_service.
+            # get_auto_trusted_pending_relationship_ids is treated exactly
+            # like AUTO/APPROVED here too, so the same edge
+            # semantic_layer_service._load_edges now trusts for join-quality
+            # scoring is also visible to _related_table_names
+            # (query_planning_service.py) — the candidate-table proposal
+            # step that decides whether analyze_join_quality is even tried
+            # for a related table in the first place. Never a status
+            # mutation, never a blanket PENDING trust.
+            from data.relationship_service import get_auto_trusted_pending_relationship_ids
+
+            auto_trusted_ids = get_auto_trusted_pending_relationship_ids(
+                source_id, schema_snap_id, conn=conn,
+            )
+            if auto_trusted_ids:
+                placeholders = ",".join("?" * len(auto_trusted_ids))
+                outbound_rels = list(outbound_rels) + conn.execute(
+                    f"""SELECT from_column, to_schema, to_table, to_table_fqn,
+                              to_column, relationship_name, relationship_type, confidence
+                       FROM table_relationships
+                       WHERE id IN ({placeholders}) AND from_table_fqn = ?""",
+                    (*auto_trusted_ids, table_fqn),
+                ).fetchall()
+                inbound_rels = list(inbound_rels) + conn.execute(
+                    f"""SELECT from_table_fqn, from_schema, from_table, from_column,
+                              to_column, relationship_name, relationship_type, confidence
+                       FROM table_relationships
+                       WHERE id IN ({placeholders}) AND to_table_fqn = ?""",
+                    (*auto_trusted_ids, table_fqn),
+                ).fetchall()
 
             # Sprint 2, Signal #2 — Weighted All-Status Relationship
             # Centrality: a SEPARATE, ranking-only read of ALL
@@ -488,6 +521,10 @@ def get_table_business_contexts_batch(
 
     Returns {} if source_id is not owned by user_id, or table_fqns is empty.
     """
+    from core.perf import stage_timer
+    import time as _time
+    _batch_t0 = _time.monotonic()
+
     table_fqns = list(dict.fromkeys(table_fqns))
     if not table_fqns:
         return {}
@@ -580,6 +617,7 @@ def get_table_business_contexts_batch(
                           min_value, max_value, avg_length,
                           semantic_type, semantic_confidence, semantic_evidence_json,
                           pii_name_heuristic, pii_confirmed, pii_signals_json,
+                          pii_classification, pii_manual_override,
                           profiling_depth, profiling_status
                    FROM profiling_column_profiles
                    WHERE profiling_snapshot_id = ? AND table_fqn IN ({ph})
@@ -621,6 +659,41 @@ def get_table_business_contexts_batch(
                 key = d.pop("to_table_fqn")  # grouping-only column, not part of the per-table shape
                 inbound_by_fqn.setdefault(key, []).append(d)
 
+            # Part 4 — automatic relationship trust, batch form of the same
+            # extension applied in get_table_business_context above (see its
+            # comment for the full rationale). Bounded to auto-trusted
+            # PENDING edges touching one of this batch's own tables.
+            from data.relationship_service import get_auto_trusted_pending_relationship_ids
+
+            auto_trusted_ids = get_auto_trusted_pending_relationship_ids(
+                source_id, schema_snap_id, conn=conn,
+            )
+            if auto_trusted_ids:
+                id_ph = ",".join("?" * len(auto_trusted_ids))
+                trusted_outbound_rows = conn.execute(
+                    f"""SELECT from_table_fqn, from_column, to_schema, to_table, to_table_fqn,
+                              to_column, relationship_name, relationship_type, confidence
+                       FROM table_relationships
+                       WHERE id IN ({id_ph}) AND from_table_fqn IN ({ph})""",
+                    (*auto_trusted_ids, *table_fqns),
+                ).fetchall()
+                for r in trusted_outbound_rows:
+                    d = dict(r)
+                    key = d.pop("from_table_fqn")
+                    outbound_by_fqn.setdefault(key, []).append(d)
+
+                trusted_inbound_rows = conn.execute(
+                    f"""SELECT to_table_fqn, from_table_fqn, from_schema, from_table, from_column,
+                              to_column, relationship_name, relationship_type, confidence
+                       FROM table_relationships
+                       WHERE id IN ({id_ph}) AND to_table_fqn IN ({ph})""",
+                    (*auto_trusted_ids, *table_fqns),
+                ).fetchall()
+                for r in trusted_inbound_rows:
+                    d = dict(r)
+                    key = d.pop("to_table_fqn")
+                    inbound_by_fqn.setdefault(key, []).append(d)
+
             rel_evidence_rows = conn.execute(
                 f"""SELECT 'outbound' AS direction, id AS relationship_id,
                           to_table_fqn AS related_table, relationship_status, confidence,
@@ -654,6 +727,7 @@ def get_table_business_contexts_batch(
             outbound_by_fqn.get(fqn, []), inbound_by_fqn.get(fqn, []),
             rel_evidence_by_fqn.get(fqn, []),
         )
+    stage_timer.record("table_business_context_batch", (_time.monotonic() - _batch_t0) * 1000)
     return results
 
 
@@ -704,6 +778,8 @@ def _assemble_column_business_context(
         "pii_name_heuristic":   bool(col_profile["pii_name_heuristic"]),
         "pii_confirmed":        bool(col_profile["pii_confirmed"]),
         "pii_signals":          _safe_json(col_profile["pii_signals_json"]),
+        "pii_classification":   col_profile["pii_classification"],
+        "pii_manual_override":  bool(col_profile["pii_manual_override"]),
         "null_percentage":      col_profile["null_percentage"],
         "distinct_count":       col_profile["distinct_count"],
         "distinct_percentage":  col_profile["distinct_percentage"],
@@ -785,6 +861,7 @@ def get_column_business_context(
                           dominant_pattern, pattern_coverage,
                           semantic_type, semantic_confidence, semantic_evidence_json,
                           pii_name_heuristic, pii_confirmed, pii_signals_json,
+                          pii_classification, pii_manual_override,
                           profiling_depth, profiling_status
                    FROM profiling_column_profiles
                    WHERE profiling_snapshot_id = ? AND table_fqn = ? AND column_name = ?""",
@@ -878,6 +955,7 @@ def get_column_business_contexts_batch(
                           dominant_pattern, pattern_coverage,
                           semantic_type, semantic_confidence, semantic_evidence_json,
                           pii_name_heuristic, pii_confirmed, pii_signals_json,
+                          pii_classification, pii_manual_override,
                           profiling_depth, profiling_status
                    FROM profiling_column_profiles
                    WHERE profiling_snapshot_id = ? AND table_fqn IN ({ph})""",
@@ -1114,3 +1192,139 @@ def get_business_summary(source_id: int, user_id: str) -> dict | None:
             "readiness_score":   readiness_score,
         },
     }
+
+
+_METRIC_EVIDENCE_CANDIDATE_POOL_CAP = 2000
+
+
+def get_source_metric_evidence(
+    source_id: int, user_id: str, *, limit_tables: int = 20, max_columns_per_table: int = 10,
+    max_domain_share: float = 0.4,
+) -> list[dict]:
+    """Executive Report Query Foundation milestone, Part 7/8 — bounded
+    schema/business evidence for the AI report-planning step
+    (core.reporting.report_planner). Returns the `limit_tables`
+    business-CENTRAL tables that have real (approved or not — see below)
+    is_metric/is_dimension/is_date columns — the report planner may only
+    propose a KPI grounded in what THIS returns, never the raw schema.
+
+    FINAL PRE-37 MILESTONE, Part 14/15/16/18 — table-level dictionary
+    approval is deliberately NOT the candidacy gate anymore (still exposed
+    per-table as `dictionary_approved`, but purely informational). Live-
+    confirmed against real CCPP: ADF_Student/ADF_Class/ADF_ClassSignups all
+    have real, correctly-classified is_metric/is_dimension/is_date columns
+    but table-level dictionary_approved=0, which the OLD `dt.is_approved=1`
+    gate excluded outright. Simply removing that gate and keeping the old
+    raw-column-COUNT ranking was already tried and confirmed wrong (wide
+    dashboard/log/tracking tables, which tend to accumulate many loosely-
+    classified columns, then dominate purely on breadth) — so table
+    candidacy now comes from ANY real is_metric/is_dimension/is_date
+    evidence (approved or not, bounded to
+    _METRIC_EVIDENCE_CANDIDATE_POOL_CAP candidates for a large schema), and
+    RANKING is done by data.query_planning_service._score_table_authority
+    called in its existing name_score=None mode — the SAME multi-signal
+    business-centrality scoring (domain/entity assignment confidence,
+    relationship coverage/centrality, row-count evidence, root/junction-
+    table structure, and the SAME naming-authority exclusions for temp/
+    backup/archive/dated-copy/dashboard-style tables) this codebase's real
+    Q&A table-selection path already trusts — reused verbatim, not
+    reimplemented or duplicated here.
+
+    Part 18 — domain diversity: the final `limit_tables` candidates are
+    capped so no single domain classification can supply more than
+    `max_domain_share` of the slots (min 2), so five KPI slots can't all
+    be filled from one narrow subsystem just because it individually
+    scores well; genuinely single-domain sources are not artificially
+    forced apart (an under-filled cap simply backfills from the remaining
+    ranked candidates regardless of domain).
+
+    Returns [] if source_id is not owned by user_id. Each entry:
+        {"table_fqn", "business_name", "domain", "entity",
+         "dictionary_approved": bool, "authority_score": float,
+         "authority_reasons": [str, ...],
+         "metric_columns": [{"column_name", "business_label"}, ...],
+         "dimension_columns": [...], "date_columns": [...]}
+    """
+    import math
+
+    conn = get_connection()
+    try:
+        source_row = _verify_source(conn, source_id, user_id)
+        if source_row is None:
+            return []
+
+        candidate_rows = conn.execute(
+            """SELECT DISTINCT dc.table_fqn AS table_fqn
+               FROM data_dictionary_columns dc
+               WHERE dc.source_id = ?
+                 AND (dc.is_metric = 1 OR dc.is_dimension = 1 OR dc.is_date = 1)""",
+            (source_id,),
+        ).fetchall()
+        candidate_fqns = [r["table_fqn"] for r in candidate_rows][:_METRIC_EVIDENCE_CANDIDATE_POOL_CAP]
+        if not candidate_fqns:
+            return []
+    finally:
+        conn.close()
+
+    contexts = get_table_business_contexts_batch(source_id, user_id, candidate_fqns)
+
+    from data.query_planning_service import _score_table_authority
+
+    scored: list[tuple[float, str, dict, list[str]]] = []
+    for fqn in candidate_fqns:
+        ctx = contexts.get(fqn)
+        if not ctx:
+            continue
+        result = _score_table_authority(fqn, ctx, name_score=None)
+        scored.append((result["bonus"], fqn, ctx, result["reasons"]))
+    scored.sort(key=lambda t: -t[0])
+
+    max_per_domain = max(2, math.ceil(limit_tables * max_domain_share))
+    domain_counts: dict[str, int] = {}
+    selected: list[tuple[float, str, dict, list[str]]] = []
+    deferred: list[tuple[float, str, dict, list[str]]] = []
+    for bonus, fqn, ctx, reasons in scored:
+        domain = ((ctx.get("domain") or {}).get("domain")) or "Unknown"
+        if domain_counts.get(domain, 0) >= max_per_domain:
+            deferred.append((bonus, fqn, ctx, reasons))
+            continue
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        selected.append((bonus, fqn, ctx, reasons))
+        if len(selected) >= limit_tables:
+            break
+    if len(selected) < limit_tables:
+        for item in deferred:
+            selected.append(item)
+            if len(selected) >= limit_tables:
+                break
+
+    evidence: list[dict] = []
+    for bonus, fqn, ctx, reasons in selected:
+        dict_row = ctx.get("dictionary") or {}
+        domain_row = ctx.get("domain") or {}
+        entity_row = ctx.get("entity") or {}
+        metric_columns: list[dict] = []
+        dimension_columns: list[dict] = []
+        date_columns: list[dict] = []
+        for col in (ctx.get("columns") or []):
+            dic = col.get("dictionary") or {}
+            entry = {"column_name": col["column_name"], "business_label": dic.get("business_label")}
+            if dic.get("is_metric") and len(metric_columns) < max_columns_per_table:
+                metric_columns.append(entry)
+            if dic.get("is_dimension") and len(dimension_columns) < max_columns_per_table:
+                dimension_columns.append(entry)
+            if dic.get("is_date") and len(date_columns) < max_columns_per_table:
+                date_columns.append(entry)
+        evidence.append({
+            "table_fqn": fqn,
+            "business_name": dict_row.get("business_name"),
+            "domain": domain_row.get("domain"),
+            "entity": entity_row.get("entity"),
+            "dictionary_approved": bool(dict_row.get("is_approved")),
+            "authority_score": bonus,
+            "authority_reasons": reasons,
+            "metric_columns": metric_columns,
+            "dimension_columns": dimension_columns,
+            "date_columns": date_columns,
+        })
+    return evidence

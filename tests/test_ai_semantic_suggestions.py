@@ -442,7 +442,13 @@ def test_list_pending_suggestions(db, monkeypatch):
     """list_ai_suggestions must return all PENDING rows for the source."""
     monkeypatch.setenv("ENABLE_AI_SEMANTIC_INTELLIGENCE", "true")
     source_id = _seed_source(db)
-    tables = [_table("dbo", "events", [_col("raw_data", "NVARCHAR"), _col("notes", "TEXT")])]
+    # Both columns must use a data_type outside rule_classifier's known
+    # buckets (id/date/flag/metric/dimension) to actually be "weak" and
+    # eligible for AI enrichment — "TEXT" specifically maps to a formed
+    # 'dimension' classification (classify_column: data_type == 'TEXT' and
+    # not is_id and not pii), which _column_needs_ai correctly treats as
+    # already having a useful description, not weak.
+    tables = [_table("dbo", "events", [_col("raw_data", "NVARCHAR"), _col("notes", "NVARCHAR")])]
     _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
     prof_id = _seed_profiling_snapshot(db, source_id)
     for col in ("raw_data", "notes"):
@@ -716,7 +722,11 @@ def test_list_filters_by_status(db, monkeypatch):
     """list_ai_suggestions(status='ACCEPTED') must not return PENDING rows."""
     monkeypatch.setenv("ENABLE_AI_SEMANTIC_INTELLIGENCE", "true")
     source_id = _seed_source(db)
-    tables = [_table("dbo", "events", [_col("raw_data", "NVARCHAR"), _col("notes", "TEXT")])]
+    # See test_list_pending_suggestions above: both columns must use a
+    # data_type outside rule_classifier's known buckets to be "weak" and
+    # thus eligible for AI enrichment — "TEXT" maps to a formed 'dimension'
+    # classification, which is not weak.
+    tables = [_table("dbo", "events", [_col("raw_data", "NVARCHAR"), _col("notes", "NVARCHAR")])]
     _seed_schema_snapshot(db, source_id, _snapshot(source_id, tables))
     prof_id = _seed_profiling_snapshot(db, source_id)
     for col in ("raw_data", "notes"):

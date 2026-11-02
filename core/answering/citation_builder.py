@@ -84,6 +84,42 @@ def _humanize_table(table_fqn: str) -> str:
     return " ".join(w.capitalize() for w in words) or table_fqn
 
 
+def _cite_remembered_terminology(plan: dict) -> list[Citation]:
+    """Phase 3, Step 4 — one Citation per remembered_terminology record
+    already deduplicated by query_planning_service (see
+    _merge_remembered_terminology). Conversational label only — no
+    governance state, confidence score, or synonym-lifecycle wording, per
+    the explainability brief."""
+    return [
+        Citation(
+            source_type=CitationType.REMEMBERED_TERMINOLOGY,
+            reference=f'{item["original_term"]}->{item["canonical_term"]}',
+            label=f'Resolved using your remembered terminology: "{item["original_term"]}" → "{item["canonical_term"]}"',
+            detail=item,
+        )
+        for item in (plan.get("remembered_terminology") or [])
+    ]
+
+
+def _cite_generated_vocabulary(plan: dict) -> list[Citation]:
+    """Enterprise Phase 4 — one Citation per generated_vocabulary_evidence
+    record already deduplicated by query_planning_service.plan_business_query.
+    Mirrors _cite_remembered_terminology's exact label style/format so the
+    two read as one consistent explainability family — the only difference
+    is which memory resolved the term (a human teaching it vs. this source's
+    own auto-derived vocabulary), never confidence scores or governance
+    jargon, per the same explainability brief."""
+    return [
+        Citation(
+            source_type=CitationType.GENERATED_VOCABULARY,
+            reference=f'{item["original_term"]}->{item["generated_term"]}',
+            label=f'Resolved using database vocabulary: "{item["original_term"]}" → "{item["generated_term"]}"',
+            detail=item,
+        )
+        for item in (plan.get("generated_vocabulary_evidence") or [])
+    ]
+
+
 def _cite_live_query(item) -> list[Citation]:
     d = item.data if isinstance(item.data, dict) else {}
     citations = [Citation(
@@ -104,6 +140,12 @@ def _cite_live_query(item) -> list[Citation]:
         )
         for i, table_fqn in enumerate(source_tables)
     )
+    # Phase 3, Step 4 — additive, alongside the citations above; never
+    # replaces or reorders them.
+    citations.extend(_cite_remembered_terminology(plan or {}))
+    # Enterprise Phase 4 — same additive treatment, one step lower precedence
+    # than remembered terminology (which is always explicit human memory).
+    citations.extend(_cite_generated_vocabulary(plan or {}))
     return citations
 
 

@@ -11,6 +11,7 @@ from core.dictionary.generator import (
     ColumnDictEntry, DictionaryResult, TableDictEntry, generate_dictionary,
 )
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +348,8 @@ def _enrich_with_ai(
 # ── Public service functions ───────────────────────────────────────────────────
 
 def generate_and_save_dictionary(
-    source_id: int, user_id: str, table_fqns: list[str] | None = None
+    source_id: int, user_id: str, table_fqns: list[str] | None = None,
+    generation_method_override: str | None = None,
 ) -> dict | None:
     """Generate and upsert dictionary entries for source_id.
 
@@ -355,6 +357,18 @@ def generate_and_save_dictionary(
     upserted (used by the autonomous metadata lifecycle to refresh changed/new
     objects only). None (default) preserves the original full-source behavior
     used by the manual "Generate Dictionary" action.
+
+    generation_method_override: Business Learning Trust Hardening milestone.
+    When set, every generated table/column entry's generation_method is
+    stamped with this value instead of the normal 'rule_based' — used by
+    core.orchestrator.business_learning's connect-time bounded discovery
+    path to write 'rule_based_preliminary' rows, distinguishable from an
+    ordinary on-demand-generated dictionary row. data.query_planning_service.
+    _is_dimension_column/_is_metric_column treat a '..._preliminary'
+    generation_method as non-definitive (fall through to profiling/schema
+    evidence instead of trusting the dictionary row outright) — see those
+    functions. None (default) preserves normal 'rule_based'/'ai_enriched'
+    behavior for every existing caller.
     """
     conn = get_connection()
     try:
@@ -390,12 +404,8 @@ def generate_and_save_dictionary(
     profiling_context: dict[tuple[str, str], dict] | None = None
     conn = get_connection()
     try:
-        prof_snap = conn.execute(
-            "SELECT id FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
-        if prof_snap is not None:
+        prof_snapshot = get_latest_profiling_snapshot(source_id, conn=conn)
+        if prof_snapshot is not None:
             col_rows = conn.execute(
                 """SELECT table_fqn, column_name,
                           semantic_type, semantic_confidence,
@@ -406,7 +416,7 @@ def generate_and_save_dictionary(
                           dominant_pattern, pattern_coverage
                    FROM profiling_column_profiles
                    WHERE profiling_snapshot_id = ?""",
-                (prof_snap["id"],),
+                (prof_snapshot.id,),
             ).fetchall()
             profiling_context = {
                 (r["table_fqn"], r["column_name"]): dict(r)
@@ -416,6 +426,13 @@ def generate_and_save_dictionary(
         conn.close()
 
     result = generate_dictionary(snapshot, snapshot_id, profiling_context=profiling_context)
+
+    if generation_method_override is not None:
+        for e in result.table_entries:
+            e.generation_method = generation_method_override
+        for e in result.column_entries:
+            e.generation_method = generation_method_override
+        result.generation_method = generation_method_override
 
     if table_fqns is not None:
         fqn_set = set(table_fqns)
@@ -454,6 +471,69 @@ def generate_and_save_dictionary(
     return summary
 
 
+def _view_profile_as_dictionary_table_row(profile) -> dict:
+    """Phase 7, Step 6E3B1, Part 3 -- data_dictionary_tables is a legacy/
+    UI/governance concept (never consulted by the active AI-first fast
+    path -- read-only confirmed: zero references in fast_path_context.py/
+    schema_frontier.py/schema_exact_context.py) and, for real CCPP data,
+    is stale (generated against an old snapshot several schema iterations
+    behind the current retrieval build) and covers TABLE objects only --
+    zero VIEW rows exist there, ever, because generate_and_save_dictionary
+    never ran against a view.
+
+    core.sqlservice.view_profiler's sql_view_profiles is the deterministic,
+    always-current (schema_fingerprint/profiling_version-checked) VIEW
+    profile store. Per this step's own Option B ("formally make
+    sql_view_profiles the authoritative view-profile store while the
+    dictionary consumes or references it"), this function builds a
+    data_dictionary_tables-SHAPED row live from a persisted ViewProfile --
+    never written back into data_dictionary_tables itself (no duplicated,
+    independently-staleable copy), always freshly read-through. The
+    `source`/`completion_status` keys make this synthesis observable --
+    a caller can always tell this is a live reference, never stale/zero-
+    view data presented as if it were a normal, human-curated row."""
+    schema_name, _, table_name = profile.object_fqn.rpartition(".")
+    return {
+        "id": None, "source_id": profile.source_id, "snapshot_id": None,
+        "table_fqn": profile.object_fqn, "table_name": table_name or profile.object_fqn,
+        "schema_name": schema_name, "table_type": "VIEW",
+        "business_name": None,
+        "description": (
+            f"authority={profile.authority_class}; grain={profile.grain_class}; "
+            f"row_preservation={profile.row_preservation_risk}; duplication_risk={profile.duplication_risk}"
+        ),
+        "domain": None, "grain": profile.grain_class,
+        "is_approved": 0, "approved_by": None, "approved_at": None,
+        "generation_method": "view_profile_deterministic",
+        "created_at": profile.created_at, "updated_at": profile.updated_at,
+        "source": "sql_view_profiles", "completion_status": profile.completion_status,
+    }
+
+
+def _view_profile_as_dictionary_column_rows(profile) -> list[dict]:
+    pii_names_lower = {cat.split(":")[0].lower() for cat in profile.pii_categories}
+    secret_names_lower = {name.lower() for name in profile.secret_columns}
+    rows = []
+    for col in profile.output_columns:
+        if not col.output_name or col.output_name == "*":
+            continue
+        rows.append({
+            "id": None, "source_id": profile.source_id, "snapshot_id": None,
+            "table_fqn": profile.object_fqn, "column_name": col.output_name,
+            "business_label": None, "meaning": None, "semantic_type": col.transformation_type,
+            "is_metric": 0, "is_dimension": 0, "is_date": 0,
+            "is_id": 1 if col.output_name in profile.entity_keys else 0,
+            "pii_risk": 1 if (
+                col.output_name.lower() in pii_names_lower or col.output_name.lower() in secret_names_lower
+            ) else 0,
+            "is_approved": 0, "approved_by": None, "approved_at": None,
+            "generation_method": "view_profile_deterministic",
+            "created_at": profile.created_at, "updated_at": profile.updated_at,
+            "source": "sql_view_profiles",
+        })
+    return rows
+
+
 def list_dictionary_tables(source_id: int, user_id: str) -> list[dict] | None:
     conn = get_connection()
     try:
@@ -469,10 +549,25 @@ def list_dictionary_tables(source_id: int, user_id: str) -> list[dict] | None:
             "WHERE source_id = ? ORDER BY schema_name, table_name",
             (source_id,),
         ).fetchall()
+        existing_fqns_lower = {r["table_fqn"].lower() for r in rows}
+        try:
+            view_fqns = [r["object_fqn"] for r in conn.execute(
+                "SELECT object_fqn FROM sql_view_profiles WHERE source_id = ?", (source_id,),
+            ).fetchall()]
+        except Exception:  # noqa: BLE001 -- table not migrated yet / no profiles yet
+            view_fqns = []
     finally:
         conn.close()
 
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    if view_fqns:
+        from data.view_profile_service import get_view_profiles_by_fqns
+        profiles = get_view_profiles_by_fqns(source_id, view_fqns)
+        for fqn_lower, profile in profiles.items():
+            if fqn_lower in existing_fqns_lower:
+                continue  # a human-curated dictionary row for this view takes precedence
+            result.append(_view_profile_as_dictionary_table_row(profile))
+    return result
 
 
 def get_table_dictionary(source_id: int, user_id: str, table_fqn: str) -> dict | None:
@@ -490,21 +585,32 @@ def get_table_dictionary(source_id: int, user_id: str, table_fqn: str) -> dict |
             "WHERE source_id = ? AND table_fqn = ?",
             (source_id, table_fqn),
         ).fetchone()
-        if table_row is None:
-            return None
 
-        col_rows = conn.execute(
-            "SELECT * FROM data_dictionary_columns "
-            "WHERE source_id = ? AND table_fqn = ? "
-            "ORDER BY column_name",
-            (source_id, table_fqn),
-        ).fetchall()
+        col_rows = []
+        if table_row is not None:
+            col_rows = conn.execute(
+                "SELECT * FROM data_dictionary_columns "
+                "WHERE source_id = ? AND table_fqn = ? "
+                "ORDER BY column_name",
+                (source_id, table_fqn),
+            ).fetchall()
     finally:
         conn.close()
 
+    if table_row is not None:
+        return {"table": dict(table_row), "columns": [dict(r) for r in col_rows]}
+
+    # Part 3, Option B: no human-curated dictionary row -- read through to
+    # the authoritative view-profile store before giving up, rather than
+    # silently returning None for every VIEW (the pre-existing behavior,
+    # since generate_and_save_dictionary never covers views at all).
+    from data.view_profile_service import get_view_profile
+    profile = get_view_profile(source_id, table_fqn)
+    if profile is None:
+        return None
     return {
-        "table":   dict(table_row),
-        "columns": [dict(r) for r in col_rows],
+        "table": _view_profile_as_dictionary_table_row(profile),
+        "columns": _view_profile_as_dictionary_column_rows(profile),
     }
 
 

@@ -390,3 +390,20 @@ def purge_old_execution_history(cutoff: str) -> int:
     except Exception as e:
         logger.error("Failed to purge old execution_history rows: %s", e)
         return 0
+
+
+def purge_old_execution_history_for_user(user_id: str, cutoff: str) -> int:
+    """Delete only one user's execution-history rows older than cutoff."""
+    try:
+        conn = get_connection()
+        cur = conn.execute(
+            "DELETE FROM execution_history WHERE user_id = ? AND started_at < ?",
+            (user_id, cutoff),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception as e:
+        logger.error("Failed to purge old execution history for user: %s", e)
+        return 0

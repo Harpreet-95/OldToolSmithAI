@@ -268,6 +268,91 @@ def test_no_status_language():
     assert extract_query_intent("revenue by status")["status_value"] is None
 
 
+def test_positive_status_never_negated():
+    # Every plain (non-negated) status question above must report
+    # status_negated=False — the new field must never be a false positive
+    # for ordinary phrasing.
+    for q in ("Active students", "Open jobs", "Cancelled interviews", "Pending submissions"):
+        intent = extract_query_intent(q)
+        assert intent["status_negated"] is False, q
+
+
+# ---------------------------------------------------------------------------
+# NEXT MILESTONE, Part 1/3 — Negation test matrix.
+#
+# Root cause: _STATUS_RE matches the bare word "active" inside "not active"
+# (the word boundary before "active" is still satisfied), and nothing
+# downstream looked at what preceded the match — the "not" was silently
+# discarded, producing status_value="Active" with no way to tell it apart
+# from a genuine positive "active" question. status_negated is the fix:
+# an explicit, separate signal for "not/isn't/aren't/... <word>" phrasing,
+# generic across every word _STATUS_RE recognizes (not a per-word special
+# case, not a CCPP-specific status list).
+# ---------------------------------------------------------------------------
+
+def test_negation_not_active():
+    intent = extract_query_intent("List classes that are not active")
+    assert intent["status_value"] == "Active"
+    assert intent["status_negated"] is True
+
+
+def test_negation_isnt_active():
+    intent = extract_query_intent("Show classes that aren't active")
+    assert intent["status_value"] == "Active"
+    assert intent["status_negated"] is True
+
+
+def test_negation_not_paid():
+    intent = extract_query_intent("List invoices that are not paid")
+    assert intent["status_value"] == "Paid"
+    assert intent["status_negated"] is True
+
+
+def test_negation_not_completed():
+    intent = extract_query_intent("Show enrollments that are not completed")
+    assert intent["status_value"] == "Completed"
+    assert intent["status_negated"] is True
+
+
+def test_negation_not_cancelled():
+    intent = extract_query_intent("List interviews that are not cancelled")
+    assert intent["status_value"] == "Cancelled"
+    assert intent["status_negated"] is True
+
+
+def test_negation_not_enabled():
+    intent = extract_query_intent("Show accounts that are not enabled")
+    assert intent["status_value"] == "Enabled"
+    assert intent["status_negated"] is True
+
+
+def test_literal_inactive_is_not_double_negated():
+    # "inactive" is its own literal word match, not "not"+"active" — no
+    # negation cue precedes the match, so status_negated must be False even
+    # though the WORD itself is the negative pole of the active/inactive
+    # pair. (status_value stays the literal "Inactive", unchanged.)
+    intent = extract_query_intent("Inactive candidates")
+    assert intent["status_value"] == "Inactive"
+    assert intent["status_negated"] is False
+
+
+def test_literal_disabled_is_not_double_negated():
+    intent = extract_query_intent("Show disabled accounts")
+    assert intent["status_value"] == "Disabled"
+    assert intent["status_negated"] is False
+
+
+def test_negation_cue_must_be_immediately_adjacent():
+    # A negation appearing earlier in an unrelated clause must NOT flip
+    # polarity — only a negation cue directly preceding the matched status
+    # word counts (same adjacent-word discipline extract_terms' own
+    # _raw_adjacent uses). "not in the active program" negates "in", not
+    # "active".
+    intent = extract_query_intent("Students who are not in the active program")
+    assert intent["status_value"] == "Active"
+    assert intent["status_negated"] is False
+
+
 # ---------------------------------------------------------------------------
 # Combined intents
 # ---------------------------------------------------------------------------
@@ -294,7 +379,13 @@ def test_unsupported_question_returns_all_none():
     intent = extract_query_intent("What is a foreign key?")
     assert intent == {
         "aggregation": None, "aggregation_target": None, "distinct": False,
-        "order": None, "date_range": None, "status_value": None,
+        "order": None, "date_range": None, "status_value": None, "status_values": [],
+        "status_negated": False,
+        "null_check_requested": False, "null_check_polarity": None,
+        # CURRENT-STATE MILESTONE fields (predate the retire-legacy-fallback
+        # milestone) — correctly negative for a question with no current-
+        # state phrasing at all.
+        "current_state_required": False, "current_state_phrase": None, "current_state_subject": None,
     }
 
 

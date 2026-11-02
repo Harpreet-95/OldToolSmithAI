@@ -25,6 +25,7 @@ os.environ.setdefault("USER_ID_SALT", "test-salt-lifecycle-api-value")
 
 import data.models as models
 from core.connectors.schema import ColumnInfo, SchemaInfo, SchemaSnapshot, TableInfo
+from core.lifecycle.models import WorkflowStep
 from data.lifecycle_service import (
     get_lifecycle_run,
     list_lifecycle_runs,
@@ -169,4 +170,4 @@ class TestListAndGetLifecycleRuns:
         run = get_lifecycle_run(1, "u1", result["run_id"])
         assert run is not None
         assert isinstance(run["steps_executed"], list)
-        assert len(run["steps_executed"]) == 10
+        assert [step["step"] for step in run["steps_executed"]] == [step.value for step in WorkflowStep]

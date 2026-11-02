@@ -317,3 +317,52 @@ def test_endpoint_allows_export_for_legacy_path_with_no_agent_status():
     )
     resp = composer_export(body, _FakeRequest(), _USER)
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Phase 8A1 -- the AI-first fast path reports success as agent_status "ok";
+# the export gate must accept it (and still refuse every non-success status).
+# ---------------------------------------------------------------------------
+
+def test_fast_path_ok_status_is_exportable():
+    from core.answering.export_service import check_exportable
+
+    answer = {"answer": "x", "answer_type": "live_query", "result_preview": [{"a": 1}]}
+    assert check_exportable(answer, "ok") is None
+    assert check_exportable(answer, "answered") is None
+    assert check_exportable(answer, None) is None
+
+
+def test_non_success_fast_path_statuses_stay_non_exportable():
+    from core.answering.export_service import check_exportable
+
+    answer = {"answer": "x", "answer_type": "live_query", "result_preview": [{"a": 1}]}
+    for status in ("non_data", "unsupported", "not_enabled", "state_reset", "safely_refused",
+                   "validation_failed", "execution_failed", "clarification_required", "timeout"):
+        assert check_exportable(answer, status) is not None, status
+
+
+def test_real_fast_path_adapter_response_passes_the_export_gate():
+    """End-to-end contract: whatever the fast-path adapter emits for a
+    successful result must be accepted by the backend export gate."""
+    from api.v1.ai_first_composer_adapter import build_ai_first_composer_response
+    from core.answering.export_service import check_exportable
+    from tests.test_ai_first_composer_adapter import _result
+
+    body = build_ai_first_composer_response(
+        _result("OK", answer="There are 42 students.", columns=("count",), rows=((42,),), row_count=1),
+        session_id="s", request_id="r", execution_time=0.1,
+    )
+    assert body["agent_status"] == "ok"
+    assert check_exportable(body["enterprise_answer"], body["agent_status"]) is None
+
+
+def test_pdf_builds_for_a_result_larger_than_the_pdf_row_cap():
+    """Regression (Phase 8A1): >40 rows adds a "+N more rows" note; it used
+    to request an unregistered italic font style and the whole PDF failed."""
+    from core.answering.export_service import _MAX_TABLE_ROWS_PDF, build_pdf_bytes
+
+    rows = [{"Month": f"2016-{i:02d}", "Count": i} for i in range(1, _MAX_TABLE_ROWS_PDF + 30)]
+    answer = {"answer": "Found rows.", "answer_type": "live_query", "result_preview": rows}
+    content = build_pdf_bytes("Monthly counts", answer)
+    assert content[:5] == b"%PDF-"

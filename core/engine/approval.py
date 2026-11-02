@@ -26,8 +26,16 @@ from core.engine.contracts import (
     ToolDefinition,
     ToolStatus,
 )
-from data.engine.tool_store import get_tool, update_tool_status
 from data.engine.approval_store import log_approval_event
+
+# get_tool/update_tool_status are imported lazily (inside each function
+# below) rather than at module load time: data.engine.tool_store itself
+# imports core.engine.contracts, which — via core/engine/__init__.py —
+# imports this module, so a top-level import here would try to bind names
+# off data.engine.tool_store while it is still mid-initialization
+# (ImportError: cannot import name 'get_tool' from partially initialized
+# module). Deferring to call time (long after both modules have finished
+# loading) breaks the cycle without changing any behavior.
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _load_or_raise(tool_id: str) -> ToolDefinition:
+    from data.engine.tool_store import get_tool
     tool = get_tool(tool_id)
     if tool is None:
         raise EngineError(f"Tool '{tool_id}' not found")
@@ -64,6 +73,7 @@ def _emit(
 
 def submit_for_approval(tool_id: str, actor_id: str, notes: str | None = None) -> None:
     """Transition draft → pending_approval. Raises EngineError if not in draft."""
+    from data.engine.tool_store import update_tool_status
     tool = _load_or_raise(tool_id)
     if tool.status != ToolStatus.DRAFT:
         raise EngineError(
@@ -77,6 +87,7 @@ def submit_for_approval(tool_id: str, actor_id: str, notes: str | None = None) -
 
 def approve_tool(tool_id: str, actor_id: str, notes: str | None = None) -> None:
     """Transition pending_approval → approved. Raises EngineError if not pending."""
+    from data.engine.tool_store import update_tool_status
     tool = _load_or_raise(tool_id)
     if tool.status != ToolStatus.PENDING_APPROVAL:
         raise EngineError(
@@ -96,6 +107,7 @@ def reject_tool(tool_id: str, actor_id: str, notes: str | None = None) -> None:
     so the author can revise and resubmit. The REJECTED event is appended to
     the audit trail regardless.
     """
+    from data.engine.tool_store import update_tool_status
     tool = _load_or_raise(tool_id)
     if tool.status != ToolStatus.PENDING_APPROVAL:
         raise EngineError(
@@ -115,6 +127,7 @@ def revoke_tool(tool_id: str, actor_id: str, notes: str | None = None) -> None:
     requiring resubmission before it can run again. The REVOKED event is
     appended to the audit trail regardless.
     """
+    from data.engine.tool_store import update_tool_status
     tool = _load_or_raise(tool_id)
     if tool.status != ToolStatus.APPROVED:
         raise EngineError(
@@ -128,6 +141,7 @@ def revoke_tool(tool_id: str, actor_id: str, notes: str | None = None) -> None:
 
 def deprecate_tool(tool_id: str, actor_id: str, notes: str | None = None) -> None:
     """Transition approved → deprecated. Raises EngineError if not approved."""
+    from data.engine.tool_store import update_tool_status
     tool = _load_or_raise(tool_id)
     if tool.status != ToolStatus.APPROVED:
         raise EngineError(

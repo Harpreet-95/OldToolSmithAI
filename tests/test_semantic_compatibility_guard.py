@@ -20,6 +20,7 @@ Run from the project root:
 """
 import os
 
+import pytest
 from cryptography.fernet import Fernet
 
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -29,6 +30,21 @@ os.environ.setdefault("USER_ID_SALT", "test-phase6-1-salt-long-enough-value-1234
 from core.semantic.compatibility_guard import check_compatibility, infer_term_family
 from data.sql_generation_service import generate_sql
 from data.sql_planning_service import build_sql_plan
+
+
+@pytest.fixture(autouse=True)
+def _isolated_metadata_db(tmp_path, monkeypatch):
+    """build_sql_plan's PII/approval check reaches the metadata DB
+    unconditionally, even for the hand-built query_plan tests below that
+    build no fixture DB of their own -- a previously missing fixture
+    (Phase 5 Step 6C)."""
+    import data.db as db_module
+    import data.models as models
+
+    db_path = str(tmp_path / "semantic_compatibility_guard_default.db")
+    monkeypatch.setattr(db_module, "DB_PATH", db_path)
+    models.init_db()
+    yield
 
 
 # ---------------------------------------------------------------------------

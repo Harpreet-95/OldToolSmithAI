@@ -9,10 +9,13 @@ way the older phase3-6 fixtures did (see Step 6 fixture fix).
 Run from the project root:
     venv/Scripts/pytest tests/test_phase7_relationship_intelligence.py -v
 """
+import ast
+import inspect
 import os
 import sqlite3
 from datetime import datetime, timezone
 
+import pytest
 from cryptography.fernet import Fernet
 
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -40,6 +43,7 @@ from data.lineage_service import get_upstream_lineage
 from data.semantic_layer_service import discover_join_paths
 from data.knowledge_graph_service import get_related_tables
 from data.business_knowledge_service import get_table_business_context
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +60,11 @@ _PATCHED_MODULES = (
     "data.semantic_layer_service",
     "data.knowledge_graph_service",
     "data.business_knowledge_service",
+    # Phase 2F.3 — added ahead of the future migration of
+    # discover_relationship_candidates() onto the shared resolver, so that
+    # migration lands with test isolation already in place. The current
+    # Relationship implementation does not call this module yet.
+    "data.profiling_snapshot_resolver",
 )
 
 
@@ -115,6 +124,7 @@ def _insert_column(
     db_path, col_id, table_fqn, column_name, *,
     data_type="int", is_primary_key=0, is_identity=0,
     uniqueness_score=0.05, guid_match_rate=None, semantic_type=None,
+    profiling_snapshot_id=1, source_id=1,
 ):
     conn = _conn(db_path)
     conn.execute(
@@ -122,9 +132,25 @@ def _insert_column(
         "(id, profiling_snapshot_id, source_id, table_fqn, column_name, data_type, "
         " is_primary_key, is_identity, uniqueness_score, guid_match_rate, semantic_type, "
         " created_at, updated_at) "
-        "VALUES (?,1,1,?,?,?,?,?,?,?,?,?,?)",
-        (col_id, table_fqn, column_name, data_type, is_primary_key, is_identity,
-         uniqueness_score, guid_match_rate, semantic_type, _NOW, _NOW),
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (col_id, profiling_snapshot_id, source_id, table_fqn, column_name, data_type,
+         is_primary_key, is_identity, uniqueness_score, guid_match_rate, semantic_type,
+         _NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _insert_profiling_snapshot(db_path, snap_id, *, source_id, schema_snapshot_id, snapshot_version, status):
+    """Phase 2F.3 helper — env() only ever seeds one hardcoded profiling_snapshots
+    row (id=1); precedence/scoping/override tests need explicit control over
+    additional rows' status and snapshot_version."""
+    conn = _conn(db_path)
+    conn.execute(
+        "INSERT INTO profiling_snapshots "
+        "(id, source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (snap_id, source_id, schema_snapshot_id, snapshot_version, status, _NOW),
     )
     conn.commit()
     conn.close()
@@ -623,3 +649,536 @@ def test_rejected_excluded_from_all_consumers(tmp_path, monkeypatch):
     assert semantic_visible is False
     assert "dbo.orders" not in kg_tables
     assert "dbo.orders" not in biz_inbound
+
+
+# ---------------------------------------------------------------------------
+# Phase 2F.3 — Relationship test isolation and pre-migration behavioral
+# baseline for discover_relationship_candidates(), ahead of its future
+# migration onto the connection-aware shared resolver
+# (data.profiling_snapshot_resolver.get_latest_profiling_snapshot). None of
+# this changes data/relationship_service.py or the local
+# _latest_profiling_snap_id() helper it still uses today.
+# ---------------------------------------------------------------------------
+
+# The exact, complete discover_relationship_candidates() result key set —
+# confirmed directly from its return statements (data/relationship_service.py),
+# not inferred from docstrings or earlier phase wording. The same dict object
+# is built once and mutated in place across every return path.
+_DISCOVER_RESULT_KEYS = {
+    "schema_snapshot_id",
+    "profiling_snapshot_id",
+    "candidates_evaluated",
+    "candidates_persisted",
+    "candidates_discarded_low_confidence",
+    "candidates_skipped_existing",
+}
+
+
+class _RelationshipInsertTrackingConn:
+    """Wraps a real sqlite3.Connection and records each execution of
+    discover_relationship_candidates()'s candidate-insert statement, without
+    altering behavior. That statement isn't a separately patchable function,
+    so this is the narrowest available seam for proving insert timing
+    (used by the rollback and read-before-write tests below).
+
+    `events`, if given, is a shared list other collaborators (e.g. a patched
+    read function) also append to, letting a test assert relative order.
+    """
+    _INSERT_MARKER = "INSERT OR IGNORE INTO table_relationships"
+
+    def __init__(self, conn: sqlite3.Connection, events: list[str] | None = None) -> None:
+        self._conn = conn
+        self.insert_count = 0
+        self._events = events
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str) and self._INSERT_MARKER in sql:
+            self.insert_count += 1
+            if self._events is not None:
+                self._events.append("insert")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+# --- 1. Response shape ---
+
+def test_response_shape_keys_and_types(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _basic_name_match_pair(db)
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert set(result.keys()) == _DISCOVER_RESULT_KEYS
+    assert isinstance(result["schema_snapshot_id"], int)
+    assert isinstance(result["profiling_snapshot_id"], int)
+    assert isinstance(result["candidates_evaluated"], int)
+    assert isinstance(result["candidates_persisted"], int)
+    assert isinstance(result["candidates_discarded_low_confidence"], int)
+    assert isinstance(result["candidates_skipped_existing"], int)
+
+
+# --- 2. Older COMPLETE beats newer CANCELLED ---
+
+def test_snapshot_complete_beats_newer_cancelled(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _insert_profiling_snapshot(db, 2, source_id=1, schema_snapshot_id=1, snapshot_version=2, status="COMPLETE")
+    _insert_profiling_snapshot(db, 3, source_id=1, schema_snapshot_id=1, snapshot_version=3, status="CANCELLED")
+
+    # Older COMPLETE snapshot's columns -> customers/orders pair (must be used).
+    _insert_column(db, 1, "dbo.customers", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=2)
+    _insert_column(db, 2, "dbo.orders", "customer_id", uniqueness_score=0.05, profiling_snapshot_id=2)
+    # Newer CANCELLED snapshot's columns -> a distinguishable vendors/orders
+    # pair (must NOT be used — a newer non-COMPLETE snapshot must never
+    # shadow older, usable COMPLETE evidence).
+    _insert_column(db, 3, "dbo.vendors", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=3)
+    _insert_column(db, 4, "dbo.orders", "vendor_id", uniqueness_score=0.05, profiling_snapshot_id=3)
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert result["profiling_snapshot_id"] == 2
+    assert result["candidates_persisted"] == 1
+
+    rel_id = _pending_id(db)
+    row = _row(db, rel_id)
+    involved = {row["from_table_fqn"], row["to_table_fqn"]}
+    assert involved == {"dbo.customers", "dbo.orders"}
+    assert "dbo.vendors" not in involved
+
+
+# --- 3. Older COMPLETE beats newer RUNNING ---
+
+def test_snapshot_complete_beats_newer_running(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _insert_profiling_snapshot(db, 2, source_id=1, schema_snapshot_id=1, snapshot_version=2, status="COMPLETE")
+    _insert_profiling_snapshot(db, 3, source_id=1, schema_snapshot_id=1, snapshot_version=3, status="RUNNING")
+
+    _insert_column(db, 1, "dbo.customers", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=2)
+    _insert_column(db, 2, "dbo.orders", "customer_id", uniqueness_score=0.05, profiling_snapshot_id=2)
+    _insert_column(db, 3, "dbo.vendors", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=3)
+    _insert_column(db, 4, "dbo.orders", "vendor_id", uniqueness_score=0.05, profiling_snapshot_id=3)
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert result["profiling_snapshot_id"] == 2
+    assert result["candidates_persisted"] == 1
+
+    rel_id = _pending_id(db)
+    row = _row(db, rel_id)
+    involved = {row["from_table_fqn"], row["to_table_fqn"]}
+    assert involved == {"dbo.customers", "dbo.orders"}
+    assert "dbo.vendors" not in involved
+
+
+# --- 4. No-snapshot behavior ---
+
+def test_no_profiling_snapshot_returns_defined_result_without_insert_or_exception(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    conn = _conn(db)
+    conn.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        " encrypted_config_json, config_schema_version, capabilities_json, "
+        " metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (2,'u1','NoProfiling','mssql','RELATIONAL','{}',1,'[]','{}','ACTIVE',1,?,?)",
+        (_NOW, _NOW),
+    )
+    conn.execute(
+        "INSERT INTO schema_snapshots "
+        "(id, source_id, snapshot_version, source_type, table_count, snapshot_json, "
+        " discovered_at, created_at) VALUES (2,2,1,'mssql',2,'{}',?,?)",
+        (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+    # No profiling_snapshots row seeded for source_id=2 at all.
+
+    result = discover_relationship_candidates(2, "u1")
+
+    assert result == {
+        "schema_snapshot_id": 2,
+        "profiling_snapshot_id": None,
+        "candidates_evaluated": 0,
+        "candidates_persisted": 0,
+        "candidates_discarded_low_confidence": 0,
+        "candidates_skipped_existing": 0,
+    }
+
+    rels = get_relationships_for_source(2, "u1")
+    assert rels == []
+
+    conn = _conn(db)
+    audit_rows = conn.execute(
+        "SELECT status, user_id FROM audit_logs WHERE task_type = 'relationship_candidate_discovery'"
+    ).fetchall()
+    conn.close()
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["status"] == "success"
+    assert audit_rows[0]["user_id"] == "u1"
+
+
+# --- 5. Source scoping ---
+
+def test_snapshot_source_scoping(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _basic_name_match_pair(db)  # source_id=1, profiling_snapshot_id=1 (seeded by env())
+
+    conn = _conn(db)
+    conn.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        " encrypted_config_json, config_schema_version, capabilities_json, "
+        " metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (2,'u1','Other','mssql','RELATIONAL','{}',1,'[]','{}','ACTIVE',1,?,?)",
+        (_NOW, _NOW),
+    )
+    conn.execute(
+        "INSERT INTO schema_snapshots "
+        "(id, source_id, snapshot_version, source_type, table_count, snapshot_json, "
+        " discovered_at, created_at) VALUES (2,2,1,'mssql',2,'{}',?,?)",
+        (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+    # Other source's profiling snapshot is far newer in absolute version terms,
+    # to prove it can never leak into source 1's resolution.
+    _insert_profiling_snapshot(db, 99, source_id=2, schema_snapshot_id=2, snapshot_version=99, status="COMPLETE")
+    _insert_column(db, 10, "dbo.vendors", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=99, source_id=2)
+    _insert_column(db, 11, "dbo.orders", "vendor_id", uniqueness_score=0.05,
+                    profiling_snapshot_id=99, source_id=2)
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert result["profiling_snapshot_id"] == 1
+    assert result["candidates_persisted"] == 1
+
+    rel_id = _pending_id(db)
+    row = _row(db, rel_id)
+    involved = {row["from_table_fqn"], row["to_table_fqn"]}
+    assert involved == {"dbo.customers", "dbo.orders"}
+    assert "dbo.vendors" not in involved
+
+
+# --- Phase 2F.4 migration proof: None path uses the shared resolver ---
+
+def test_none_override_invokes_resolver_once_with_source_id_and_caller_conn(tmp_path, monkeypatch):
+    """Direct Phase 2F.4 migration proof: when profiling_snap_id is omitted,
+    discover_relationship_candidates() must call the shared resolver exactly
+    once, with source_id and the exact connection object it itself opened
+    (not a new one). The old local helper is gone as of Phase 2F.5 (see the
+    structural tests below), so there's nothing left to patch a
+    forbidden-call guard onto here."""
+    db = env(tmp_path, monkeypatch)
+    _basic_name_match_pair(db)
+
+    opened_connections = []
+
+    def _tracking_get_connection():
+        c = _db_conn(db)
+        opened_connections.append(c)
+        return c
+
+    monkeypatch.setattr("data.relationship_service.get_connection", _tracking_get_connection)
+
+    resolver_calls = []
+    real_resolver = get_latest_profiling_snapshot
+
+    def _tracking_resolver(source_id, conn=None):
+        resolver_calls.append((source_id, conn))
+        return real_resolver(source_id, conn=conn)
+
+    monkeypatch.setattr("data.relationship_service.get_latest_profiling_snapshot", _tracking_resolver)
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert result["candidates_persisted"] == 1
+    assert len(opened_connections) == 1
+    assert len(resolver_calls) == 1
+    called_source_id, called_conn = resolver_calls[0]
+    assert called_source_id == 1
+    assert called_conn is opened_connections[0]  # exact caller-owned conn, not a new one
+
+
+# --- 6. Explicit profiling_snap_id override ---
+
+def test_explicit_profiling_snapshot_override_positive_bypasses_latest_resolution(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _insert_profiling_snapshot(db, 5, source_id=1, schema_snapshot_id=1, snapshot_version=5, status="COMPLETE")
+    _insert_profiling_snapshot(db, 6, source_id=1, schema_snapshot_id=1, snapshot_version=6, status="COMPLETE")
+
+    # Explicitly-targeted (older) snapshot's columns -> customers/orders pair.
+    _insert_column(db, 1, "dbo.customers", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=5)
+    _insert_column(db, 2, "dbo.orders", "customer_id", uniqueness_score=0.05, profiling_snapshot_id=5)
+    # Newer snapshot's columns -> a distinguishable pair that must NOT be used.
+    _insert_column(db, 3, "dbo.vendors", "id", is_primary_key=1, is_identity=1,
+                    uniqueness_score=1.0, profiling_snapshot_id=6)
+    _insert_column(db, 4, "dbo.orders", "vendor_id", uniqueness_score=0.05, profiling_snapshot_id=6)
+
+    # Scoped to this test only. Raising proves the override short-circuits
+    # the snapshot-resolution fallback entirely — the resolver must never be
+    # consulted when an explicit positive profiling_snap_id is supplied. (The
+    # old local helper this used to also guard against was retired in Phase
+    # 2F.5 — see the structural tests below; there's nothing left to patch.)
+    def _resolver_must_not_be_called(source_id, conn=None):
+        raise AssertionError("get_latest_profiling_snapshot must not be called when profiling_snap_id is supplied")
+
+    monkeypatch.setattr("data.relationship_service.get_latest_profiling_snapshot", _resolver_must_not_be_called)
+
+    result = discover_relationship_candidates(1, "u1", profiling_snap_id=5)
+
+    assert result["profiling_snapshot_id"] == 5
+    assert result["candidates_persisted"] == 1
+
+    rel_id = _pending_id(db)
+    row = _row(db, rel_id)
+    involved = {row["from_table_fqn"], row["to_table_fqn"]}
+    assert involved == {"dbo.customers", "dbo.orders"}
+    assert "dbo.vendors" not in involved
+
+
+def test_explicit_profiling_snapshot_override_zero_falls_back_to_latest(tmp_path, monkeypatch):
+    """Documents current production behavior exactly as-is: `0` is falsy in
+    `if profiling_snap_id: ... else: ...`, so profiling_snap_id=0 is NOT
+    treated as an override — it falls back to latest-snapshot resolution via
+    the shared resolver, identically to omitting the parameter. Phase 2F.4
+    changes the resolution mechanism (shared resolver instead of the local
+    helper) but not this semantic."""
+    db = env(tmp_path, monkeypatch)
+    _basic_name_match_pair(db)  # profiling_snapshot_id=1 (seeded by env())
+
+    resolver_calls = []
+    real_resolver = get_latest_profiling_snapshot
+
+    def _tracking_resolver(source_id, conn=None):
+        resolver_calls.append(source_id)
+        return real_resolver(source_id, conn=conn)
+
+    monkeypatch.setattr("data.relationship_service.get_latest_profiling_snapshot", _tracking_resolver)
+
+    result = discover_relationship_candidates(1, "u1", profiling_snap_id=0)
+
+    assert result["profiling_snapshot_id"] == 1  # resolved via fallback, not literal 0
+    assert result["candidates_persisted"] == 1
+    assert resolver_calls == [1]  # resolver was called (fallback path), not skipped
+
+
+# --- 7. Connection count ---
+
+def test_connection_count_is_one(tmp_path, monkeypatch):
+    """Phase 2F.4: discover_relationship_candidates() now calls the shared
+    resolver via get_latest_profiling_snapshot(source_id, conn=conn) — since
+    conn is supplied, the resolver never calls its own get_connection(), so
+    the Relationship-owned connection count stays 1 and the resolver-owned
+    count stays 0."""
+    db = env(tmp_path, monkeypatch)
+    _basic_name_match_pair(db)
+
+    rel_calls = {"n": 0}
+    resolver_calls = {"n": 0}
+
+    def _counting_rel_get_connection():
+        rel_calls["n"] += 1
+        return _db_conn(db)
+
+    def _counting_resolver_get_connection():
+        resolver_calls["n"] += 1
+        return _db_conn(db)
+
+    monkeypatch.setattr("data.relationship_service.get_connection", _counting_rel_get_connection)
+    monkeypatch.setattr("data.profiling_snapshot_resolver.get_connection", _counting_resolver_get_connection)
+
+    # Explicit reset: env() and the seeding above run before these counting
+    # wrappers exist, so they cannot have been counted regardless — this
+    # makes that guarantee explicit rather than relying on call ordering.
+    rel_calls["n"] = 0
+    resolver_calls["n"] = 0
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert result["candidates_persisted"] == 1
+    assert rel_calls["n"] == 1
+    assert resolver_calls["n"] == 0
+    assert rel_calls["n"] + resolver_calls["n"] == 1
+
+
+# --- 8. Rollback after partial failure ---
+
+def test_rollback_after_partial_failure_leaves_no_partial_rows(tmp_path, monkeypatch):
+    """Forces a deterministic exception while processing the second of two
+    candidates, after the first candidate's INSERT OR IGNORE has already
+    executed but strictly before conn.commit(). The two candidates are both
+    Pass-1 (within-bucket, name-matched) pairs — the only pass whose order is
+    guaranteed, since Pass 2 (domain/entity cross-bucket pairs) iterates a
+    set and is not order-stable. Patch point is _value_overlap_score, called
+    exactly once per candidate immediately before scoring/insert — the
+    narrowest available per-candidate seam.
+
+    Since discover_relationship_candidates() has no except clause around this
+    loop, the exception is never swallowed by _audit_discovery() (which only
+    runs after conn.commit(), never reached here) and propagates straight to
+    the outer `finally: conn.close()`, which rolls back the uncommitted
+    transaction — proving persistence is all-or-nothing per run, not
+    per-candidate.
+    """
+    db = env(tmp_path, monkeypatch)
+    _insert_column(db, 1, "dbo.customers", "id", is_primary_key=1, is_identity=1, uniqueness_score=1.0)
+    _insert_column(db, 2, "dbo.orders", "customer_id", uniqueness_score=0.05)
+    _insert_column(db, 3, "dbo.orders", "product_id", uniqueness_score=0.05)
+    _insert_column(db, 4, "dbo.products", "id", is_primary_key=1, is_identity=1, uniqueness_score=1.0)
+
+    tracked_conn = _RelationshipInsertTrackingConn(_db_conn(db))
+    monkeypatch.setattr("data.relationship_service.get_connection", lambda: tracked_conn)
+
+    call_count = {"n": 0}
+    insert_count_at_failure = {}
+
+    def _overlap_second_call_raises(conn, from_col_id, to_col_id):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            insert_count_at_failure["value"] = tracked_conn.insert_count
+            raise RuntimeError("forced-failure-for-rollback-test")
+        return None
+
+    monkeypatch.setattr("data.relationship_service._value_overlap_score", _overlap_second_call_raises)
+
+    with pytest.raises(RuntimeError, match="forced-failure-for-rollback-test"):
+        discover_relationship_candidates(1, "u1")
+
+    # Proves the first candidate's INSERT OR IGNORE actually executed before
+    # the forced failure — without this, a failure before any insert would
+    # not demonstrate partial-write rollback at all.
+    assert insert_count_at_failure["value"] == 1
+    assert tracked_conn.insert_count == 1  # no insert for the second (failed) candidate
+
+    conn = _conn(db)
+    remaining = conn.execute("SELECT COUNT(*) AS n FROM table_relationships").fetchone()["n"]
+    audit_rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE task_type = 'relationship_candidate_discovery'"
+    ).fetchone()["n"]
+    conn.close()
+    assert remaining == 0    # the uncommitted first insert was rolled back on close
+    assert audit_rows == 0   # _audit_discovery() runs after commit(); never reached
+
+
+# --- 9. Read-only phase before inserts ---
+
+def test_snapshot_and_column_reads_precede_first_insert(tmp_path, monkeypatch):
+    """Narrow ordering evidence only (not a full SQL-sequence assertion):
+    the profiling-column read (get_key_candidate_columns, which depends on
+    snapshot resolution having already happened) is observed to occur before
+    the first table_relationships insert.
+    """
+    db = env(tmp_path, monkeypatch)
+    _basic_name_match_pair(db)
+
+    events: list[str] = []
+    tracked_conn = _RelationshipInsertTrackingConn(_db_conn(db), events=events)
+    monkeypatch.setattr("data.relationship_service.get_connection", lambda: tracked_conn)
+
+    real_get_columns = discover_relationship_candidates.__globals__["get_key_candidate_columns"]
+
+    def _tracking_get_columns(conn, source_id, profiling_snapshot_id):
+        events.append("read_columns")
+        return real_get_columns(conn, source_id, profiling_snapshot_id)
+
+    monkeypatch.setattr("data.relationship_service.get_key_candidate_columns", _tracking_get_columns)
+
+    result = discover_relationship_candidates(1, "u1")
+
+    assert result["candidates_persisted"] == 1
+    assert "read_columns" in events
+    assert "insert" in events
+    assert events.index("read_columns") < events.index("insert")
+
+
+# --- Resolver fixture isolation proof ---
+
+def test_resolver_fixture_patches_temp_database_not_default(tmp_path, monkeypatch):
+    """Proves data.profiling_snapshot_resolver.get_connection is now
+    redirected to the same temp DB as the rest of this suite: seeds a
+    uniquely identifiable snapshot (id/version 4242, which cannot exist in
+    any other database) directly in the temp DB, then resolves it through
+    the real resolver function. No assertion depends on the contents or
+    absence of data/toolsmith.db."""
+    db = env(tmp_path, monkeypatch)
+    _insert_profiling_snapshot(db, 4242, source_id=1, schema_snapshot_id=1, snapshot_version=4242, status="COMPLETE")
+
+    result = get_latest_profiling_snapshot(1)
+
+    assert result is not None
+    assert result.id == 4242
+    assert result.snapshot_version == 4242
+
+
+# ---------------------------------------------------------------------------
+# Phase 2F.5 — structural proof that the legacy local snapshot helper
+# (_latest_profiling_snap_id) is gone from relationship_service.py and that
+# discover_relationship_candidates() uses the shared resolver directly.
+# ---------------------------------------------------------------------------
+
+def test_relationship_service_has_no_legacy_snapshot_helper():
+    import data.relationship_service as relationship_service_module
+
+    assert not hasattr(relationship_service_module, "_latest_profiling_snap_id")
+
+
+def test_relationship_service_source_has_no_legacy_helper_reference():
+    import data.relationship_service as relationship_service_module
+
+    source = inspect.getsource(relationship_service_module)
+    assert "_latest_profiling_snap_id" not in source
+
+
+def test_discover_relationship_candidates_uses_shared_resolver():
+    """Narrow AST check scoped to discover_relationship_candidates()'s own
+    source only: exactly one get_latest_profiling_snapshot(...) call, with
+    source_id passed positionally and conn=conn passed by keyword."""
+    source = inspect.getsource(discover_relationship_candidates)
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "get_latest_profiling_snapshot"
+    ]
+    assert len(calls) == 1, "expected exactly one get_latest_profiling_snapshot(...) call"
+
+    call = calls[0]
+    positional_names = [a.id for a in call.args if isinstance(a, ast.Name)]
+    assert "source_id" in positional_names
+
+    keyword_values = {kw.arg: kw.value for kw in call.keywords}
+    assert "conn" in keyword_values
+    conn_value = keyword_values["conn"]
+    assert isinstance(conn_value, ast.Name) and conn_value.id == "conn"
+
+
+def test_repository_has_no_live_production_legacy_snapshot_helpers():
+    """AST-based (not substring) search of every top-level module in data/
+    for a live def _latest_profiling_snap_id(...). Scoped to production
+    Python files only, so the historical comments/docstrings in
+    tests/test_phase{3,4,5,6,8}_*.py describing other modules' own past
+    retirements of this same pattern cannot cause a false failure here."""
+    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+    violations = []
+    for fname in os.listdir(data_dir):
+        if not fname.endswith(".py"):
+            continue
+        path = os.path.join(data_dir, fname)
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=fname)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_latest_profiling_snap_id":
+                violations.append(fname)
+
+    assert violations == []

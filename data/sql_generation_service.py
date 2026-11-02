@@ -92,13 +92,41 @@ def _qcol(table_fqn: str, column_name: str, adapter: DialectAdapter) -> str:
 # Clause builders — each consumes the relevant sub-list from sql_plan
 # ---------------------------------------------------------------------------
 
+def _escape_string_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _build_derived_case_expr(row: dict, adapter: DialectAdapter) -> str:
+    """AI-FIRST CAPABILITY HARDENING milestone, Part 4 — renders a
+    core.semantic.derived_concept_adjudicator SUPPORTED result as a
+    deterministic CASE WHEN expression. Every column reference and every
+    string literal here came from that module's own identifier-locked
+    validation (categories/conditions/labels), never from unvalidated AI
+    text — this function performs no semantic judgment, only mechanical
+    translation, same contract as adapter.date_part_expr for time_grain."""
+    table_fqn = row["table_fqn"]
+    derived = row["derived_case"]
+    branches: list[str] = []
+    for category in derived["categories"]:
+        conds = " AND ".join(
+            f"{_qcol(table_fqn, c['column_name'], adapter)} IS {'NULL' if c['is_null'] else 'NOT NULL'}"
+            for c in category["conditions"]
+        )
+        label = _escape_string_literal(category["label"])
+        branches.append(f"WHEN {conds} THEN '{label}'")
+    else_label = _escape_string_literal(derived.get("else_label") or "Other")
+    return "CASE " + " ".join(branches) + f" ELSE '{else_label}' END"
+
+
 def _build_select_clause(select: list[dict], adapter: DialectAdapter) -> str:
     parts: list[str] = []
     for row in select:
         agg = row.get("aggregation")
         column_name = row.get("column_name")
 
-        if column_name is None:
+        if row.get("derived_case"):
+            expr = _build_derived_case_expr(row, adapter)
+        elif column_name is None:
             # Bare row-count ("How many clients?") — sql_planning_service
             # only ever produces this shape when aggregation == "COUNT".
             expr = "COUNT(*)"
@@ -251,6 +279,13 @@ def _build_where_clause(where: list[dict], adapter: DialectAdapter) -> tuple[str
 def _build_group_by_clause(group_by: list[dict], adapter: DialectAdapter) -> str:
     parts = []
     for g in group_by:
+        if g.get("derived_case"):
+            # Groups by the exact same CASE expression projected in SELECT —
+            # every dialect this project generates for accepts a repeated
+            # expression in GROUP BY (never just the alias, which some
+            # dialects disallow there).
+            parts.append(_build_derived_case_expr(g, adapter))
+            continue
         col_ref = _qcol(g["table_fqn"], g["column_name"], adapter)
         if g.get("time_grain"):
             col_ref = adapter.date_part_expr(g["time_grain"], col_ref)
@@ -360,7 +395,15 @@ def generate_sql(
     limit_suffix = adapter.row_limit_suffix(int(row_limit)) if row_limit else ""
     distinct_prefix = "DISTINCT " if distinct else ""
 
-    lines: list[str] = [f"SELECT {limit_prefix}{distinct_prefix}{select_clause}"]
+    # Investigation Agent Hardening milestone (Part 11) — real MSSQL syntax
+    # is SELECT [DISTINCT] [TOP (n)] col..., DISTINCT must precede TOP.
+    # Live-confirmed defect: the previous TOP-then-DISTINCT order produced
+    # "SELECT TOP (1000) DISTINCT col ..." against real CCPP for "Distinct
+    # students"/"Unique recruiters", which SQL Server rejects with
+    # "Incorrect syntax near the keyword 'DISTINCT'". Every other dialect's
+    # row_limit_prefix is always "" (they cap rows via a trailing LIMIT
+    # clause instead), so this reorder is a no-op for sqlite/postgres/mysql.
+    lines: list[str] = [f"SELECT {distinct_prefix}{limit_prefix}{select_clause}"]
     if from_clause:
         lines.append(f"FROM {from_clause}")
     lines.extend(join_clauses)

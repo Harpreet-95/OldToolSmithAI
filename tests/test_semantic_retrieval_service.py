@@ -778,3 +778,130 @@ def test_generated_vocabulary_high_tier_merge_unaffected_by_evidence_filter(tmp_
 
     result = get_candidate_tables(1, "u1", "how many candidates", ["candidate"])
     assert "dbo.ADF_BHCandidates" in result
+
+
+# ---------------------------------------------------------------------------
+# Candidate-pool completeness — reserved column_name_token bucket
+# (data.semantic_retrieval_service._is_column_token_evidence /
+# _GENERATED_VOCAB_COLUMN_TOKEN_LIMIT). Live-confirmed against real CCPP:
+# dbo.ADF_Path's only generated-vocabulary evidence for "program" is its
+# ProgramType column (column_name_token), but 14 other tables tied at a
+# higher table-identity score (mostly entity_assignment rows) filled the
+# entire combined per-term cap before it ever got a chance.
+# ---------------------------------------------------------------------------
+
+def test_column_token_evidence_not_crowded_out_by_table_identity_ties(tmp_path, monkeypatch):
+    """A large tie among table-identity candidates for the same term must
+    not reduce a materially different table's column_name_token evidence to
+    zero surviving slots — reproduces the real dbo.ADF_Path/"program" case
+    at small scale."""
+    db = env(tmp_path, monkeypatch)
+    # 8 table-identity ties, all outranking the column-evidence row below —
+    # more than _GENERATED_VOCAB_PER_TERM_LIMIT (5) so the old flat
+    # combined top-5 cut would exclude the column-evidence table entirely.
+    for i in range(8):
+        table_fqn = f"dbo.ZQxFamily{i}"
+        _register_in_snapshot(db, table_fqn)
+        _add_generated_vocab(
+            db, "widget", table_fqn, tier="MEDIUM", score=0.5,
+            evidence=[{"type": "entity_assignment", "table_fqn": table_fqn}],
+        )
+    _register_in_snapshot(db, "dbo.CatalogItems")
+    _add_generated_vocab(
+        db, "widget", "dbo.CatalogItems", tier="MEDIUM", score=0.35, column_name="WidgetType",
+        evidence=[{
+            "type": "column_name_token", "table_fqn": "dbo.CatalogItems",
+            "column_name": "WidgetType", "of": ["widget", "type"],
+        }],
+    )
+
+    result = get_candidate_tables(1, "u1", "show widget", ["widget"])
+    assert "dbo.CatalogItems" in result
+
+
+def test_table_identity_bucket_still_bounded_with_column_bucket_present(tmp_path, monkeypatch):
+    """The reserved column-evidence bucket is additive, not a blanket
+    widening — a large tie among table-identity candidates still only
+    contributes up to its own bounded limit, not every tied row."""
+    db = env(tmp_path, monkeypatch)
+    for i in range(15):
+        table_fqn = f"dbo.ZQxFamily{i}"
+        _register_in_snapshot(db, table_fqn)
+        _add_generated_vocab(
+            db, "widget", table_fqn, tier="MEDIUM", score=0.5,
+            evidence=[{"type": "entity_assignment", "table_fqn": table_fqn}],
+        )
+
+    result = get_candidate_tables(1, "u1", "show widget", ["widget"])
+    widget_family = [fqn for fqn in result if fqn.startswith("dbo.ZQxFamily")]
+    assert len(widget_family) <= 5
+
+
+def test_generated_vocabulary_length_tiebreak_prefers_shorter_name(tmp_path, monkeypatch):
+    """Among rows tied at the exact same confidence_score, a shorter,
+    undecorated table name is preferred over a longer suffixed/derived
+    variant — both still tied within the per-term cap, but ordering
+    determines which candidates survive when the tie group exceeds it."""
+    db = env(tmp_path, monkeypatch)
+    for i in range(6):
+        table_fqn = f"dbo.ZQxVariantWithLongSuffix{i}"
+        _register_in_snapshot(db, table_fqn)
+        _add_generated_vocab(
+            db, "widget", table_fqn, tier="MEDIUM", score=0.5,
+            evidence=[{"type": "entity_assignment", "table_fqn": table_fqn}],
+        )
+    _register_in_snapshot(db, "dbo.Widget")
+    _add_generated_vocab(
+        db, "widget", "dbo.Widget", tier="MEDIUM", score=0.5,
+        evidence=[{"type": "entity_assignment", "table_fqn": "dbo.Widget"}],
+    )
+
+    result = get_candidate_tables(1, "u1", "show widget", ["widget"])
+    assert "dbo.Widget" in result
+
+
+def test_column_token_bucket_still_excludes_low_tier(tmp_path, monkeypatch):
+    """The reserved column-evidence bucket reuses the same LOW-tier
+    exclusion as the table-identity bucket — it is not a separate, looser
+    admission path."""
+    db = env(tmp_path, monkeypatch)
+    _register_in_snapshot(db, "dbo.UnrelatedThing")
+    _add_generated_vocab(
+        db, "widget", "dbo.UnrelatedThing", tier="LOW", score=0.2, column_name="WidgetType",
+        evidence=[{
+            "type": "column_name_token", "table_fqn": "dbo.UnrelatedThing",
+            "column_name": "WidgetType", "of": ["widget", "type"],
+        }],
+    )
+
+    result = get_candidate_tables(1, "u1", "show widget", ["widget"])
+    assert "dbo.UnrelatedThing" not in result
+
+
+def test_candidate_pool_stays_bounded_with_both_buckets_full(tmp_path, monkeypatch):
+    """Total candidate growth from the two-bucket generated-vocabulary merge
+    stays small and bounded — completeness must not become explosion."""
+    db = env(tmp_path, monkeypatch)
+    for i in range(10):
+        table_fqn = f"dbo.ZQxTable{i}"
+        _register_in_snapshot(db, table_fqn)
+        _add_generated_vocab(
+            db, "widget", table_fqn, tier="MEDIUM", score=0.5,
+            evidence=[{"type": "entity_assignment", "table_fqn": table_fqn}],
+        )
+    for i in range(10):
+        table_fqn = f"dbo.ZQxColTable{i}"
+        _register_in_snapshot(db, table_fqn)
+        _add_generated_vocab(
+            db, "widget", table_fqn, tier="MEDIUM", score=0.35, column_name="WidgetType",
+            evidence=[{
+                "type": "column_name_token", "table_fqn": table_fqn,
+                "column_name": "WidgetType", "of": ["widget", "type"],
+            }],
+        )
+
+    result = get_candidate_tables(1, "u1", "show widget", ["widget"])
+    # At most 5 (table bucket) + 5 (column bucket) generated-vocabulary
+    # contributions for this single term, regardless of 20 tied rows total.
+    widget_related = [fqn for fqn in result if "ZQx" in fqn]
+    assert len(widget_related) <= 10

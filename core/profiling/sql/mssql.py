@@ -213,6 +213,43 @@ def build_sample_values_query(
     )
 
 
+def build_referential_overlap_query(
+    from_table_fqn: str,
+    from_column: str,
+    to_table_fqn: str,
+    to_column: str,
+    use_nolock: bool = True,
+) -> str:
+    """Return a single-scan query measuring referential coverage: how many
+    distinct non-null from_column values also appear in to_column.
+
+    Uses one LEFT JOIN (not a per-row correlated subquery) so cost is one
+    pass over from_table joined to to_table — cheap when to_column is a
+    primary/unique key (the expected case; callers only call this for
+    candidates where to_column already looks key-like), since the join can
+    use to_column's own index.
+
+    Returns a single row: source_nonnull_count, source_distinct_count,
+    matched_distinct_count. matched_distinct_count / source_distinct_count
+    is the referential coverage ratio the caller scores as evidence.
+    """
+    ft = _fqn(from_table_fqn)
+    fc = _q(from_column)
+    tt = _fqn(to_table_fqn)
+    tc = _q(to_column)
+    nl = _nolock(use_nolock)
+    return (
+        f"SELECT\n"
+        f"    COUNT_BIG(*)                                   AS source_nonnull_count,\n"
+        f"    COUNT_BIG(DISTINCT s.{fc})                     AS source_distinct_count,\n"
+        f"    COUNT_BIG(DISTINCT CASE WHEN t.{tc} IS NOT NULL\n"
+        f"                            THEN s.{fc} END)        AS matched_distinct_count\n"
+        f"FROM {ft} AS s{nl}\n"
+        f"LEFT JOIN {tt} AS t{nl} ON t.{tc} = s.{fc}\n"
+        f"WHERE s.{fc} IS NOT NULL"
+    )
+
+
 def build_percentile_query(
     table_fqn: str,
     column_name: str,
@@ -301,4 +338,62 @@ def build_histogram_query(
         f") AS _hist\n"
         f"GROUP BY bucket_idx\n"
         f"ORDER BY bucket_idx"
+    )
+
+
+def build_view_dependency_query() -> str:
+    """
+    SQL rebuild Phase 5, Step 6 — authoritative, catalog-only, same-database
+    view -> table/view dependency query. Never parses view SQL text and
+    never guesses: every row is resolved by SQL Server's own compiled
+    dependency catalog (sys.sql_expression_dependencies) — the identical
+    mechanism SQL Server Management Studio's own "View Dependencies"
+    feature relies on.
+
+    Every exclusion happens in this WHERE clause — never as a second,
+    Python-side filtering pass:
+      - unresolved/dynamic references:      d.referenced_id IS NOT NULL
+      - ambiguous references SQL Server itself could not uniquely resolve:
+                                             d.is_ambiguous = 0
+      - cross-database / linked-server refs: d.referenced_server_name and
+        d.referenced_database_name must both be blank/absent or name this
+        exact connection's own database
+      - system objects:                     v.is_ms_shipped = 0 AND
+                                             o.is_ms_shipped = 0 AND the
+                                             target schema is never 'sys'
+      - anything that is not a user table or a view (functions/procedures/
+        triggers excluded per this step's own scope): o.type IN ('U','V')
+      - self-references:                    d.referenced_id <> v.object_id
+
+    SELECT DISTINCT collapses SQL Server's own multiple dependency rows for
+    the same (view, target) pair (one row per referenced column, or one per
+    repeated reference in the view body) into exactly one edge per pair —
+    duplicate suppression happens here, in SQL, not as a second pass.
+
+    No table/column/schema name from any specific customer's database is
+    referenced anywhere in this function — every identifier here is a
+    SQL Server SYSTEM catalog object name, present identically on every
+    SQL Server instance.
+    """
+    return (
+        "SELECT DISTINCT\n"
+        "    sv.name AS view_schema,\n"
+        "    v.name  AS view_name,\n"
+        "    st.name AS ref_schema,\n"
+        "    o.name  AS ref_name,\n"
+        "    o.type  AS ref_type\n"
+        "FROM sys.views AS v\n"
+        "JOIN sys.schemas AS sv ON sv.schema_id = v.schema_id\n"
+        "JOIN sys.sql_expression_dependencies AS d ON d.referencing_id = v.object_id\n"
+        "JOIN sys.objects AS o ON o.object_id = d.referenced_id\n"
+        "JOIN sys.schemas AS st ON st.schema_id = o.schema_id\n"
+        "WHERE v.is_ms_shipped = 0\n"
+        "  AND d.referenced_id IS NOT NULL\n"
+        "  AND d.referenced_id <> v.object_id\n"
+        "  AND d.is_ambiguous = 0\n"
+        "  AND (d.referenced_server_name IS NULL OR d.referenced_server_name = '')\n"
+        "  AND (d.referenced_database_name IS NULL OR d.referenced_database_name = DB_NAME())\n"
+        "  AND o.is_ms_shipped = 0\n"
+        "  AND st.name <> 'sys'\n"
+        "  AND o.type IN ('U', 'V')"
     )

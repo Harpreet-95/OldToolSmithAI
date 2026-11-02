@@ -80,7 +80,13 @@ _SCHEMA = """
         relationship_type TEXT    NOT NULL DEFAULT 'FOREIGN_KEY',
         confidence        REAL    NOT NULL DEFAULT 1.0,
         evidence_json     TEXT,
-        created_at        TEXT    NOT NULL DEFAULT '2026-01-01'
+        created_at        TEXT    NOT NULL DEFAULT '2026-01-01',
+        relationship_confidence INTEGER NOT NULL DEFAULT 100,
+        inference_method  TEXT    NOT NULL DEFAULT 'declared_fk',
+        relationship_status TEXT  NOT NULL DEFAULT 'AUTO',
+        cardinality       TEXT    NOT NULL DEFAULT 'UNKNOWN',
+        approved_by       TEXT,
+        approved_at       TEXT
     );
     CREATE UNIQUE INDEX idx_tr_uniq ON table_relationships
         (snapshot_id, from_table_fqn, from_column, to_table_fqn, to_column);

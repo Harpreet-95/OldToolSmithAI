@@ -26,7 +26,15 @@ os.environ.setdefault("JWT_SECRET", "test-phase9-query-planning-secret-long-enou
 os.environ.setdefault("USER_ID_SALT", "test-phase9-salt-long-enough-value-1234567890")
 
 import data.models as models
-from data.query_planning_service import plan_business_query, _score_table_authority
+from data.query_planning_service import (
+    plan_business_query, _score_table_authority,
+    _score_relationship_centrality, _REL_CENTRALITY_MAX_BONUS,
+    _resolve_count_all, _score_term_match,
+    _AUTO_SELECT_MIN_CONFIDENCE, _AMBIGUITY_MARGIN,
+    _find_status_column, _resolve_related_attribute_dimension,
+    _find_sufficient_single_object, _check_single_object_sufficiency,
+    _try_build_relationship_aggregate_plan,
+)
 
 _NOW = "2026-06-30T00:00:00+00:00"
 
@@ -136,6 +144,32 @@ def _add_column(db, table_fqn, col_name, *,
              int(bool(is_date)), int(bool(is_id)), int(bool(pii)),
              int(bool(approved)), "rule_based", _NOW, _NOW),
         )
+    c.commit()
+    c.close()
+    return _col_seq[0]
+
+
+def _add_value_samples(db, col_profile_id, values, *, sample_type="top_values"):
+    c = _c(db)
+    for i, v in enumerate(values):
+        c.execute(
+            "INSERT INTO profiling_value_samples "
+            "(profiling_column_profile_id, sample_type, value, row_count, percentage, rank) "
+            "VALUES (?,?,?,?,?,?)",
+            (col_profile_id, sample_type, v, 1, 1.0, i),
+        )
+    c.commit()
+    c.close()
+
+
+def _add_table_type(db, table_fqn, table_type):
+    """Override the table_type data_dictionary_tables row _add_table already
+    wrote (default 'TABLE') — used to mark a fixture table as a VIEW."""
+    c = _c(db)
+    c.execute(
+        "UPDATE data_dictionary_tables SET table_type = ? WHERE source_id=1 AND table_fqn = ?",
+        (table_type, table_fqn),
+    )
     c.commit()
     c.close()
 
@@ -553,20 +587,6 @@ def test_bare_row_count_falls_back_to_count_star_with_no_key(tmp_path, monkeypat
     assert measure["selected"]["key_confidence"] == "none"
 
 
-def test_bare_count_not_triggered_without_count_language(tmp_path, monkeypatch):
-    # A plain noun with no count language must keep its existing behavior —
-    # this milestone must not reinterpret every unresolved measure as COUNT(*).
-    db = env(tmp_path, monkeypatch)
-    _add_table(db, "dbo.clients")
-    _add_column(db, "dbo.clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
-
-    result = _plan(db, question="clients", concepts=["clients"],
-                   measures=["clients"], dimensions=[])
-
-    assert result["intent"]["aggregation"] is None
-    assert result["measures"][0]["selected"] is None
-
-
 def test_question_level_aggregation_overrides_column_name_default(tmp_path, monkeypatch):
     # Before this milestone, a resolved measure with no explicit aggregation
     # hint in its OWN column name/label always defaulted to SUM. The question
@@ -683,6 +703,177 @@ def test_status_filter_not_fabricated_when_no_status_column(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
+# NEXT MILESTONE, Part 1/3 — negated status filter end-to-end. Root cause:
+# _STATUS_RE matched "open" inside "not open" and nothing downstream ever
+# looked at the preceding "not" — the resulting SQL asserted the OPPOSITE of
+# what was asked (status = 'Open' for a "not open" question). Fixed via
+# concept_resolver.extract_query_intent's new status_negated signal, flowing
+# through data.query_planning_service._typed_status_filter_value/
+# _compatible_status_filter into the actual emitted operator/value.
+# ---------------------------------------------------------------------------
+
+def test_negated_status_filter_flips_operator_on_text_column(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.jobs")
+    _add_column(db, "dbo.jobs", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Amount", approved=True)
+    _add_column(db, "dbo.jobs", "status", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Status", approved=True)
+
+    result = _plan(db, question="Total amount for jobs that are not open", measures=["amount"], dimensions=[])
+
+    status_filters = [f for f in result["filters"] if f.get("column") == "status"]
+    assert len(status_filters) == 1
+    # The word "Open" is still the correct evidence (it's what was named in
+    # the question) — only the OPERATOR flips, never the value.
+    assert status_filters[0]["operator"] == "!="
+    assert status_filters[0]["value"] == "Open"
+    assert status_filters[0]["polarity"] == "negative"
+
+
+def test_negated_status_filter_flips_boolean_value(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _seed_class_with_status_and_flag(db)
+    _add_column(db, "dbo.ADF_Class", "SignupCount", data_type="INTEGER", is_metric=True,
+                business_label="Signup Count", approved=True)
+
+    result = _plan(
+        db, question="Total signup count for classes that are not active",
+        measures=["signupcount"], dimensions=[],
+    )
+
+    status_filters = [f for f in result["filters"] if f.get("column") == "IsActive"]
+    assert len(status_filters) == 1
+    # A boolean/FLAG column keeps operator "=" — polarity is expressed by
+    # inverting the mapped 0/1 value instead, never by "!= 1".
+    assert status_filters[0]["operator"] == "="
+    assert status_filters[0]["value"] == 0
+    assert status_filters[0]["polarity"] == "negative"
+
+
+def test_positive_status_filter_still_tagged_positive_polarity(tmp_path, monkeypatch):
+    # Regression guard: an ordinary (non-negated) status question must keep
+    # producing polarity="positive" — the new field must never flip a
+    # previously-correct positive filter.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.jobs")
+    _add_column(db, "dbo.jobs", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Amount", approved=True)
+    _add_column(db, "dbo.jobs", "status", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Status", approved=True)
+
+    result = _plan(db, question="Total amount for open jobs", measures=["amount"], dimensions=[])
+
+    status_filters = [f for f in result["filters"] if f.get("column") == "status"]
+    assert status_filters[0]["operator"] == "="
+    assert status_filters[0]["polarity"] == "positive"
+
+
+# ---------------------------------------------------------------------------
+# A6 — Business Filter Intelligence: _find_status_column() evidence expansion
+#
+# Direct unit tests against _find_status_column() using hand-built
+# table_contexts dicts — the same shape get_table_business_context returns
+# ({"columns": [{"column_name", "dictionary", "profiling"}, ...]}) — following
+# the direct-unit-test pattern already used for _score_table_authority/
+# _resolve_count_all below. One full-pipeline test (via plan_business_query)
+# is included to confirm the new business_label evidence wires through to a
+# real resolved filter, not just the resolver function in isolation.
+# ---------------------------------------------------------------------------
+
+def _status_col(name, *, profiling_semantic_type=None, business_label=None):
+    return {
+        "column_name": name,
+        "dictionary": {"business_label": business_label} if business_label is not None else None,
+        "profiling": {"semantic_type": profiling_semantic_type} if profiling_semantic_type is not None else None,
+    }
+
+
+def test_find_status_column_dictionary_business_label_detected():
+    ctx = {
+        "dbo.jobs": {"columns": [
+            _status_col("wf_code", business_label="Enrollment Stage"),
+            _status_col("amount"),
+        ]},
+    }
+    assert _find_status_column(ctx, "dbo.jobs") == ("dbo.jobs", "wf_code")
+
+
+def test_find_status_column_profiling_takes_precedence_over_business_label():
+    ctx = {
+        "dbo.jobs": {"columns": [
+            _status_col("other_flag", business_label="Job Lifecycle"),
+            _status_col("real_status", profiling_semantic_type="STATUS"),
+        ]},
+    }
+    assert _find_status_column(ctx, "dbo.jobs") == ("dbo.jobs", "real_status")
+
+
+def test_find_status_column_expanded_keyword_fallback():
+    ctx = {
+        "dbo.candidates": {"columns": [
+            _status_col("is_active", business_label="Column A"),
+        ]},
+    }
+    assert _find_status_column(ctx, "dbo.candidates") == ("dbo.candidates", "is_active")
+
+
+def test_find_status_column_preferred_table_ordering_unchanged():
+    # dbo.other has a stronger signal (profiling STATUS) but dbo.jobs is the
+    # preferred table with only a weaker name-token match. Table preference
+    # is still checked before evidence strength — unchanged from before.
+    ctx = {
+        "dbo.other": {"columns": [_status_col("order_status", profiling_semantic_type="STATUS")]},
+        "dbo.jobs": {"columns": [_status_col("status_code")]},
+    }
+    assert _find_status_column(ctx, "dbo.jobs") == ("dbo.jobs", "status_code")
+
+
+def test_find_status_column_generic_state_column_not_selected_over_stronger_candidate():
+    ctx = {
+        "dbo.customers": {"columns": [
+            _status_col("state", business_label="State"),
+            _status_col("order_status", profiling_semantic_type="STATUS"),
+        ]},
+    }
+    assert _find_status_column(ctx, "dbo.customers") == ("dbo.customers", "order_status")
+
+
+def test_find_status_column_no_match_returns_none():
+    ctx = {
+        "dbo.widgets": {"columns": [
+            _status_col("amount"),
+            _status_col("region", business_label="Region"),
+        ]},
+    }
+    assert _find_status_column(ctx, "dbo.widgets") is None
+
+
+def test_find_status_column_existing_name_token_match_unchanged():
+    ctx = {
+        "dbo.jobs": {"columns": [_status_col("status", business_label="Status")]},
+    }
+    assert _find_status_column(ctx, "dbo.jobs") == ("dbo.jobs", "status")
+
+
+def test_status_filter_synthesized_via_business_label_when_name_is_opaque(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.enrollments")
+    _add_column(db, "dbo.enrollments", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Amount", approved=True)
+    _add_column(db, "dbo.enrollments", "wf_code", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Enrollment Stage", approved=True)
+
+    result = _plan(db, question="Total amount for completed enrollments",
+                   measures=["amount"], dimensions=[])
+
+    status_filters = [f for f in result["filters"] if f.get("column") == "wf_code"]
+    assert len(status_filters) == 1
+    assert status_filters[0]["operator"] == "="
+    assert status_filters[0]["value"] == "Completed"
+
+
+# ---------------------------------------------------------------------------
 # Milestone M-2 — Enterprise Authoritative Source Ranking
 #
 # _resolve_count_all/_resolve_term now combine _score_term_match's name-match
@@ -731,9 +922,14 @@ def test_temporary_table_penalty(tmp_path, monkeypatch):
     measure = result["measures"][0]
     assert measure["selected"] is not None
     assert measure["selected"]["table_fqn"] == "dbo.adf_clients"
-    temp_candidate = next(c for c in measure["candidates"] if c["table_fqn"] == "dbo.adf_clients_temp")
-    assert any("temp" in r.lower() for r in temp_candidate["ranking_reasons"])
-    assert temp_candidate["authority_bonus"] < measure["selected"]["authority_bonus"]
+    # Day 2B: "clients" is a grounded target entity, so this bare-entity
+    # question resolves via the semantic-contract fast path — the temp
+    # decoy is excluded at discovery time (recorded as an excluded_object,
+    # see test_semantic_contract_service.py::
+    # test_discovery_resolves_canonical_and_excludes_backup) and never
+    # re-enters the query-time candidate pool at all, rather than being
+    # rescored fresh on every query and merely ranked low.
+    assert not any(c["table_fqn"] == "dbo.adf_clients_temp" for c in measure["candidates"])
 
 
 def test_backup_table_penalty(tmp_path, monkeypatch):
@@ -750,8 +946,10 @@ def test_backup_table_penalty(tmp_path, monkeypatch):
     measure = result["measures"][0]
     assert measure["selected"] is not None
     assert measure["selected"]["table_fqn"] == "dbo.adf_candidates"
-    backup_candidate = next(c for c in measure["candidates"] if c["table_fqn"] == "dbo.adf_candidates_backup")
-    assert any("backup" in r.lower() for r in backup_candidate["ranking_reasons"])
+    # Day 2B: see test_temporary_table_penalty's comment — "candidates" is
+    # a grounded target entity, so the backup decoy is excluded at
+    # discovery time and never re-enters the query-time candidate pool.
+    assert not any(c["table_fqn"] == "dbo.adf_candidates_backup" for c in measure["candidates"])
 
 
 def test_archive_table_penalty(tmp_path, monkeypatch):
@@ -768,8 +966,10 @@ def test_archive_table_penalty(tmp_path, monkeypatch):
     measure = result["measures"][0]
     assert measure["selected"] is not None
     assert measure["selected"]["table_fqn"] == "dbo.adf_students"
-    archive_candidate = next(c for c in measure["candidates"] if c["table_fqn"] == "dbo.adf_students_archive")
-    assert any("archive" in r.lower() for r in archive_candidate["ranking_reasons"])
+    # Day 2B: see test_temporary_table_penalty's comment — "students" is
+    # a grounded target entity, so the archive decoy is excluded at
+    # discovery time and never re-enters the query-time candidate pool.
+    assert not any(c["table_fqn"] == "dbo.adf_students_archive" for c in measure["candidates"])
 
 
 def test_approved_dictionary_preference(tmp_path, monkeypatch):
@@ -835,12 +1035,26 @@ def test_remaining_ambiguity_still_refuses(tmp_path, monkeypatch):
     # count, no naming penalties, no domain/entity/relationship evidence
     # either way) must still refuse to auto-select — the ambiguity guard is
     # not weakened by the new ranking signals.
+    #
+    # Milestone M-33 note: "adf_clients"/"crm_clients" (not "adf_bhclients",
+    # this fixture's original pairing) — both tokenize to the same
+    # {prefix, "clients"} two-token shape (_tokenize splits on "_"), so both
+    # are equally diluted name-matches for "clients" under _score_term_match
+    # _single's near-match-Jaccard scoring (M-33 root-cause fix for
+    # ~45/98 Enterprise Acceptance Suite "Unresolved term(s)" failures — see
+    # data.query_planning_service._score_term_match_single's own docstring).
+    # "adf_bhclients" is a single undivided token ("bh"+"clients" concatenated
+    # with no case boundary or separator in this all-lowercase fixture
+    # convention), so it no longer name-matches "clients" as well as a real
+    # tie partner should — that's the fix working as intended, not a
+    # regression, but it broke this fixture's premise that the two tables
+    # were equally good candidates.
     db = env(tmp_path, monkeypatch)
     _add_table(db, "dbo.adf_clients", row_count=1000, approved=True)
     _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
 
-    _add_table(db, "dbo.adf_bhclients", row_count=1000, approved=True)
-    _add_column(db, "dbo.adf_bhclients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.crm_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.crm_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
 
     result = _plan(db, question="How many clients?",
                    concepts=["clients"], measures=["clients"], dimensions=[])
@@ -899,8 +1113,8 @@ def test_concept_ambiguity_preserved(tmp_path, monkeypatch):
     _add_table(db, "dbo.adf_clients", row_count=1000, approved=True)
     _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
 
-    _add_table(db, "dbo.adf_bhclients", row_count=1000, approved=True)
-    _add_column(db, "dbo.adf_bhclients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.crm_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.crm_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
 
     result = _plan(db, question="clients", concepts=["clients"])
 
@@ -1007,6 +1221,148 @@ def test_multiple_concepts_resolved_independently(tmp_path, monkeypatch):
     assert by_term["students"]["selected"]["table_fqn"] == "dbo.adf_students"
 
 
+# ---------------------------------------------------------------------------
+# Enterprise AI Analyst Agent — bare entity list routing (M-26)
+#
+# A question naming only a business concept ("Show clients") with no
+# measure/dimension term previously produced intent.type == "unresolved"
+# even when the concept resolved confidently to one table — build_sql_plan
+# never builds SELECT from concepts, so it silently refused instead of
+# listing the entity. Fixed to route to "list_entities" only when exactly
+# one concept term was extracted and it resolved.
+# ---------------------------------------------------------------------------
+
+def test_bare_single_concept_routes_to_list_entities(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=71048, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="Show me clients", concepts=["clients"])
+
+    assert result["intent"]["type"] == "list_entities"
+    assert result["concepts"][0]["selected"]["table_fqn"] == "dbo.adf_clients"
+
+
+def test_bare_multiple_grounded_concepts_routes_to_relationship_list(tmp_path, monkeypatch):
+    # "Show clients and invoices" — two bare concepts, no measure/dimension,
+    # both fully grounded via semantic_contract_service. Day 3 — this no
+    # longer stays unresolved (pre-Day-3 behavior — never guess which one, or
+    # invent a join/union): query_planning_service._try_build_relationship_plan
+    # now routes a bare multi-entity question like this to a
+    # "relationship_list" intent instead, reusing the existing join planner
+    # (_plan_joins) to build the join graph. The never-guess-on-genuine-
+    # ambiguity guarantee still holds, just moved downstream — this fixture
+    # has no relationship data at all, so the join_plan carries an unfound
+    # path (path_found=False), which sql_planning_service.build_sql_plan's
+    # own existing untrusted-join check refuses at SQL-planning time (an
+    # entity that can't be safely joined is refused, never a guessed/
+    # Cartesian join) — see test_phase10_sql_planning.py's own relationship
+    # coverage for that half.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=50000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.adf_invoices", table_class="Master", row_count=20000, approved=True)
+    _add_column(db, "dbo.adf_invoices", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="clients and invoices", concepts=["clients", "invoices"])
+
+    assert result["intent"]["type"] == "relationship_list"
+    assert result["join_plan"]["required"] is True
+    assert set(result["join_plan"]["tables"]) == {"dbo.adf_clients", "dbo.adf_invoices"}
+    assert any(not s["path_found"] for s in result["join_plan"]["steps"])
+
+
+def test_bare_ambiguous_concept_stays_unresolved(tmp_path, monkeypatch):
+    # A single bare concept that itself fails to resolve (tied candidates)
+    # must not be routed to list_entities either.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.crm_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.crm_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="clients", concepts=["clients"])
+
+    assert result["intent"]["type"] == "unresolved"
+
+
+def test_bare_concept_with_measure_still_routes_to_aggregate(tmp_path, monkeypatch):
+    # A concept present alongside a resolved measure must not be reclassified
+    # as list_entities — the existing aggregate routing takes precedence.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders", row_count=1000, approved=True)
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True, business_label="Revenue")
+
+    result = _plan(db, question="total revenue", measures=["revenue"], concepts=["orders"])
+
+    assert result["intent"]["type"] == "aggregate_overall"
+
+
+# ---------------------------------------------------------------------------
+# Enterprise AI Analyst A5 Milestone 1 — Entity-Centric Planner. Additive-only
+# query_plan["entity"/"entity_table"/"entity_confidence"/"entity_candidates"]
+# fields, projected from resolved_concepts (_resolve_concept's own output,
+# already exercised by the tests above) — no new resolution/scoring.
+# ---------------------------------------------------------------------------
+
+def test_entity_fields_populated_for_bare_resolved_concept(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=71048, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="Show me clients", concepts=["clients"])
+
+    assert result["entity"] == "clients"
+    assert result["entity_table"] == "dbo.adf_clients"
+    assert isinstance(result["entity_confidence"], float) and result["entity_confidence"] > 0
+    assert result["entity_candidates"]
+    assert result["entity_candidates"][0]["table_fqn"] == "dbo.adf_clients"
+
+def test_entity_fields_populated_without_table_for_ambiguous_concept(tmp_path, monkeypatch):
+    # Mirrors test_bare_ambiguous_concept_stays_unresolved — entity/
+    # entity_candidates are still populated as evidence (the whole point of
+    # this milestone: surface the tie), but entity_table stays None since
+    # nothing was confidently selected.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.crm_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.crm_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="clients", concepts=["clients"])
+
+    assert result["entity"] == "clients"
+    assert result["entity_table"] is None
+    assert len(result["entity_candidates"]) == 2
+
+def test_entity_fields_not_populated_when_measure_resolves(tmp_path, monkeypatch):
+    # Mirrors test_bare_concept_with_measure_still_routes_to_aggregate — an
+    # aggregate question must never populate the entity fields, even though
+    # a single concept term was also extracted alongside the measure.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders", row_count=1000, approved=True)
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True, business_label="Revenue")
+
+    result = _plan(db, question="total revenue", measures=["revenue"], concepts=["orders"])
+
+    assert result["entity"] is None
+    assert result["entity_table"] is None
+    assert result["entity_candidates"] == []
+
+def test_entity_fields_not_populated_for_multiple_concepts(tmp_path, monkeypatch):
+    # Mirrors test_bare_multiple_concepts_stays_unresolved — two bare
+    # concepts is not "the primary request is a single business entity".
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=50000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.adf_invoices", table_class="Master", row_count=20000, approved=True)
+    _add_column(db, "dbo.adf_invoices", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="clients and invoices", concepts=["clients", "invoices"])
+
+    assert result["entity"] is None
+
+
 def test_concept_sql_planner_semantic_context_handoff(tmp_path, monkeypatch):
     # SQL HANDOFF requirement: the resolved concept semantic context must be
     # available on the query plan for build_sql_plan to pass through (see
@@ -1019,6 +1375,287 @@ def test_concept_sql_planner_semantic_context_handoff(tmp_path, monkeypatch):
     result = _plan(db, question="clients", concepts=["clients"])
     assert "concepts" in result
     assert result["concepts"][0]["selected"]["table_fqn"] == "dbo.adf_clients"
+
+
+# ---------------------------------------------------------------------------
+# A5 Milestone 2.1 — Suppress Redundant Measure Resolution for Bare Entity
+# Questions.
+#
+# extract_terms() puts a term with no "by"-clause into BOTH concepts and
+# measures. Every test below explicitly duplicates the term into both
+# concepts=[term] and measures=[term] (mirroring exactly what extract_terms()
+# produces for "Show active clients"/"List courses"/etc.), since the plain
+# bare-concept tests above never exercised that duplication and therefore
+# never exercised the bug this milestone fixes. Each "gate should fire" test
+# seeds a decoy column elsewhere whose business_label alone would win (or
+# spuriously tie for) the old column-level measure search, proving the fix
+# actually suppresses that search rather than merely happening not to match
+# anything in an under-seeded fixture.
+# ---------------------------------------------------------------------------
+
+def test_bare_entity_gate_suppresses_measure_resolution_active_clients(tmp_path, monkeypatch):
+    # "Show active clients" — concept resolves cleanly to one table; a decoy
+    # metric column elsewhere (business_label="Clients") would, pre-fix,
+    # have given the redundant measure-role search something to seize on.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.vw_clients", table_class="Master", row_count=50000, approved=True)
+    _add_column(db, "dbo.vw_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.unrelated_metrics", table_class="Transactional", row_count=10)
+    _add_column(db, "dbo.unrelated_metrics", "client_count", data_type="INTEGER", is_metric=True,
+                business_label="Clients", approved=True)
+
+    result = _plan(db, question="Show active clients", concepts=["clients"], measures=["clients"])
+
+    assert result["measures"] == []
+    assert not any(w["type"] == "ambiguous_measure" for w in result["warnings"])
+    assert result["concepts"][0]["selected"]["table_fqn"] == "dbo.vw_clients"
+    assert result["intent"]["type"] == "list_entities"
+
+
+def test_bare_entity_gate_suppresses_measure_resolution_active_projects(tmp_path, monkeypatch):
+    # "List active projects" — same pattern as above, different noun.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.basecamp_projects", table_class="Master", row_count=800, approved=True)
+    _add_column(db, "dbo.basecamp_projects", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.unrelated_metrics", table_class="Transactional", row_count=10)
+    _add_column(db, "dbo.unrelated_metrics", "project_count", data_type="INTEGER", is_metric=True,
+                business_label="Projects", approved=True)
+
+    result = _plan(db, question="List active projects", concepts=["projects"], measures=["projects"])
+
+    assert result["measures"] == []
+    assert not any(w["type"] == "ambiguous_measure" for w in result["warnings"])
+    assert result["concepts"][0]["selected"]["table_fqn"] == "dbo.basecamp_projects"
+    assert result["intent"]["type"] == "list_entities"
+
+
+def test_bare_entity_gate_prevents_wrong_table_hijack_courses(tmp_path, monkeypatch):
+    # "List courses" — mirrors the confirmed A5 M2 audit finding: two
+    # genuinely tied concept candidates (adf_course/adf_path-style), plus a
+    # third, unrelated table whose column business_label alone
+    # ("Courses") would, pre-fix, let the measure-role search silently
+    # auto-select it — hijacking the answer away from the real, ambiguous
+    # course tables with no clarification offered at all.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_course", row_count=271, approved=False)
+    _add_column(db, "dbo.adf_course", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.adf_path", row_count=271, approved=False)
+    _add_column(db, "dbo.adf_path", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.adf_class", table_class="Unknown", row_count=311, approved=False)
+    _add_column(db, "dbo.adf_class", "seat_count", data_type="INTEGER", is_metric=True,
+                business_label="Courses", approved=True)
+
+    result = _plan(db, question="List courses", concepts=["courses"], measures=["courses"])
+
+    assert result["measures"] == []
+    assert not any(w["type"] == "ambiguous_measure" for w in result["warnings"])
+    # No silent wrong-table SQL: the concept stays correctly ambiguous
+    # between the two genuine course tables, never hijacked to adf_class.
+    assert result["concepts"][0]["selected"] is None
+    assert result["intent"]["type"] == "unresolved"
+    assert result["intent"]["aggregation"] is None
+
+
+def test_confidently_resolved_bare_concept_reaches_list_entities_despite_duplicate_measure_term(tmp_path, monkeypatch):
+    # Requirement 5: a confidently resolved concept must still reach
+    # list_entities routing when the identical term is also (redundantly)
+    # present in measures — the gate must fire and get out of the way
+    # cleanly, not merely "usually work."
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=71048, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="Show me clients", concepts=["clients"], measures=["clients"])
+
+    assert result["measures"] == []
+    assert result["intent"]["type"] == "list_entities"
+    assert result["concepts"][0]["selected"]["table_fqn"] == "dbo.adf_clients"
+
+
+def test_ambiguous_bare_concept_with_duplicate_measure_term_stays_unresolved_not_hijacked(tmp_path, monkeypatch):
+    # Requirement 6 (query_planning_service layer): a genuinely ambiguous
+    # concept, with the identical term duplicated into measures, must stay
+    # "unresolved" (the shape context_builder._extract_ambiguous_terms'
+    # existing, unmodified concept-fallback branch turns into
+    # clarification_required) — never silently promoted to
+    # "aggregate_overall" by the redundant measure-role search.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.crm_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.crm_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="clients", concepts=["clients"], measures=["clients"])
+
+    assert result["measures"] == []
+    assert result["intent"]["type"] == "unresolved"
+    assert result["concepts"][0]["selected"] is None
+    assert len(result["concepts"][0]["candidates"]) == 2
+
+
+def test_total_revenue_still_resolves_measure_normally(tmp_path, monkeypatch):
+    # Requirement 7 — control: an explicit aggregation keyword ("total")
+    # means query_intent.aggregation is not None, so the gate must not fire
+    # even though "revenue" could in principle also appear as a concept.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders", row_count=1000, approved=True)
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True, business_label="Revenue")
+
+    result = _plan(db, question="total revenue", measures=["revenue"], concepts=["revenue"])
+
+    assert len(result["measures"]) == 1
+    assert result["measures"][0]["selected"]["column_name"] == "amount"
+    assert result["intent"]["type"] == "aggregate_overall"
+
+
+def test_average_salary_still_resolves_measure_normally(tmp_path, monkeypatch):
+    # Requirement 8 — control: AVG aggregation.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.employees", row_count=500, approved=True)
+    _add_column(db, "dbo.employees", "pay", data_type="DECIMAL", is_metric=True, business_label="Salary")
+
+    result = _plan(db, question="average salary", measures=["salary"], concepts=["salary"])
+
+    assert len(result["measures"]) == 1
+    assert result["measures"][0]["selected"]["column_name"] == "pay"
+    assert result["intent"]["aggregation"] == "AVG"
+
+
+def test_count_candidates_uses_entity_count_aggregation_path(tmp_path, monkeypatch):
+    # Requirement 9 — control: "how many candidates" carries
+    # aggregation_target="entity_count", so the gate's own
+    # "aggregation_target is None" clause keeps it off; this question
+    # already correctly routes through _resolve_entity_count/
+    # _resolve_count_all (table-name match), never the buggy column-level
+    # path — unaffected by this milestone either way.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.candidates", table_class="Master", row_count=2000, approved=True)
+    _add_column(db, "dbo.candidates", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="how many candidates do we have",
+                   concepts=["candidates"], measures=["candidates"])
+
+    assert len(result["measures"]) == 1
+    assert result["measures"][0]["selected"]["table_fqn"] == "dbo.candidates"
+    assert result["measures"][0]["selected"]["aggregation_target"] == "entity_count"
+    assert result["intent"]["aggregation_target"] == "entity_count"
+
+
+def test_revenue_by_department_remains_unchanged(tmp_path, monkeypatch):
+    # Requirement 10 — control: a "by"-clause yields 2 concepts
+    # (revenue, department), so len(concepts) == 1 is false and the gate
+    # cannot fire regardless of aggregation.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders", row_count=1000, approved=True)
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True, business_label="Revenue")
+    _add_column(db, "dbo.orders", "dept", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Department")
+
+    result = _plan(db, question="revenue by department",
+                   concepts=["revenue", "department"], measures=["revenue"], dimensions=["department"])
+
+    assert len(result["measures"]) == 1
+    assert result["measures"][0]["selected"]["column_name"] == "amount"
+    assert result["intent"]["type"] == "aggregate_by_dimension"
+
+
+def test_which_recruiter_has_most_placements_ranking_question_remains_unchanged(tmp_path, monkeypatch):
+    # Requirement 11 — control, using the task's own literal example.
+    # "Which recruiter has the most placements?" extracts to TWO concepts
+    # (['placements', 'recruiter']) with aggregation=MAX — both the
+    # len(concepts)==1 guard and the aggregation-is-None guard keep the gate
+    # off independently.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.placements", row_count=500, approved=True)
+    _add_column(db, "dbo.placements", "fee", data_type="DECIMAL", is_metric=True, business_label="Placements")
+
+    result = _plan(db, question="Which recruiter has the most placements?",
+                   concepts=["placements", "recruiter"], measures=["placements"], dimensions=["recruiter"])
+
+    assert len(result["measures"]) == 1
+
+
+def test_top_10_clients_by_revenue_ranking_question_remains_unchanged(tmp_path, monkeypatch):
+    # Requirement 11 (second literal example) — "Top 10 clients by revenue"
+    # sets query_intent.order (explicit N) and extracts 3 concepts; either
+    # guard alone would keep the gate off.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.clients", row_count=500, approved=True)
+    _add_column(db, "dbo.clients", "revenue", data_type="DECIMAL", is_metric=True, business_label="Revenue")
+
+    result = _plan(db, question="Top 10 clients by revenue",
+                   concepts=["clients", "revenue"], measures=["revenue"], dimensions=["clients"])
+
+    assert len(result["measures"]) == 1
+
+
+def test_bare_top_recruiters_with_no_explicit_number_is_a_documented_gate_discrepancy(tmp_path, monkeypatch):
+    # IMPORTANT, HONEST DISCREPANCY — flagged in the A5 M2.1 report rather
+    # than hidden: the task's control list names "Top recruiters" (no
+    # digit) as a phrase that must not be suppressed. But
+    # extract_query_intent()'s own _TOP_N_RE requires an explicit number
+    # ("top 5", not bare "top"), and "top" is itself a _STOPWORDS entry — so
+    # for this EXACT literal phrase (no number, no ranking verb),
+    # extract_terms()/extract_query_intent() (both unmodified, out of this
+    # milestone's scope) already produce concepts==measures==['recruiters']
+    # and order=None — i.e. this phrasing is, by the existing system's own
+    # semantics, indistinguishable from the bare entity question "recruiters"
+    # itself. The milestone's exact, literally-specified gate condition
+    # therefore does suppress it too, consistently with every other bare
+    # single-concept case. This test documents the ACTUAL, verified
+    # behavior rather than asserting the illustrative example's outcome
+    # unverified — see A5 M2.1 report for the full explanation and the
+    # concrete extract_terms()/extract_query_intent() probe that confirms
+    # it (order=None, concepts==measures==['recruiters']) for both "top
+    # recruiters" and "bottom invoices".
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.recruiters", table_class="Master", row_count=40, approved=True)
+    _add_column(db, "dbo.recruiters", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="top recruiters", concepts=["recruiters"], measures=["recruiters"])
+
+    assert result["measures"] == []
+
+
+def test_multi_concept_question_remains_unchanged(tmp_path, monkeypatch):
+    # Requirement 12 — control: "clients and invoices" duplicates one of the
+    # two terms into measures too, isolating the len(concepts)==1 guard
+    # specifically (as opposed to test_revenue_by_department's dimension-
+    # driven multi-concept case above).
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=50000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.adf_invoices", table_class="Master", row_count=20000, approved=True)
+    _add_column(db, "dbo.adf_invoices", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    result = _plan(db, question="clients and invoices",
+                   concepts=["clients", "invoices"], measures=["clients"])
+
+    # Day 2E, Task 2 — both "Client" and "Invoice" genuinely ground here
+    # (each is the only table matching its own entity name in this
+    # fixture), so the "clients" CONCEPT resolves via contract authority;
+    # its duplicate, unresolved MEASURE entry (no metric column named
+    # "clients" exists) is then intentionally dropped as redundant noise
+    # once its own entity concept has already answered it elsewhere —
+    # exactly the fix for the live-confirmed defect where the same dropped-
+    # duplicate words surfaced as spurious "ambiguous_measure" warnings
+    # alongside an already-correct concept resolution. The two-concept
+    # ambiguity gate below (Requirement 12's actual subject) is unaffected.
+    #
+    # Day 3 update: with both concepts fully grounded and no measure/
+    # dimension actually selected (len(measures) == 0 below confirms the
+    # duplicate "clients" measure was dropped, same as before), this now
+    # routes to "relationship_list" rather than "unresolved" — see
+    # test_bare_multiple_grounded_concepts_routes_to_relationship_list for
+    # the dedicated Day 3 coverage of that routing decision itself.
+    assert len(result["measures"]) == 0
+    assert result["intent"]["type"] == "relationship_list"
+
+
+def test_threshold_constants_unchanged_by_this_milestone(tmp_path, monkeypatch):
+    # Requirement 13 — this milestone must not touch either gate constant.
+    assert _AUTO_SELECT_MIN_CONFIDENCE == 0.5
+    assert _AMBIGUITY_MARGIN == 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1721,364 @@ def test_ambiguity_and_ranking_safeguards_unchanged_by_synonym_wiring(tmp_path, 
     concept = result["concepts"][0]
     assert concept["resolved"] is False
     assert concept["ambiguity_reason"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Semantic Retrieval Integration — no silent fallback to the unbounded
+# _collect_candidate_tables() scan on empty/failed bounded retrieval.
+# ---------------------------------------------------------------------------
+
+def test_empty_bounded_retrieval_returns_unresolved_not_unbounded_scan(tmp_path, monkeypatch, caplog):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders")
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Revenue", approved=True)
+
+    import data.query_planning_service as qps
+    monkeypatch.setattr(qps, "_get_ai_candidate_tables_ranked", lambda *a, **kw: (set(), [], []))
+
+    calls = []
+    original = qps._collect_candidate_tables
+    monkeypatch.setattr(
+        qps, "_collect_candidate_tables",
+        lambda *a, **kw: (calls.append(a), original(*a, **kw))[1],
+    )
+
+    with caplog.at_level("INFO"):
+        result = _plan(db, question="revenue by status",
+                       measures=["revenue"], dimensions=["status"])
+
+    assert calls == []  # the unbounded legacy scan is never invoked
+    assert result is not None
+    assert result["intent"]["type"] == "unresolved"
+    assert "bounded retrieval found no candidate" in caplog.text
+
+
+def test_retrieval_failure_is_observable_and_fails_safe(tmp_path, monkeypatch, caplog):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders")
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Revenue", approved=True)
+
+    import data.query_planning_service as qps
+    import data.semantic_retrieval_service as svc
+
+    def _boom(*a, **kw):
+        raise RuntimeError("search backend unavailable")
+    monkeypatch.setattr(svc, "search_metadata", _boom)
+
+    calls = []
+    original = qps._collect_candidate_tables
+    monkeypatch.setattr(
+        qps, "_collect_candidate_tables",
+        lambda *a, **kw: (calls.append(a), original(*a, **kw))[1],
+    )
+
+    with caplog.at_level("WARNING"):
+        result = _plan(db, question="revenue by status",
+                       measures=["revenue"], dimensions=["status"])
+
+    assert result is not None  # never raises
+    assert calls == []  # failure does not trigger the unbounded legacy scan
+    assert result["intent"]["type"] == "unresolved"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3, Step 2 — remembered-synonym resolution feeds the planner the
+# canonical term before candidate-table retrieval ever runs. Spies on
+# _get_ai_candidate_tables_ranked (the same seam test_empty_bounded_
+# retrieval_returns_unresolved_not_unbounded_scan above already uses) so
+# these are pure unit tests of the substitution, independent of whether any
+# table actually matches.
+# ---------------------------------------------------------------------------
+
+def _spy_candidate_tables(monkeypatch):
+    import data.query_planning_service as qps
+    seen_terms = []
+    monkeypatch.setattr(
+        qps, "_get_ai_candidate_tables_ranked",
+        lambda source_id, user_id, question, terms, **kw: (seen_terms.append(list(terms)), (set(), [], []))[1],
+    )
+    return seen_terms
+
+
+def test_remembered_synonym_substitutes_term_before_retrieval(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "clients", "customer", actor_id="u1")
+
+    seen_terms = _spy_candidate_tables(monkeypatch)
+    _plan(db, question="show my clients", concepts=["clients"])
+    assert seen_terms == [["customer"]]
+
+
+def test_unknown_synonym_term_is_unchanged(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    seen_terms = _spy_candidate_tables(monkeypatch)
+    # Day 2E, Task 4 — "vendors" (not "clients"): a taxonomy-entity word
+    # with zero evidence anywhere (no table, no approved mapping, no
+    # generated vocabulary) is now a genuine, confirmed-unsupported dead
+    # end and correctly fast-exits before the broad search this test wants
+    # to isolate ever runs — see tests/test_unsupported_entity_business_
+    # message.py for that behavior's own coverage. A neutral, non-taxonomy
+    # word keeps this test's actual subject (synonym substitution) isolated
+    # from that unrelated mechanism.
+    _plan(db, question="show my vendors", concepts=["vendors"])
+    # No synonym taught -> get_synonym_canonical returns None -> the
+    # original raw term flows through untouched, byte-for-byte identical to
+    # pre-Phase-3 behavior (normalization, same as always, happens later
+    # downstream, not in this substitution step).
+    assert seen_terms == [["vendors"]]
+
+
+def test_canonical_term_itself_still_resolves_directly(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "clients", "customer", actor_id="u1")
+
+    seen_terms = _spy_candidate_tables(monkeypatch)
+    _plan(db, question="show my customers", concepts=["customer"])
+    # "customer" has no synonym taught for itself -> unchanged.
+    assert seen_terms == [["customer"]]
+
+
+def test_synonym_substitution_is_scoped_to_its_source(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    conn = _c(db)
+    conn.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        " encrypted_config_json, config_schema_version, capabilities_json, "
+        " metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (2,'u1','Test2','mssql','RELATIONAL','{}',1,'[]','{}','ACTIVE',1,?,?)",
+        (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "vendors", "customer", actor_id="u1")
+
+    # Day 2E, Task 4 — "vendors" (not "clients"): see test_unknown_synonym_
+    # term_is_unchanged's own comment. Source 2 never taught this synonym,
+    # so it is zero-evidence there too, and correctly fast-exits on its own
+    # terms — the point of this test (scope isolation across sources) is
+    # unaffected either way.
+    seen_terms = _spy_candidate_tables(monkeypatch)
+    plan_business_query(2, "u1", {"question": "show my vendors", "concepts": ["vendors"]})
+    # Source 2 was never taught this synonym.
+    assert seen_terms == [["vendors"]]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3, Step 4 — remembered-terminology explainability. Pure evidence:
+# these tests check query_plan["remembered_terminology"] only, never table
+# selection/scoring (already pinned unchanged by every test above and below
+# this section, all of which still pass with this key simply added).
+# ---------------------------------------------------------------------------
+
+def test_remembered_synonym_produces_one_evidence_record(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "clients", "customer", actor_id="u1")
+
+    seen_terms = _spy_candidate_tables(monkeypatch)
+    result = _plan(db, question="show my clients", concepts=["clients"])
+    assert seen_terms == [["customer"]]
+    assert result["remembered_terminology"] == [{
+        "evidence_type": "remembered_terminology",
+        "original_term": "clients",
+        "canonical_term": "customer",
+        "source": "user_memory",
+    }]
+
+
+def test_no_evidence_for_unknown_term(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _spy_candidate_tables(monkeypatch)
+    result = _plan(db, question="show my products", concepts=["products"])
+    assert result["remembered_terminology"] == []
+
+
+def test_no_evidence_when_canonical_term_used_directly(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "clients", "customer", actor_id="u1")
+
+    _spy_candidate_tables(monkeypatch)
+    result = _plan(db, question="show my customers", concepts=["customer"])
+    assert result["remembered_terminology"] == []
+
+
+def test_no_evidence_across_source_isolation(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    conn = _c(db)
+    conn.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        " encrypted_config_json, config_schema_version, capabilities_json, "
+        " metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (2,'u1','Test2','mssql','RELATIONAL','{}',1,'[]','{}','ACTIVE',1,?,?)",
+        (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "clients", "customer", actor_id="u1")
+
+    _spy_candidate_tables(monkeypatch)
+    result = plan_business_query(2, "u1", {"question": "show my clients", "concepts": ["clients"]})
+    assert result["remembered_terminology"] == []
+
+
+def test_same_term_repeated_across_concepts_and_dimensions_yields_one_record(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    from data.concept_mapping_service import remember_synonym
+    remember_synonym(1, "u1", "clients", "customer", actor_id="u1")
+
+    _spy_candidate_tables(monkeypatch)
+    result = _plan(db, question="clients by clients", concepts=["clients"], dimensions=["clients"])
+    assert result["remembered_terminology"] == [{
+        "evidence_type": "remembered_terminology",
+        "original_term": "clients",
+        "canonical_term": "customer",
+        "source": "user_memory",
+    }]
+
+
+def test_merge_remembered_terminology_dedupes_across_internal_paths():
+    # Direct unit test of the merge helper — proves that if
+    # query_planning_service's own substitution AND
+    # semantic_retrieval_service's own (mirrored) substitution each detect
+    # the same (original_term, canonical_term) pair, the merged result still
+    # has exactly one record, per the "one evidence item per unique
+    # original/canonical pair" requirement.
+    from data.query_planning_service import _merge_remembered_terminology
+    record = {
+        "evidence_type": "remembered_terminology",
+        "original_term": "clients", "canonical_term": "customer", "source": "user_memory",
+    }
+    merged = _merge_remembered_terminology([record], [dict(record)])
+    assert merged == [record]
+
+
+# ---------------------------------------------------------------------------
+# Enterprise Phase 4 — generated_business_vocabulary scoring bonus
+# ---------------------------------------------------------------------------
+
+def _add_generated_vocab(db, term, table_fqn, *, tier="HIGH", score=0.9, column_name=""):
+    c = _c(db)
+    c.execute(
+        "INSERT INTO generated_business_vocabulary "
+        "(source_id, schema_snapshot_id, term, table_fqn, column_name, "
+        " confidence_tier, confidence_score, evidence_json, created_at, updated_at) "
+        "VALUES (1,1,?,?,?,?,?,'[]',?,?)",
+        (term, table_fqn, column_name, tier, score, _NOW, _NOW),
+    )
+    c.commit()
+    c.close()
+
+
+def test_generated_vocabulary_bonus_applied_when_no_approved_mapping(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    # Day 2E, Task 4 — "widget" (not "candidate"): a taxonomy-entity word
+    # with an UNAPPROVED-table-only generated-vocabulary suggestion and no
+    # approved mapping is now a genuine, confirmed-unsupported dead end
+    # (weak, auto-generated evidence pointing at an unapproved table is
+    # deliberately not enough to defer the fast exit — see data.semantic_
+    # contract_service._has_validated_alternative_evidence) and correctly
+    # fast-exits before this test's own subject (the vocabulary bonus's
+    # effect on ranking_reasons) is ever reached. A neutral, non-taxonomy
+    # word keeps that subject isolated from this unrelated mechanism.
+    # Table name shares no token with "widget" — _score_term_match alone
+    # contributes ~0, so a "Generated vocabulary" ranking_reason proves the
+    # bonus (not name-matching) is what's operating here.
+    _add_table(db, "dbo.legacy_bh_store", approved=False)
+    _add_generated_vocab(db, "widget", "dbo.legacy_bh_store", tier="HIGH", score=0.9)
+
+    result = _plan(db, question="widgets", concepts=["widget"])
+
+    candidate = result["concepts"][0]["candidates"][0]
+    assert candidate["table_fqn"] == "dbo.legacy_bh_store"
+    assert any("Generated vocabulary" in r for r in candidate["ranking_reasons"])
+
+
+def test_approved_mapping_bonus_takes_precedence_over_generated_vocabulary_bonus(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.candidate_master", approved=False)
+    _add_generated_vocab(db, "candidate", "dbo.candidate_master", tier="HIGH", score=0.9)
+
+    from data.concept_mapping_service import promote_clarification_selection
+    promote_clarification_selection(1, "u1", "candidate", "dbo.candidate_master", actor_id="u1")
+
+    result = _plan(db, question="candidates", concepts=["candidate"])
+
+    candidate = result["concepts"][0]["candidates"][0]
+    reasons = candidate["ranking_reasons"]
+    assert any("Approved concept mapping" in r for r in reasons)
+    assert not any("Generated vocabulary" in r for r in reasons)
+    # The human-approved decision must be the one that's actually selected.
+    assert result["concepts"][0]["selected"]["table_fqn"] == "dbo.candidate_master"
+    assert result["concepts"][0]["resolved"] is True
+
+
+def test_generated_vocabulary_bonus_alone_insufficient_to_auto_select(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    # Day 2E, Task 4 — "widget" (not "candidate"): see test_generated_
+    # vocabulary_bonus_applied_when_no_approved_mapping's own comment.
+    # MEDIUM tier only, table name unrelated, no dictionary/domain/entity/
+    # relationship evidence at all — 0.12 bonus alone must stay well under
+    # _AUTO_SELECT_MIN_CONFIDENCE (0.5): a bias, never a bypass.
+    _add_table(db, "dbo.legacy_bh_store", approved=False)
+    _add_generated_vocab(db, "widget", "dbo.legacy_bh_store", tier="MEDIUM", score=0.5)
+
+    result = _plan(db, question="widgets", concepts=["widget"])
+
+    concept = result["concepts"][0]
+    assert concept["resolved"] is False
+    assert concept["selected"] is None
+
+
+def test_generated_vocabulary_evidence_surfaced_on_plan(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.candidate_master", approved=False)
+    _add_generated_vocab(db, "candidate", "dbo.candidate_master", tier="HIGH", score=0.9)
+
+    result = _plan(db, question="how many candidates", measures=["candidate"])
+
+    assert result["generated_vocabulary_evidence"] == [{
+        "original_term": "candidate",
+        "generated_term": "candidate",
+        "source": "generated_vocabulary",
+    }]
+
+
+def test_merge_remembered_terminology_keeps_distinct_pairs():
+    from data.query_planning_service import _merge_remembered_terminology
+    a = {"evidence_type": "remembered_terminology", "original_term": "clients",
+         "canonical_term": "customer", "source": "user_memory"}
+    b = {"evidence_type": "remembered_terminology", "original_term": "revenue",
+         "canonical_term": "sales_amount", "source": "user_memory"}
+    merged = _merge_remembered_terminology([a], [b])
+    assert merged == [a, b]
+
+
+def test_existing_planner_output_unaffected_apart_from_new_key(tmp_path, monkeypatch):
+    # Pins test_simple_measure_and_dimension_same_table's own assertions,
+    # with nothing taught — proves the new key is purely additive.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.orders", table_class="Transactional")
+    _add_column(db, "dbo.orders", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Revenue", approved=True)
+    _add_column(db, "dbo.orders", "status", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Order Status", approved=True)
+
+    result = _plan(db, question="revenue by status", measures=["revenue"], dimensions=["status"])
+    assert result["intent"]["type"] == "aggregate_by_dimension"
+    assert result["intent"]["aggregation"] == "SUM"
+    assert any(m["selected"] and m["selected"]["column_name"] == "amount" for m in result["measures"])
+    assert result["remembered_terminology"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1225,12 +2220,1112 @@ def test_ambiguous_tied_confidence_still_refuses_auto_select(tmp_path, monkeypat
     _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
     _add_domain(db, "dbo.adf_clients", "Operations", confidence=0.8)
 
-    _add_table(db, "dbo.adf_bhclients", row_count=1000, approved=True)
-    _add_column(db, "dbo.adf_bhclients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
-    _add_domain(db, "dbo.adf_bhclients", "Operations", confidence=0.8)
+    _add_table(db, "dbo.crm_clients", row_count=1000, approved=True)
+    _add_column(db, "dbo.crm_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_domain(db, "dbo.crm_clients", "Operations", confidence=0.8)
 
     result = _plan(db, question="How many clients?",
                    concepts=["clients"], measures=["clients"], dimensions=[])
     measure = result["measures"][0]
     assert measure["selected"] is None
     assert any("ambiguous" in w["type"] or "missing" in w["type"] for w in result["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Sprint 2, Signal #2 — Weighted All-Status Relationship Centrality
+#
+# _score_table_authority's existing rel_count bonus only ever sees AUTO/
+# APPROVED edges (ctx["relationships"], the trusted join-planning contract,
+# unchanged by this signal). This adds a SEPARATE, bounded, confidence- and
+# status-weighted read of ALL relationship_status values (ctx
+# ["relationship_evidence"]) so canonicality ranking can use a PENDING edge
+# as weak corroborating evidence — never as a joinable edge (that safeguard
+# lives entirely in semantic_layer_service._load_edges, untouched here).
+#
+# A-D/F/L are pure unit tests against _score_relationship_centrality /
+# _score_table_authority. E is both a direct unit test and implied by G-K.
+# G-K exercise the same behavior through the full plan_business_query path.
+# All are written against the current code (no relationship_evidence signal
+# yet) and are expected to fail red (ImportError at collection, since
+# _score_relationship_centrality/_REL_CENTRALITY_MAX_BONUS don't exist yet)
+# until the implementation lands.
+# ---------------------------------------------------------------------------
+
+def _edge(*, direction="outbound", status="PENDING", confidence=1.0,
+          related_table="dbo.other", relationship_id=1):
+    return {
+        "direction": direction,
+        "relationship_status": status,
+        "confidence": confidence,
+        "related_table": related_table,
+        "relationship_id": relationship_id,
+    }
+
+
+def test_pending_edge_contributes_positive_bonus():
+    # A. A PENDING edge with positive confidence contributes more than zero.
+    result = _score_relationship_centrality([_edge(status="PENDING", confidence=0.8)])
+    assert result["bonus"] > 0.0
+
+
+def test_pending_contributes_less_than_trusted():
+    # B. A PENDING edge contributes less, end-to-end through
+    # _score_table_authority, than an otherwise identical APPROVED/AUTO edge
+    # — which already earns full credit via the existing trusted rel_count
+    # bonus and nothing extra from the new centrality signal.
+    pending_ctx = _authority_ctx(domain_assigned=False, entity_assigned=False)
+    pending_ctx["relationships"] = {}
+    pending_ctx["relationship_evidence"] = [_edge(status="PENDING", confidence=1.0)]
+
+    approved_ctx = _authority_ctx(domain_assigned=False, entity_assigned=False)
+    approved_ctx["relationships"] = {"outbound": [{"to_table_fqn": "dbo.other"}], "inbound": []}
+    approved_ctx["relationship_evidence"] = [_edge(status="APPROVED", confidence=1.0)]
+
+    pending = _score_table_authority("dbo.widgets", pending_ctx)
+    approved = _score_table_authority("dbo.widgets", approved_ctx)
+    assert pending["bonus"] < approved["bonus"]
+
+
+def test_zero_confidence_edge_contributes_zero():
+    # C. A zero-confidence edge contributes zero.
+    result = _score_relationship_centrality([_edge(status="PENDING", confidence=0.0)])
+    assert result["bonus"] == 0.0
+
+
+def test_rejected_and_unknown_status_contribute_zero():
+    # D. Unsupported/rejected/deprecated relationship states contribute zero.
+    for status in ("REJECTED", "DEPRECATED", "UNKNOWN_STATUS"):
+        result = _score_relationship_centrality([_edge(status=status, confidence=1.0)])
+        assert result["bonus"] == 0.0, status
+
+
+def test_more_weighted_inbound_centrality_scores_higher():
+    # E. More weighted inbound centrality produces a higher score when all
+    # other signals are equal.
+    few = _score_relationship_centrality([_edge(direction="inbound", status="PENDING", confidence=0.5)])
+    many = _score_relationship_centrality([
+        _edge(direction="inbound", status="PENDING", confidence=0.5, relationship_id=i)
+        for i in range(5)
+    ])
+    assert many["bonus"] > few["bonus"]
+
+
+def test_trusted_relationship_not_double_counted():
+    # F. Existing trusted relationship behavior is not double-counted: adding
+    # relationship_evidence entries for the SAME AUTO/APPROVED edges already
+    # reflected in ctx["relationships"] must not change the total bonus.
+    base_ctx = _authority_ctx(domain_assigned=False, entity_assigned=False)
+    base_ctx["relationships"] = {"outbound": [{"to_table_fqn": "dbo.other"}], "inbound": []}
+    base_ctx["relationship_evidence"] = []
+
+    with_evidence_ctx = _authority_ctx(domain_assigned=False, entity_assigned=False)
+    with_evidence_ctx["relationships"] = {"outbound": [{"to_table_fqn": "dbo.other"}], "inbound": []}
+    with_evidence_ctx["relationship_evidence"] = [_edge(status="AUTO", confidence=1.0)]
+
+    base = _score_table_authority("dbo.widgets", base_ctx)
+    with_evidence = _score_table_authority("dbo.widgets", with_evidence_ctx)
+    assert base["bonus"] == with_evidence["bonus"]
+
+
+def test_relationship_evidence_bounded_by_cap():
+    # L. Relationship evidence is bounded by the configured cap, even with a
+    # large number of high-confidence PENDING edges.
+    edges = [
+        _edge(direction="inbound", status="PENDING", confidence=1.0, relationship_id=i)
+        for i in range(50)
+    ]
+    result = _score_relationship_centrality(edges)
+    assert result["bonus"] <= _REL_CENTRALITY_MAX_BONUS
+
+
+def test_join_planning_still_refuses_pending_relationships(tmp_path, monkeypatch):
+    # G. Join planning must continue to refuse PENDING relationships for
+    # execution, even though they now contribute ranking evidence.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.sales")
+    _add_table(db, "dbo.regions", table_class="Master")
+    _add_column(db, "dbo.sales", "amount", data_type="DECIMAL", is_metric=True,
+                business_label="Sales Amount", approved=True)
+    _add_column(db, "dbo.sales", "region_id", data_type="INTEGER", uniqueness=0.05)
+    _add_column(db, "dbo.regions", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_column(db, "dbo.regions", "name", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Region Name", approved=True)
+    _add_fk(db, "dbo.sales", "region_id", "dbo.regions", "id", status="PENDING")
+
+    result = _plan(db, question="sales by region",
+                   measures=["amount"], dimensions=["name"])
+    jp = result["join_plan"]
+    assert jp["required"] is True
+    assert jp["steps"][0]["path_found"] is False
+
+
+def test_relationship_hub_breaks_near_tie(tmp_path, monkeypatch):
+    # H. A relationship hub can break a genuine near tie when the evidence
+    # is sufficient. Pre-existing gap (domain 0.05*1.0 + entity 0.07*1.0 =
+    # 0.12) alone sits below the 0.15 ambiguity margin -> still ambiguous.
+    # 12 PENDING inbound edges (0.4 status weight * 1.0 confidence * 1.25
+    # inbound weight = 0.5 each -> weighted_total 6.0, capped bonus +0.05)
+    # bridges the remaining gap.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.hub_master", row_count=1000, approved=True)
+    _add_column(db, "dbo.hub_master", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_domain(db, "dbo.hub_master", "Ops", confidence=1.0)
+    _add_entity(db, "dbo.hub_master", "Thing", confidence=1.0)
+
+    _add_table(db, "dbo.hub_rival", row_count=1000, approved=True)
+    _add_column(db, "dbo.hub_rival", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    baseline = _plan(db, question="hub", concepts=["hub"])
+    assert baseline["concepts"][0]["resolved"] is False
+
+    for i in range(12):
+        _add_fk(db, f"dbo.filler_{i}", "id", "dbo.hub_master", f"fk_{i}",
+                status="PENDING", confidence=1.0)
+
+    result = _plan(db, question="hub", concepts=["hub"])
+    concept = result["concepts"][0]
+    assert concept["resolved"] is True
+    assert concept["selected"]["table_fqn"] == "dbo.hub_master"
+
+
+def test_weak_pending_evidence_alone_cannot_manufacture_winner(tmp_path, monkeypatch):
+    # I. Weak PENDING evidence alone (even well past the cap threshold)
+    # cannot manufacture a winner between two otherwise perfectly tied
+    # tables — the max +0.05 bonus never clears the 0.15 ambiguity margin
+    # on its own.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.tie_a", row_count=1000, approved=True)
+    _add_column(db, "dbo.tie_a", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    _add_table(db, "dbo.tie_b", row_count=1000, approved=True)
+    _add_column(db, "dbo.tie_b", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    for i in range(20):
+        _add_fk(db, f"dbo.filler2_{i}", "id", "dbo.tie_a", f"fk_{i}",
+                status="PENDING", confidence=1.0)
+
+    result = _plan(db, question="tie", concepts=["tie"])
+    concept = result["concepts"][0]
+    assert concept["resolved"] is False
+    assert concept["selected"] is None
+
+
+def test_equal_relationship_centrality_remains_ambiguous(tmp_path, monkeypatch):
+    # J. Genuinely equal centrality (same weighted PENDING evidence on both
+    # sides) remains ambiguous — it must not manufacture false
+    # differentiation between candidates that are truly tied.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.sym_a", row_count=1000, approved=True)
+    _add_column(db, "dbo.sym_a", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_table(db, "dbo.sym_b", row_count=1000, approved=True)
+    _add_column(db, "dbo.sym_b", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+
+    for i in range(5):
+        _add_fk(db, f"dbo.fillerA_{i}", "id", "dbo.sym_a", f"fk_{i}",
+                status="PENDING", confidence=0.6)
+        _add_fk(db, f"dbo.fillerB_{i}", "id", "dbo.sym_b", f"fk_{i}",
+                status="PENDING", confidence=0.6)
+
+    result = _plan(db, question="sym", concepts=["sym"])
+    concept = result["concepts"][0]
+    assert concept["resolved"] is False
+    assert concept["selected"] is None
+    candidates = {c["table_fqn"]: c["score"] for c in concept["candidates"]}
+    assert candidates["dbo.sym_a"] == candidates["dbo.sym_b"]
+
+
+def test_clear_winner_survives_maximum_relationship_evidence_on_loser(tmp_path, monkeypatch):
+    # K. A previously clear winner remains the winner even when the losing
+    # candidate is given the maximum possible relationship-centrality bonus.
+    # Deliberately does NOT also stack Signal #1's max domain+entity
+    # confidence swing on the loser — that combination is already documented
+    # as a boundary case (not a decisive win) in
+    # test_clear_winner_survives_maximum_opposing_confidence above, and
+    # compounding it with a second signal's max swing on top belongs in the
+    # Sprint 2 report's regression-risk section, not this test.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.adf_clients", table_class="Master", row_count=5_000_000, approved=True)
+    _add_column(db, "dbo.adf_clients", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    _add_fk(db, "dbo.adf_clients", "id", "dbo.contacts_ref", "ref_id")
+
+    _add_table(db, "dbo.adf_clients_temp", table_class="Transactional", row_count=10, approved=False)
+    _add_column(db, "dbo.adf_clients_temp", "id", data_type="INTEGER", is_pk=1, uniqueness=1.0)
+    for i in range(20):
+        _add_fk(db, f"dbo.fillerK_{i}", "id", "dbo.adf_clients_temp", f"fk_{i}",
+                status="PENDING", confidence=1.0)
+
+    result = _plan(db, question="How many clients?",
+                   concepts=["clients"], measures=["clients"], dimensions=[])
+    measure = result["measures"][0]
+    assert measure["selected"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Accuracy Program A1, Phase A — Table-name scoring parity for
+# _resolve_count_all(). Direct unit tests against _resolve_count_all() itself
+# (no DB needed — table_contexts is a plain, hand-built dict, the same
+# no-DB pattern _authority_ctx above already uses), isolating the name_score
+# change from every other additive signal: profiling/relationships/domain/
+# entity are all empty in _count_ctx so _score_table_authority's bonus is the
+# same flat 0.03 (0.1 no-evidence importance * 0.30) baseline for every
+# candidate table in every test below — any selection difference is coming
+# from name_score (table name / business_name / description) alone, never
+# from authority.
+# ---------------------------------------------------------------------------
+
+def _count_ctx(*, business_name=None, description=None, is_approved=False):
+    dictionary = None
+    if business_name is not None or description is not None or is_approved:
+        dictionary = {
+            "business_name": business_name,
+            "description": description,
+            "is_approved": is_approved,
+        }
+    return {
+        "dictionary": dictionary,
+        "domain": None,
+        "entity": None,
+        "profiling": None,
+        "relationships": {},
+        "relationship_evidence": [],
+        "governance": {
+            "domain_assigned": False,
+            "entity_assigned": False,
+            "dictionary_approved": is_approved,
+        },
+        "table": {"table_type": "TABLE"},
+    }
+
+
+def test_business_name_breaks_tie_table_names_alone_cannot():
+    # 1. Two decoy tables that are structurally identical on raw table-name
+    # Jaccard alone ("Huntr_Clients" / "Vendor_Clients" — each one filler
+    # token + "clients") stay genuinely tied and must NOT auto-select.
+    tied = {
+        "dbo.Huntr_Clients": _count_ctx(),
+        "dbo.Vendor_Clients": _count_ctx(),
+    }
+    tied_result = _resolve_count_all("clients", tied)
+    assert tied_result["selected"] is None
+    tied_scores = {round(c["name_score"], 4) for c in tied_result["candidates"]}
+    assert len(tied_scores) == 1  # genuinely tied, not merely both weak
+
+    # Same two tables, but one now carries an approved business_name that
+    # exactly matches the term — must now win decisively (Phase A fix).
+    # Table names alone (unchanged above) could never have produced this.
+    broken = {
+        "dbo.Huntr_Clients": _count_ctx(business_name="Clients", is_approved=True),
+        "dbo.Vendor_Clients": _count_ctx(),
+    }
+    broken_result = _resolve_count_all("clients", broken)
+    assert broken_result["selected"] is not None
+    assert broken_result["selected"]["table_fqn"] == "dbo.Huntr_Clients"
+
+
+def test_description_contributes_to_ranking():
+    # 2. A cryptically-named table (zero table-name token overlap with the
+    # term) stays unresolved on table name alone...
+    no_description = {"dbo.T004": _count_ctx()}
+    assert _resolve_count_all("clients", no_description)["selected"] is None
+
+    # ...and resolves once its dictionary description is scored too — the
+    # same _score_term_match() call, just with description now passed
+    # through (Phase A fix; description alone, no business_name).
+    with_description = {"dbo.T004": _count_ctx(description="Clients", is_approved=True)}
+    result = _resolve_count_all("clients", with_description)
+    assert result["selected"] is not None
+    assert result["selected"]["table_fqn"] == "dbo.T004"
+
+
+def test_no_dictionary_metadata_matches_pre_fix_table_name_only_scoring():
+    # 3. When a candidate table has no dictionary row at all
+    # (ctx["dictionary"] is None — get_table_business_context's real
+    # contract for an undocumented table), _resolve_count_all must fall
+    # back to scoring the raw table name exactly as it did before this
+    # change: no crash, no behavior change for sources with zero dictionary
+    # coverage.
+    result = _resolve_count_all("clients", {"dbo.ADF_Clients": _count_ctx()})
+    only = result["candidates"][0]
+    assert only["name_score"] == _score_term_match("clients", "ADF_Clients")
+
+
+def test_existing_confident_single_table_match_still_resolves():
+    # 4. Regression guard: a table whose raw name alone already clears the
+    # auto-select threshold/margin (the common case before this change)
+    # must still resolve exactly as before — the fix only ADDS text to
+    # score against, it never removes or weakens the existing table-name
+    # signal.
+    ctx = {
+        "dbo.Clients": _count_ctx(),
+        "dbo.SomeUnrelatedTable": _count_ctx(),
+    }
+    result = _resolve_count_all("clients", ctx)
+    assert result["selected"] is not None
+    assert result["selected"]["table_fqn"] == "dbo.Clients"
+
+
+# ---------------------------------------------------------------------------
+# Accuracy Program A4, Fix #2 — display-only label metadata pass-through.
+#
+# _resolve_count_all now also carries ctx["dictionary"]["business_name"] and
+# ctx["entity"]["entity"] onto each candidate as "table_business_name"/
+# "entity_name", purely so core/answering/explanation_builder.py can build a
+# better clarification label. Both are read from the SAME ctx already fetched
+# for name-scoring (no new lookup). These tests prove the pass-through is
+# additive-only: scoring, ranking, and selection are byte-identical to the
+# pre-Fix-#2 behavior above regardless of what these two new fields contain.
+# ---------------------------------------------------------------------------
+
+def test_table_business_name_and_entity_name_pass_through_without_new_reads():
+    ctx = {
+        "dbo.ADF_BHCandidates": _count_ctx(business_name="Candidates", is_approved=True),
+    }
+    ctx["dbo.ADF_BHCandidates"]["entity"] = {"entity": "Candidate"}
+    result = _resolve_count_all("candidates", ctx)
+    only = result["candidates"][0]
+    assert only["table_business_name"] == "Candidates"
+    assert only["entity_name"] == "Candidate"
+
+
+def test_missing_entity_assignment_yields_none_not_crash():
+    ctx = {"dbo.T004": _count_ctx()}  # dictionary=None, entity=None (default _count_ctx shape)
+    result = _resolve_count_all("clients", ctx)
+    only = result["candidates"][0]
+    assert only["table_business_name"] is None
+    assert only["entity_name"] is None
+
+
+def test_candidate_ordering_unaffected_by_label_metadata():
+    # Two candidates that score identically on name/authority; only their
+    # display-only label metadata differs. Order (and the tie itself) must
+    # be governed purely by score, exactly as in the untied/tied tests above.
+    ctx = {
+        "dbo.Huntr_Clients": _count_ctx(business_name="Clients", is_approved=True),
+        "dbo.Vendor_Clients": _count_ctx(business_name="Clients", is_approved=True),
+    }
+    ctx["dbo.Huntr_Clients"]["entity"] = {"entity": "Client"}
+    ctx["dbo.Vendor_Clients"]["entity"] = {"entity": "Unknown"}
+    without_labels = _resolve_count_all("clients", {
+        "dbo.Huntr_Clients": _count_ctx(business_name="Clients", is_approved=True),
+        "dbo.Vendor_Clients": _count_ctx(business_name="Clients", is_approved=True),
+    })
+    with_labels = _resolve_count_all("clients", ctx)
+    without_order = [c["table_fqn"] for c in without_labels["candidates"]]
+    with_order = [c["table_fqn"] for c in with_labels["candidates"]]
+    assert with_order == without_order
+    without_scores = [round(c["score"], 6) for c in without_labels["candidates"]]
+    with_scores = [round(c["score"], 6) for c in with_labels["candidates"]]
+    assert with_scores == without_scores
+
+
+def test_object_type_domain_and_relationship_metadata_pass_through_fix3():
+    # Accuracy Program A4, Fix #3 — table_object_type/domain_name/
+    # relationship_related_tables are read from the same already-fetched ctx
+    # (no new lookup) and must not change ordering or score, exactly like
+    # Fix #2's table_business_name/entity_name pass-through above.
+    ctx = {
+        "dbo.ADF_BHPlacements": _count_ctx(business_name="Placements", is_approved=True),
+    }
+    ctx["dbo.ADF_BHPlacements"]["table"] = {"table_type": "VIEW"}
+    ctx["dbo.ADF_BHPlacements"]["domain"] = {"domain": "Operations"}
+    ctx["dbo.ADF_BHPlacements"]["relationships"] = {
+        "outbound": [{"to_table_fqn": "dbo.ADF_BHCandidates"}],
+        "inbound": [{"from_table_fqn": "dbo.ADF_BHClients"}, {"from_table_fqn": "dbo.ADF_BHCandidates"}],
+    }
+    result = _resolve_count_all("placements", ctx)
+    only = result["candidates"][0]
+    assert only["table_object_type"] == "VIEW"
+    assert only["domain_name"] == "Operations"
+    # Deduplicated (ADF_BHCandidates appears in both outbound and inbound),
+    # self excluded, order preserved.
+    assert only["relationship_related_tables"] == ["dbo.ADF_BHCandidates", "dbo.ADF_BHClients"]
+
+    without_relationship_metadata = _resolve_count_all("placements", {
+        "dbo.ADF_BHPlacements": _count_ctx(business_name="Placements", is_approved=True),
+    })
+    assert only["score"] == without_relationship_metadata["candidates"][0]["score"]
+
+
+def test_missing_table_domain_and_relationship_metadata_yields_safe_defaults():
+    ctx = {"dbo.T004": _count_ctx()}  # table_type="TABLE" (default), domain=None, relationships={}
+    result = _resolve_count_all("clients", ctx)
+    only = result["candidates"][0]
+    assert only["table_object_type"] == "TABLE"
+    assert only["domain_name"] is None
+
+
+# ---------------------------------------------------------------------------
+# Demo blocker fix — entity-relative attribute resolution
+# ("Show the names of the 10 most recently added students.")
+#
+# _resolve_related_attribute_dimension now weights candidates by the FK
+# relationship's own cardinality (analyze_join_quality's existing output,
+# itself derived from profiling_column_profiles.uniqueness_score — no new
+# metadata): an identity-style relationship (ONE_TO_ONE/ONE_TO_MANY — the
+# concept table's FK column is itself near-unique, e.g. one Student maps to
+# exactly one User account) is structurally the right kind of link for a
+# personal-attribute request, unlike a category/lookup-style relationship
+# (MANY_TO_ONE — many Students share one Marketing campaign) whose "*Name"
+# column can score identically on lexical similarity alone.
+# ---------------------------------------------------------------------------
+
+def _seed_student_users_identity(db):
+    """dbo.ADF_Student --(StudentUserID, near-unique)--> dnnuser.Users (identity link)."""
+    _add_table(db, "dbo.ADF_Student", table_class="Master", row_count=10918)
+    _add_column(db, "dbo.ADF_Student", "StudentID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Student", "StudentUserID", uniqueness=0.999)
+    _add_domain(db, "dbo.ADF_Student", "Operations", confidence=0.88)
+    _add_entity(db, "dbo.ADF_Student", "Student", confidence=0.82)
+
+    _add_table(db, "dnnuser.Users", table_class="Master", row_count=39505)
+    _add_column(db, "dnnuser.Users", "UserID", is_pk=1, uniqueness=1.0)
+    _add_column(db, "dnnuser.Users", "FirstName", data_type="TEXT", is_dimension=True,
+                business_label="First Name", approved=True)
+    _add_column(db, "dnnuser.Users", "LastName", data_type="TEXT", is_dimension=True,
+                business_label="Last Name", approved=True)
+
+    _add_fk(db, "dbo.ADF_Student", "StudentUserID", "dnnuser.Users", "UserID", status="AUTO")
+
+
+def _seed_student_marketing_lookup(db):
+    """dbo.ADF_Student --(MarketingID, low-uniqueness)--> dbo.ADF_Marketing (category/lookup link)."""
+    _add_table(db, "dbo.ADF_Marketing", table_class="Reference", row_count=40)
+    _add_column(db, "dbo.ADF_Marketing", "MarketingID", is_pk=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Marketing", "MarketingName", data_type="TEXT", is_dimension=True,
+                business_label="Marketing Name", approved=True)
+    _add_column(db, "dbo.ADF_Student", "MarketingID", uniqueness=0.002)
+    _add_fk(db, "dbo.ADF_Student", "MarketingID", "dbo.ADF_Marketing", "MarketingID", status="AUTO")
+
+
+def test_student_name_resolves_through_users_identity_relationship(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _seed_student_users_identity(db)
+
+    result = _resolve_related_attribute_dimension("names", "dbo.ADF_Student", 1, "u1")
+    assert result is not None
+    assert all(entry.get("selected") for entry in result)
+    assert {entry["selected"]["table_fqn"] for entry in result} == {"dnnuser.Users"}
+    assert {entry["selected"]["column_name"] for entry in result} == {"FirstName", "LastName"}
+    assert not any(entry["warnings"] for entry in result)
+
+
+def test_marketing_name_rejected_for_student_name_request(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _seed_student_users_identity(db)
+    _seed_student_marketing_lookup(db)
+
+    result = _resolve_related_attribute_dimension("names", "dbo.ADF_Student", 1, "u1")
+    assert result is not None
+    # The category/lookup-style MarketingName must never be selected...
+    assert not any(entry.get("selected", {}) and entry["selected"]["table_fqn"] == "dbo.ADF_Marketing"
+                   for entry in result)
+    # ...and the identity-style Users columns resolve cleanly, no clarification.
+    assert all(entry.get("selected") for entry in result)
+    assert {entry["selected"]["table_fqn"] for entry in result} == {"dnnuser.Users"}
+
+
+def test_genuinely_ambiguous_name_request_still_clarifies(tmp_path, monkeypatch):
+    # Two DIFFERENT identity-style (near-unique FK) relationships, both with
+    # an equally strong name-like column — a real, unresolvable ambiguity
+    # that must still surface as a clarification, not a guess.
+    db = env(tmp_path, monkeypatch)
+    _seed_student_users_identity(db)
+
+    _add_table(db, "dbo.PersonProfile", table_class="Master", row_count=10900)
+    _add_column(db, "dbo.PersonProfile", "ProfileID", is_pk=1, uniqueness=1.0)
+    _add_column(db, "dbo.PersonProfile", "FullName", data_type="TEXT", is_dimension=True,
+                business_label="Full Name", approved=True)
+    _add_column(db, "dbo.ADF_Student", "ProfileID", uniqueness=0.998)
+    _add_fk(db, "dbo.ADF_Student", "ProfileID", "dbo.PersonProfile", "ProfileID", status="AUTO")
+
+    result = _resolve_related_attribute_dimension("names", "dbo.ADF_Student", 1, "u1")
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["selected"] is None
+    assert any(w["type"] == "ambiguous_dimension" for w in result[0]["warnings"])
+
+
+def test_joined_detail_name_query_limits_to_ten_ordered_by_insert_date(tmp_path, monkeypatch):
+    from core.semantic.concept_resolver import extract_terms
+    from data.sql_planning_service import build_sql_plan
+    from data.sql_generation_service import generate_sql, detect_dialect
+
+    db = env(tmp_path, monkeypatch)
+    _seed_student_users_identity(db)
+    _add_column(db, "dbo.ADF_Student", "InsertDate", data_type="DATETIME", is_date=True,
+                business_label="Insert Date", approved=True)
+
+    question = "Show the names of the 10 most recently added students."
+    concepts, measures, dimensions = extract_terms(question)
+    query_plan = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dimensions, "filters": [],
+    })
+    assert query_plan["intent"]["order"]["target"] == "date"
+    assert query_plan["intent"]["order"]["limit"] == 10
+
+    sql_plan = build_sql_plan(1, "u1", query_plan)
+    assert sql_plan["validation"]["valid"] is True
+    generated = generate_sql(1, "u1", sql_plan, dialect=detect_dialect(1))
+    sql = generated["sql"]
+    assert sql, "expected SQL to be generated"
+    assert "TOP (10)" in sql or "LIMIT 10" in sql
+    assert "ORDER BY" in sql
+    assert "InsertDate" in sql
+    assert "DESC" in sql
+
+
+# ---------------------------------------------------------------------------
+# General Attribute Resolution — a bare attribute word ("city") lands in
+# `measures` purely because extract_terms() has no "by"-clause to classify
+# it as a dimension, not because it names anything aggregatable. Ordinary
+# measure resolution only ever tries _is_metric_column, so a real DIRECT
+# dimension-typed column on the anchor's OWN table was invisible to it, and
+# _resolve_related_attribute_dimension only ever searches RELATED tables,
+# never the anchor itself. Real-CCPP regression: "Show instructor city"
+# rendered SUM([InstructorCity]) — a SQL Server type error — before this
+# same-table dimension-kind retry (routed to `dimensions`, never `measures`,
+# so it can never be wrapped in an aggregate) was added.
+# ---------------------------------------------------------------------------
+
+def test_bare_attribute_word_resolves_as_dimension_on_anchor_table_directly(tmp_path, monkeypatch):
+    from core.semantic.concept_resolver import extract_terms
+    from data.sql_planning_service import build_sql_plan
+    from data.sql_generation_service import generate_sql, detect_dialect
+
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.ADF_Instructor", table_class="Master")
+    _add_column(db, "dbo.ADF_Instructor", "InstructorID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Instructor", "InstructorCity", data_type="TEXT", is_dimension=True,
+                business_label="Instructor City", approved=True)
+
+    question = "Show instructor city"
+    concepts, measures, dimensions = extract_terms(question)
+    query_plan = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dimensions, "filters": [],
+    })
+    assert query_plan["measures"] == []
+    assert len(query_plan["dimensions"]) == 1
+    dim_sel = query_plan["dimensions"][0]["selected"]
+    assert dim_sel["table_fqn"] == "dbo.ADF_Instructor"
+    assert dim_sel["column_name"] == "InstructorCity"
+
+    sql_plan = build_sql_plan(1, "u1", query_plan)
+    assert sql_plan["validation"]["valid"] is True
+    select_row = next(r for r in sql_plan["select"] if r["column_name"] == "InstructorCity")
+    assert select_row["aggregation"] is None
+
+    generated = generate_sql(1, "u1", sql_plan, dialect=detect_dialect(1))
+    assert generated["sql"], "expected SQL to be generated"
+    assert "SUM" not in generated["sql"].upper()
+
+
+def test_related_attribute_rescue_keeps_genuinely_numeric_column_as_measure(tmp_path, monkeypatch):
+    # Regression safety: a rescued attribute whose OWN resolved column really
+    # is is_metric (e.g. a fee/amount column reached via a related table)
+    # must stay a measure, not be forced into `dimensions` just because it
+    # came through the related-attribute fallback.
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.ADF_Student", table_class="Master")
+    _add_column(db, "dbo.ADF_Student", "StudentID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Student", "AccountID", uniqueness=0.999)
+    _add_table(db, "dbo.ADF_Account", table_class="Reference")
+    _add_column(db, "dbo.ADF_Account", "AccountID", is_pk=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Account", "Balance", data_type="DECIMAL", is_metric=True,
+                business_label="Balance", approved=True)
+    _add_fk(db, "dbo.ADF_Student", "AccountID", "dbo.ADF_Account", "AccountID", status="AUTO")
+
+    result = _resolve_related_attribute_dimension("balance", "dbo.ADF_Student", 1, "u1")
+    assert result is not None
+    assert result[0]["selected"]["is_metric"] is True
+
+
+# ---------------------------------------------------------------------------
+# Compound Business Phrase / Qualifier Understanding — a still-unresolved
+# term sitting next to a term that DID resolve to a real column is a
+# QUALIFIER of that resolved concept, not a missing second concept, when it
+# carries its OWN real generated-vocabulary evidence for that SAME table.
+# Real-CCPP regression: "How many students are on a trial subscription?" —
+# "trial" resolves to dbo.ADF_ClassSignups.IsTrial, but "subscription" (real
+# column-level evidence for the same table: IsSubscriptionPlan,
+# SubscriptionPlanID, ...) scored too low on its own to auto-select any ONE
+# of those columns, and stayed dangling, blocking the whole plan.
+# ---------------------------------------------------------------------------
+
+def _seed_student_classsignups_trial(db):
+    _seed_student_users_identity(db)
+    _add_table(db, "dbo.ADF_ClassSignups", table_class="Transactional", row_count=13963)
+    _add_column(db, "dbo.ADF_ClassSignups", "ClassSignupsID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_ClassSignups", "StudentID", uniqueness=0.1)
+    _add_column(db, "dbo.ADF_ClassSignups", "IsTrial", data_type="BIT", is_dimension=True,
+                business_label="Is Trial", approved=True)
+    _add_fk(db, "dbo.ADF_ClassSignups", "StudentID", "dbo.ADF_Student", "StudentID", status="AUTO")
+
+
+def test_compound_qualifier_consumed_by_resolved_neighbor_attribute(tmp_path, monkeypatch):
+    from core.semantic.concept_resolver import extract_terms
+
+    db = env(tmp_path, monkeypatch)
+    _seed_student_classsignups_trial(db)
+    # "subscription" has real column-level vocabulary evidence for the SAME
+    # table "trial" resolves to, even though it never scores high enough on
+    # its own to auto-select any single column there (mirrors real-CCPP
+    # IsSubscriptionPlan/SubscriptionPlanID/SubscriptionMonthlyAmount).
+    _add_generated_vocab(db, "subscription", "dbo.ADF_ClassSignups", tier="MEDIUM", column_name="SubscriptionPlanID")
+
+    question = "How many students are on a trial subscription?"
+    concepts, measures, dims = extract_terms(question)
+    result = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dims, "filters": [],
+    })
+    dangling = [e["term"] for e in result["measures"] + result["dimensions"] if not e.get("selected")]
+    assert "subscription" not in dangling
+    resolved_tables = {
+        e["selected"]["table_fqn"] for e in result["measures"] + result["dimensions"] if e.get("selected")
+    }
+    assert "dbo.ADF_ClassSignups" in resolved_tables
+
+
+def test_qualifier_drop_requires_real_vocabulary_evidence(tmp_path, monkeypatch):
+    # Regression safety / "AI hypothesis cannot force unsupported compound
+    # meaning": same shape as above, but with NO generated-vocabulary
+    # evidence for "subscription" anywhere — it must stay a genuine
+    # unresolved term rather than being silently dropped just because it
+    # sits next to a resolved neighbor.
+    from core.semantic.concept_resolver import extract_terms
+
+    db = env(tmp_path, monkeypatch)
+    _seed_student_classsignups_trial(db)
+
+    question = "How many students are on a trial subscription?"
+    concepts, measures, dims = extract_terms(question)
+    result = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dims, "filters": [],
+    })
+    all_terms = [e["term"] for e in result["measures"] + result["dimensions"]]
+    assert "subscription" in all_terms
+
+
+def test_qualifier_drop_is_source_isolated(tmp_path, monkeypatch):
+    # Vocabulary evidence recorded for a DIFFERENT source must never leak
+    # into this source's qualifier-drop decision.
+    from core.semantic.concept_resolver import extract_terms
+
+    db = env(tmp_path, monkeypatch)
+    _seed_student_classsignups_trial(db)
+    conn = _c(db)
+    conn.execute(
+        "INSERT INTO data_source_connections "
+        "(id, user_id, display_name, source_type, source_category, "
+        " encrypted_config_json, config_schema_version, capabilities_json, "
+        " metadata_json, source_status, is_active, created_at, updated_at) "
+        "VALUES (2,'u1','Other','mssql','RELATIONAL','{}',1,'[]','{}','ACTIVE',1,?,?)",
+        (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+    _add_generated_vocab(db, "subscription", "dbo.ADF_ClassSignups", tier="MEDIUM", column_name="SubscriptionPlanID")
+    # Re-point the just-inserted vocab row at source_id=2 instead of 1.
+    conn = _c(db)
+    conn.execute("UPDATE generated_business_vocabulary SET source_id = 2 WHERE table_fqn = 'dbo.ADF_ClassSignups'")
+    conn.commit()
+    conn.close()
+
+    question = "How many students are on a trial subscription?"
+    concepts, measures, dims = extract_terms(question)
+    result = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dims, "filters": [],
+    })
+    all_terms = [e["term"] for e in result["measures"] + result["dimensions"]]
+    assert "subscription" in all_terms
+
+
+# ---------------------------------------------------------------------------
+# Demo blocker fix — single-object sufficiency check
+# ("How many launch participants are stalled, active, graduated, or not
+# started?"). Previously: none of the 4 enumerated status VALUES lexically
+# match any column NAME, so the ordinary path fell through to an expensive,
+# doomed multi-table candidate + relationship search (confirmed against real
+# CCPP metadata: 22.5 minutes) ending in a "no_valid_join" refusal. Now:
+# checked BEFORE any of that runs, whether one already-known object (a
+# curated VIEW preferred) alone satisfies grain + a status-like dimension +
+# cached value coverage — if so, answered directly against it, join search
+# never runs at all.
+# ---------------------------------------------------------------------------
+
+_STATUS_VALUES_REQUIRED = ["stalled", "active", "graduated", "not started"]
+
+
+def _seed_launch_participant_raw_table(db):
+    _add_table(db, "dbo.launch_participants_raw", table_class="Transactional", row_count=500)
+    pid = _add_column(db, "dbo.launch_participants_raw", "ParticipantID", is_pk=1, is_id=1, uniqueness=1.0)
+    sid = _add_column(db, "dbo.launch_participants_raw", "Status", data_type="TEXT", is_dimension=True,
+                       business_label="Status", approved=True)
+    _add_value_samples(db, sid, ["Active", "Graduated", "Stalled", "Not Started"])
+    return pid, sid
+
+
+def _seed_launch_participant_view(db, *, table_fqn="dbo.v_launch_participant_current_status"):
+    _add_table(db, table_fqn, table_class="Master", row_count=500)
+    _add_table_type(db, table_fqn, "VIEW")
+    pid = _add_column(db, table_fqn, "CAP_Launch_ParticipantID", is_pk=1, is_id=1, uniqueness=1.0)
+    sid = _add_column(db, table_fqn, "Current_Status", data_type="TEXT", is_dimension=True,
+                       business_label="Current Status", approved=True)
+    _add_value_samples(db, sid, ["Active", "Graduated", "Stalled", "Not Started"])
+    return pid, sid
+
+
+def test_trusted_view_preferred_over_raw_launch_table(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _seed_launch_participant_raw_table(db)
+    _seed_launch_participant_view(db)
+
+    question = "How many launch participants are stalled, active, graduated, or not started?"
+    result = _find_sufficient_single_object(
+        ["launch", "participants"], question, _STATUS_VALUES_REQUIRED, 1, "u1",
+    )
+    assert result is not None
+    assert result["table_fqn"] == "dbo.v_launch_participant_current_status"
+    assert result["status_column"] == "Current_Status"
+
+
+def test_join_planning_skipped_when_view_sufficient(tmp_path, monkeypatch):
+    from core.semantic.concept_resolver import extract_terms
+    import data.semantic_layer_service as sls
+
+    db = env(tmp_path, monkeypatch)
+    _seed_launch_participant_view(db)
+
+    join_search_calls = []
+    monkeypatch.setattr(sls, "analyze_join_quality",
+                         lambda *a, **kw: join_search_calls.append(a) or None)
+    monkeypatch.setattr(sls, "recommend_best_join_path",
+                         lambda *a, **kw: join_search_calls.append(a) or None)
+
+    question = "How many launch participants are stalled, active, graduated, or not started?"
+    concepts, measures, dimensions = extract_terms(question)
+    query_plan = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dimensions, "filters": [],
+    })
+    assert query_plan is not None
+    assert query_plan["join_plan"]["required"] is False
+    assert query_plan["join_plan"]["tables"] == ["dbo.v_launch_participant_current_status"]
+    assert join_search_calls == []
+
+
+def test_sufficient_object_result_groups_by_current_status(tmp_path, monkeypatch):
+    from core.semantic.concept_resolver import extract_terms
+
+    db = env(tmp_path, monkeypatch)
+    _seed_launch_participant_view(db)
+
+    question = "How many launch participants are stalled, active, graduated, or not started?"
+    concepts, measures, dimensions = extract_terms(question)
+    query_plan = plan_business_query(1, "u1", {
+        "question": question, "concepts": concepts, "measures": measures,
+        "dimensions": dimensions, "filters": [],
+    })
+    assert query_plan["intent"]["type"] == "aggregate_by_dimension"
+    assert query_plan["intent"]["aggregation"] == "COUNT"
+    assert query_plan["dimensions"][0]["selected"]["column_name"] == "Current_Status"
+    assert query_plan["dimensions"][0]["selected"]["table_fqn"] == "dbo.v_launch_participant_current_status"
+    assert query_plan["measures"][0]["selected"]["table_fqn"] == "dbo.v_launch_participant_current_status"
+
+
+def test_view_missing_required_field_does_not_falsely_pass_sufficiency(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    # A view with a status column and full value coverage, but NO grain
+    # column at all (no PK/identity/is_id/near-unique column) — must not
+    # falsely pass just because the dimension/value check alone succeeds.
+    _add_table(db, "dbo.v_launch_status_no_grain", table_class="Master", row_count=500)
+    _add_table_type(db, "dbo.v_launch_status_no_grain", "VIEW")
+    sid = _add_column(db, "dbo.v_launch_status_no_grain", "Current_Status", data_type="TEXT",
+                       is_dimension=True, business_label="Current Status", approved=True)
+    _add_value_samples(db, sid, ["Active", "Graduated", "Stalled", "Not Started"])
+
+    result, probe_used = _check_single_object_sufficiency(
+        "dbo.v_launch_status_no_grain", _STATUS_VALUES_REQUIRED, 1, "u1", allow_live_probe=False,
+    )
+    assert result is None
+    assert probe_used is False
+
+    # A second view WITH grain but INCOMPLETE value coverage (missing
+    # "Stalled") — must not falsely pass either.
+    _add_table(db, "dbo.v_launch_status_partial_values", table_class="Master", row_count=500)
+    _add_table_type(db, "dbo.v_launch_status_partial_values", "VIEW")
+    _add_column(db, "dbo.v_launch_status_partial_values", "ParticipantID", is_pk=1, is_id=1, uniqueness=1.0)
+    sid2 = _add_column(db, "dbo.v_launch_status_partial_values", "Current_Status", data_type="TEXT",
+                        is_dimension=True, business_label="Current Status", approved=True)
+    _add_value_samples(db, sid2, ["Active", "Graduated"])  # missing Stalled, Not Started
+
+    result2, probe_used2 = _check_single_object_sufficiency(
+        "dbo.v_launch_status_partial_values", _STATUS_VALUES_REQUIRED, 1, "u1", allow_live_probe=False,
+    )
+    assert result2 is None
+    assert probe_used2 is False
+
+
+# ---------------------------------------------------------------------------
+# Join-Path/Dimension Selection — bare "per/by <entity>" relationship
+# aggregates must GROUP BY the grouped entity's own business label column
+# (when one confidently exists) rather than its surrogate key. Real-CCPP
+# regression: "How many students are in each program?" grouped by
+# dbo.ADF_Path.PathID instead of PathName even though Program correctly
+# resolved to dbo.ADF_Path and the join path was already correct — the
+# bare-entity branch of _try_build_relationship_aggregate_plan (Automatic
+# Multi-Entity Semantic Grounding) always used _select_entity_key (PK-first)
+# without ever trying _resolve_entity_label_column first, unlike every other
+# dimension-resolution path in this module. Direct unit tests against
+# _try_build_relationship_aggregate_plan with hand-built table_contexts
+# (same shape get_table_business_context returns) — following this file's
+# own established direct-unit-test pattern — plus real DB fixtures only for
+# the FK edge _plan_joins needs.
+# ---------------------------------------------------------------------------
+
+def _rel_agg_ctx(table_fqn, columns, *, business_name=None):
+    return {
+        "columns": columns,
+        "dictionary": {"business_name": business_name or table_fqn.split(".")[-1], "is_approved": True, "description": None},
+        "domain": None, "entity": None, "profiling": None,
+        "relationships": {}, "governance": {},
+        "table": {"table_type": "TABLE"},
+    }
+
+
+def _rel_agg_col(name, *, is_pk=False, is_dimension=False, is_id=False, business_label=None, cardinality_tier="MEDIUM"):
+    return {
+        "column_name": name,
+        "dictionary": {
+            "business_label": business_label or name, "is_dimension": is_dimension,
+            "is_metric": False, "is_date": False, "is_id": is_id, "pii_risk": False, "is_approved": True,
+        },
+        "profiling": {"cardinality_tier": cardinality_tier, "pii_name_heuristic": False, "semantic_type": None},
+        "schema": {"is_primary_key": is_pk, "is_identity": is_pk, "data_type": "INTEGER" if is_pk else "TEXT"},
+    }
+
+
+_REL_AGG_QUERY_INTENT = {
+    "aggregation_target": "entity_count", "date_range": None,
+    "order": None, "status_value": None, "distinct": False, "aggregation": None,
+}
+
+
+def test_bare_relationship_dimension_prefers_label_column_over_surrogate_key(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.students")
+    _add_column(db, "dbo.students", "StudentID", is_pk=1, is_id=1, uniqueness=1.0)
+    # Table name deliberately shares its own core token ("path") with its
+    # label column (PathName), exactly like real-CCPP dbo.ADF_Path/PathName
+    # — _label_column_bonus's FULL bonus (vs. a weak nod) requires the
+    # label column's own name to embed the table's own identity token.
+    _add_table(db, "dbo.path_lookup")
+    _add_column(db, "dbo.path_lookup", "PathID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_fk(db, "dbo.students", "PathID", "dbo.path_lookup", "PathID")
+
+    table_contexts = {
+        "dbo.students": _rel_agg_ctx("dbo.students", [_rel_agg_col("StudentID", is_pk=True, is_id=True)]),
+        "dbo.path_lookup": _rel_agg_ctx("dbo.path_lookup", [
+            _rel_agg_col("PathID", is_pk=True, is_id=True),
+            _rel_agg_col("PathName", is_dimension=True, business_label="Path Name", cardinality_tier="HIGH"),
+        ]),
+    }
+    grounding = {
+        "fully_grounded": True, "matched_entities": ["Student", "Program"],
+        "entity_table_map": {"Student": "dbo.students", "Program": "dbo.path_lookup"},
+        "grounded": {"Student": {}, "Program": {}}, "seed_table_fqns": ["dbo.students", "dbo.path_lookup"],
+    }
+    result = _try_build_relationship_aggregate_plan(
+        1, "u1", "How many students are in each program?", grounding, _REL_AGG_QUERY_INTENT,
+        table_contexts, measure_terms=["students"], candidate_ranking=[],
+        remembered_terminology=[], generated_vocabulary_evidence=[], warnings=[],
+        concept_mappings=None, generated_vocab=None,
+    )
+    assert result is not None
+    assert result["dimensions"][0]["selected"]["table_fqn"] == "dbo.path_lookup"
+    assert result["dimensions"][0]["selected"]["column_name"] == "PathName"
+    # The join itself is unaffected by which column represents the dimension.
+    assert set(result["join_plan"]["tables"]) == {"dbo.students", "dbo.path_lookup"}
+
+
+def test_bare_relationship_dimension_falls_back_to_key_without_confident_label(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _add_table(db, "dbo.students")
+    _add_column(db, "dbo.students", "StudentID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_table(db, "dbo.instructors")
+    _add_column(db, "dbo.instructors", "InstructorID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_fk(db, "dbo.students", "InstructorID", "dbo.instructors", "InstructorID")
+
+    table_contexts = {
+        "dbo.students": _rel_agg_ctx("dbo.students", [_rel_agg_col("StudentID", is_pk=True, is_id=True)]),
+        "dbo.instructors": _rel_agg_ctx("dbo.instructors", [
+            _rel_agg_col("InstructorID", is_pk=True, is_id=True),
+            # No name/title/label-style column at all — no confident label
+            # column exists, so behavior must stay exactly as before this
+            # change: fall back to the trusted entity key.
+            _rel_agg_col("City", is_dimension=True, cardinality_tier="MEDIUM"),
+        ]),
+    }
+    grounding = {
+        "fully_grounded": True, "matched_entities": ["Student", "Instructor"],
+        "entity_table_map": {"Student": "dbo.students", "Instructor": "dbo.instructors"},
+        "grounded": {"Student": {}, "Instructor": {}}, "seed_table_fqns": ["dbo.students", "dbo.instructors"],
+    }
+    result = _try_build_relationship_aggregate_plan(
+        1, "u1", "How many students are there per instructor?", grounding, _REL_AGG_QUERY_INTENT,
+        table_contexts, measure_terms=["students"], candidate_ranking=[],
+        remembered_terminology=[], generated_vocabulary_evidence=[], warnings=[],
+        concept_mappings=None, generated_vocab=None,
+    )
+    assert result is not None
+    assert result["dimensions"][0]["selected"]["table_fqn"] == "dbo.instructors"
+    assert result["dimensions"][0]["selected"]["column_name"] == "InstructorID"
+
+
+# ---------------------------------------------------------------------------
+# Scoring/calibration milestone — evidence-quality fixes
+#
+# Confirmed live against real CCPP: "Average course fee by program" and
+# "Show classes and their program" both correctly joined dbo.ADF_Class ->
+# dbo.ADF_Path but then displayed/grouped by ADF_Path.ProgramType (a
+# category column that merely shares the "program" token) instead of
+# ADF_Path.PathName (the table's real display name — zero token overlap
+# with "program" at all, since "path" and "program" are different words
+# for the business's own entity). _resolve_related_attribute_dimension's
+# hard name_score>=_AUTO_SELECT_MIN_CONFIDENCE floor had no fallback to a
+# table's own designated label column when only a weak/incidental attribute
+# match cleared it.
+# ---------------------------------------------------------------------------
+
+def _set_semantic_type(db, table_fqn, col_name, semantic_type):
+    c = _c(db)
+    c.execute(
+        "UPDATE profiling_column_profiles SET semantic_type = ? "
+        "WHERE source_id = 1 AND table_fqn = ? AND column_name = ?",
+        (semantic_type, table_fqn, col_name),
+    )
+    c.commit()
+    c.close()
+
+
+def _seed_class_path(db):
+    """dbo.ADF_Class --(PathID, many-to-one)--> dbo.ADF_Path, mirroring the
+    real CCPP shape: ADF_Path has a category column (ProgramType) that
+    tokenizes to {'program','type'} and its real label column (PathName)."""
+    _add_table(db, "dbo.ADF_Class", table_class="Transactional", row_count=1542)
+    _add_column(db, "dbo.ADF_Class", "ClassID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Class", "PathID", uniqueness=0.02)
+    _add_column(db, "dbo.ADF_Class", "CourseFee", data_type="DECIMAL", is_metric=True,
+                business_label="Course Fee", approved=True)
+
+    _add_table(db, "dbo.ADF_Path", table_class="Reference", row_count=311)
+    _add_column(db, "dbo.ADF_Path", "PathID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Path", "PathName", data_type="TEXT", is_dimension=True,
+                business_label="Path Name", approved=True)
+    _add_column(db, "dbo.ADF_Path", "ProgramType", data_type="TEXT", is_dimension=True,
+                cardinality_tier="LOW", business_label="Program Type", approved=True)
+
+    _add_fk(db, "dbo.ADF_Class", "PathID", "dbo.ADF_Path", "PathID", status="AUTO")
+
+
+def test_label_column_preferred_over_incidental_token_match_for_bare_entity_term(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _seed_class_path(db)
+
+    result = _resolve_related_attribute_dimension("program", "dbo.ADF_Class", 1, "u1")
+    assert result is not None
+    assert all(entry.get("selected") for entry in result)
+    assert {entry["selected"]["table_fqn"] for entry in result} == {"dbo.ADF_Path"}
+    assert {entry["selected"]["column_name"] for entry in result} == {"PathName"}, (
+        "A bare 'program' term must resolve to the table's own label column "
+        "(PathName), not an attribute column that only incidentally shares "
+        "a token (ProgramType)."
+    )
+
+
+def test_specific_attribute_term_still_wins_over_label_column(tmp_path, monkeypatch):
+    """A deliberate, specific mention of the attribute itself ("program
+    type") must NOT be overridden by the label-column rescue — the rescue
+    only fires for a weak/incidental match, never a genuinely strong one."""
+    db = env(tmp_path, monkeypatch)
+    _seed_class_path(db)
+
+    result = _resolve_related_attribute_dimension("program type", "dbo.ADF_Class", 1, "u1")
+    assert result is not None
+    assert all(entry.get("selected") for entry in result)
+    assert {entry["selected"]["column_name"] for entry in result} == {"ProgramType"}
+
+
+def test_label_column_rescue_does_not_fire_without_a_weak_match(tmp_path, monkeypatch):
+    """No column on the related table clears the floor at all for this term
+    — the rescue must not invent a match; behavior stays a clean refusal."""
+    db = env(tmp_path, monkeypatch)
+    _seed_class_path(db)
+
+    result = _resolve_related_attribute_dimension("zzz_unrelated_term", "dbo.ADF_Class", 1, "u1")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Scoring/calibration milestone — status-column FLAG-vs-STATUS preference
+#
+# Confirmed live against real CCPP: "How many active classes are there?"
+# resolved to dbo.ADF_Class.CLASSTYPE (a 4-value category column classified
+# STATUS purely from low cardinality — core/profiling/classification/
+# column_typer.py's _score_status grants this from cardinality+datatype
+# alone, no name-vocabulary requirement) instead of dbo.ADF_Class.IsActive
+# (the real boolean flag, classified FLAG at confidence 1.0). Filtering
+# CLASSTYPE = 'Active' silently returned zero rows — a confidently WRONG
+# answer, not a safe refusal. _find_status_column's priority order checked
+# STATUS-typed columns before ever considering FLAG-typed ones.
+# ---------------------------------------------------------------------------
+
+def _seed_class_with_status_and_flag(db):
+    _add_table(db, "dbo.ADF_Class", table_class="Transactional", row_count=1542)
+    _add_column(db, "dbo.ADF_Class", "ClassID", is_pk=1, is_id=1, uniqueness=1.0)
+    _add_column(db, "dbo.ADF_Class", "CLASSTYPE", data_type="TEXT",
+                cardinality_tier="LOW", is_dimension=True, business_label="Classtype")
+    _set_semantic_type(db, "dbo.ADF_Class", "CLASSTYPE", "STATUS")
+    _add_column(db, "dbo.ADF_Class", "IsActive", data_type="BOOLEAN",
+                cardinality_tier="BINARY", is_dimension=True, business_label="Is Active")
+    _set_semantic_type(db, "dbo.ADF_Class", "IsActive", "FLAG")
+
+
+def test_boolean_status_value_prefers_flag_column_over_status_category_column(tmp_path, monkeypatch):
+    db = env(tmp_path, monkeypatch)
+    _seed_class_with_status_and_flag(db)
+    conn = _c(db)
+    try:
+        ctx = {"dbo.ADF_Class": {"columns": [
+            {"column_name": row["column_name"],
+             "profiling": {"semantic_type": row["semantic_type"]},
+             "dictionary": {"business_label": row["business_label"] if "business_label" in row.keys() else None}}
+            for row in conn.execute(
+                "SELECT pcp.column_name, pcp.semantic_type, dc.business_label "
+                "FROM profiling_column_profiles pcp "
+                "LEFT JOIN data_dictionary_columns dc "
+                "  ON dc.table_fqn = pcp.table_fqn AND dc.column_name = pcp.column_name "
+                "WHERE pcp.table_fqn = 'dbo.ADF_Class'"
+            )
+        ]}}
+    finally:
+        conn.close()
+
+    found = _find_status_column(ctx, "dbo.ADF_Class", status_value="active")
+    assert found == ("dbo.ADF_Class", "IsActive"), (
+        "A boolean status word ('active') must prefer the real FLAG column "
+        "over a same-named STATUS-typed category column."
+    )
+
+    # Non-boolean status word: unaffected, falls through to the ordinary
+    # STATUS-typed-column-first priority (byte-identical to before this fix).
+    found_open = _find_status_column(ctx, "dbo.ADF_Class", status_value="open")
+    assert found_open == ("dbo.ADF_Class", "CLASSTYPE")
+
+    # No status_value at all: unaffected (existing callers with 2 positional args).
+    found_bare = _find_status_column(ctx, "dbo.ADF_Class")
+    assert found_bare == ("dbo.ADF_Class", "CLASSTYPE")

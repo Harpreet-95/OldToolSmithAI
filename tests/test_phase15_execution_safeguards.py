@@ -70,7 +70,9 @@ _QEL_DDL = """
         status               TEXT    NOT NULL,
         error_code           TEXT,
         executed_at          TEXT    NOT NULL,
-        created_at           TEXT    NOT NULL
+        created_at           TEXT    NOT NULL,
+        execution_kind       TEXT    NOT NULL DEFAULT 'user_query',
+        pipeline_trace_encrypted TEXT
     )
 """
 
@@ -120,7 +122,7 @@ def _iso(dt: datetime) -> str:
 
 
 def _write_log(log_db, user_id="u1", source_id=1, status="success",
-               sql_hash=None, executed_at=None):
+               sql_hash=None, executed_at=None, execution_kind="user_query"):
     """Insert a row directly into query_execution_log."""
     if executed_at is None:
         executed_at = _iso(datetime.now(timezone.utc))
@@ -129,11 +131,11 @@ def _write_log(log_db, user_id="u1", source_id=1, status="success",
         INSERT INTO query_execution_log
             (execution_id, user_id, source_id, sql_hash, tables_accessed_json,
              param_count, row_count, truncated, duration_ms, status,
-             error_code, executed_at, created_at)
-        VALUES (?, ?, ?, ?, '[]', 0, 0, 0, 10, ?, NULL, ?, ?)
+             error_code, executed_at, created_at, execution_kind)
+        VALUES (?, ?, ?, ?, '[]', 0, 0, 0, 10, ?, NULL, ?, ?, ?)
         """,
         (str(uuid.uuid4()), user_id, source_id, sql_hash,
-         status, executed_at, executed_at),
+         status, executed_at, executed_at, execution_kind),
     )
     log_db._inner.commit()
 
@@ -182,6 +184,7 @@ def _patch_exec_deps(monkeypatch, cursor=None):
     cursor = cursor or _make_cursor()
     conn   = MagicMock()
     conn.cursor.return_value = cursor
+    monkeypatch.setattr(svc, "_check_live_query_authorized", lambda sid, uid: True)
     monkeypatch.setattr(svc, "_load_source_connection", lambda s, u: (conn, "mssql"))
     monkeypatch.setattr(svc, "_governance_recheck", lambda *a, **kw: ([], set(), []))
     monkeypatch.setattr(svc, "log_audit_event", lambda *a, **kw: None)
@@ -217,6 +220,81 @@ def test_rate_limit_isolates_by_user(log_db):
     # alice is rate-limited; bob is not
     assert _check_user_rate_limit("alice") is True
     assert _check_user_rate_limit("bob")   is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Stabilization, Task 3 — rate-limiter self-collision fix.
+# The agent's own bounded investigation phase (data.investigation_service,
+# up to 3 calls per turn) writes to this same query_execution_log table via
+# log_query_execution() so it appears in analytics/audit, but must not count
+# as a "user execution" for the 2-second per-user limiter — otherwise a
+# normal first turn (investigate, then execute the real answer) can find its
+# own internal traffic still inside the window and self-rate-limit, no
+# repeated user requests involved. execution_kind is the explicit
+# discriminator (not fragile timing) separating the two.
+# ---------------------------------------------------------------------------
+
+def test_investigation_writes_do_not_trigger_user_rate_limit(log_db):
+    recent = _iso(datetime.now(timezone.utc) - timedelta(milliseconds=200))
+    _write_log(log_db, user_id="u1", executed_at=recent, execution_kind="investigation")
+    assert _check_user_rate_limit("u1") is False
+
+
+def test_three_investigation_probes_then_final_execution_succeeds(log_db):
+    # One user turn: up to 3 bounded internal probes immediately followed by
+    # the real, user-visible execution — none of the probes may count
+    # against that final execution's own rate-limit check.
+    now = datetime.now(timezone.utc)
+    for i in range(3):
+        _write_log(
+            log_db, user_id="u1",
+            executed_at=_iso(now - timedelta(milliseconds=50 * i)),
+            execution_kind="investigation",
+        )
+    assert _check_user_rate_limit("u1") is False
+
+
+def test_genuine_second_user_query_still_blocked_within_window(log_db):
+    # A real second user-visible execution within the window must still be
+    # rejected — the fix narrows what counts, it does not loosen the limit.
+    recent = _iso(datetime.now(timezone.utc) - timedelta(milliseconds=500))
+    _write_log(log_db, user_id="u1", executed_at=recent, execution_kind="user_query")
+    assert _check_user_rate_limit("u1") is True
+
+
+def test_investigation_and_recent_user_query_both_present_still_blocks_on_user_query(log_db):
+    # Mixed case: an investigation row and a genuine recent user_query row
+    # both exist — the real user_query row must still be what triggers the
+    # block, proving the filter doesn't accidentally hide real collisions.
+    now = datetime.now(timezone.utc)
+    _write_log(log_db, user_id="u1", executed_at=_iso(now - timedelta(milliseconds=100)),
+               execution_kind="investigation")
+    _write_log(log_db, user_id="u1", executed_at=_iso(now - timedelta(milliseconds=50)),
+               execution_kind="user_query")
+    assert _check_user_rate_limit("u1") is True
+
+
+def test_log_query_execution_defaults_to_user_query_kind(log_db):
+    # Callers that don't pass execution_kind (every pre-existing call site)
+    # must keep behaving exactly as before — real executions still count.
+    log_query_execution(
+        str(uuid.uuid4()), "u1", 1, "SELECT 1", {},
+        param_count=0, row_count=1, truncated=False, duration_ms=5,
+        status="success", error_code=None,
+        executed_at=_iso(datetime.now(timezone.utc)),
+    )
+    assert _check_user_rate_limit("u1") is True
+
+
+def test_log_query_execution_accepts_investigation_kind(log_db):
+    log_query_execution(
+        str(uuid.uuid4()), "u1", 1, "SELECT 1", {},
+        param_count=0, row_count=1, truncated=False, duration_ms=5,
+        status="success", error_code=None,
+        executed_at=_iso(datetime.now(timezone.utc)),
+        execution_kind="investigation",
+    )
+    assert _check_user_rate_limit("u1") is False
 
 
 # ===========================================================================

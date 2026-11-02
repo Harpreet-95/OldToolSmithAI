@@ -66,6 +66,25 @@ class ProfilingQueryBuilder(ABC):
         ...
 
     @abstractmethod
+    def build_referential_overlap_query(
+        self,
+        from_table_fqn: str,
+        from_column: str,
+        to_table_fqn: str,
+        to_column: str,
+    ) -> str:
+        """Return a single-scan query measuring how many distinct non-null
+        values of from_table_fqn.from_column also appear in
+        to_table_fqn.to_column — used to validate a candidate relationship
+        (Relationship Intelligence, Part 3: value-level validation) via a
+        LEFT JOIN rather than a per-row correlated subquery, so cost stays
+        proportional to one join over the two tables involved, not the
+        schema at large. Must return a single row with columns:
+        source_nonnull_count, source_distinct_count, matched_distinct_count.
+        """
+        ...
+
+    @abstractmethod
     def build_percentile_query(self, table_fqn: str, column_name: str) -> str:
         """Return a query computing P5/P25/P50/P75/P95 for a numeric column.
 

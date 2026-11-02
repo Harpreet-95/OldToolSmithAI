@@ -38,6 +38,8 @@ class CitationType(str, Enum):
     LIVE_QUERY = "live_query"
     PROFILING = "profiling"
     KNOWLEDGE_GRAPH = "knowledge_graph"
+    REMEMBERED_TERMINOLOGY = "remembered_terminology"
+    GENERATED_VOCABULARY = "generated_vocabulary"
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,28 @@ class EnterpriseAnswer:
     # accepts — or None whenever the result shape doesn't support a chart
     # (core.answering.result_formatter._build_chart_spec).
     chart: dict | None = None
+    # Phase 7, Step 6G — AI-first fast-path result insights/visualization.
+    # insights (plural): grounded, multi-item findings computed directly
+    # from the executed rows (core.sqlservice.result_insight_builder /
+    # answer_generation_service.AnswerInsight) -- additive alongside the
+    # legacy singular `insight` above, never replacing it; populated only
+    # by api/v1/ai_first_composer_adapter.py, [] for every other pipeline.
+    # kpi: {"label", "value"} for a genuine single-scalar result (never a
+    # one-row-multi-column detail record) -- core.sqlservice.
+    # result_chart_builder.build_deterministic_kpi; None whenever the
+    # result isn't a clean single scalar.
+    insights: list = field(default_factory=list)
+    kpi: dict | None = None
+    # NEXT MILESTONE, Part 9 — Source Data Quality Observation wiring.
+    # data_quality_notes is executive/business-facing plain-language text
+    # (core.answering.data_quality_observations.executive_data_notes);
+    # technical_diagnostics is the full evidence-bearing detail for an
+    # admin/developer view (core.answering.data_quality_observations.
+    # technical_diagnostics). Both default to empty — populated only when
+    # core.orchestrator.agent actually ran the bounded, question-scoped
+    # detection pass (see that module's own wiring comment).
+    data_quality_notes: list[str] = field(default_factory=list)
+    technical_diagnostics: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = dataclasses.asdict(self)

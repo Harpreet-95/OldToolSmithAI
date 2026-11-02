@@ -18,9 +18,12 @@ so excluding it from term extraction loses no signal.
 Run from the project root:
     venv/Scripts/pytest tests/test_semantic_accuracy.py -v
 """
+import inspect
 from datetime import date
 
-from core.semantic.concept_resolver import extract_terms, extract_query_intent
+from core.semantic.concept_resolver import (
+    extract_terms, extract_query_intent, generate_compound_phrase_candidates,
+)
 
 _TODAY = date(2026, 7, 12)
 
@@ -97,6 +100,73 @@ def test_distinct_unique_excluded():
 
 
 # ---------------------------------------------------------------------------
+# extract_terms() — imperative verbs and the "on file"/"on record" idiom
+# excluded (Phase 4, Milestone 1)
+#
+# Root cause (Phase 4 failure audit, 2026-08-04): "sort"/"sorted"/"return"
+# are imperative instruction words, the same grammatical category as the
+# already-stopworded "show"/"list"/"display"/"give"/"get"/"find"/"tell" —
+# but were missing from _STOPWORDS, so they leaked in as their own bogus
+# concept/measure term and searched for a matching column, dragging in an
+# unrelated table via the same dilution mechanism test_ranking_words_excluded
+# above already guards against for "latest"/"highest"/etc. "on file"/
+# "on record" is a two-word idiom meaning "recorded/available" — decomposed
+# literally, its own word "file" coincidentally name-matches real tables
+# (e.g. a CMS attachments table), producing a confident but completely
+# wrong answer. Fixed the same way _date_phrase_words/_status_enum_words
+# above are: phrase-level detection on the raw question, so only "file"/
+# "record" occurring in this exact idiom are dropped — "file" used as a
+# genuine business noun elsewhere must still survive.
+# ---------------------------------------------------------------------------
+
+def test_sort_verb_excluded():
+    concepts, measures, dimensions = extract_terms("Sort clients by name")
+    assert "sort" not in concepts
+    assert "sort" not in measures
+    assert "clients" in concepts
+    assert dimensions == ["name"]
+
+
+def test_sorted_verb_excluded():
+    concepts, measures, dimensions = extract_terms("Sorted by client")
+    assert "sorted" not in concepts
+    assert "sorted" not in measures
+    assert dimensions == ["client"]
+
+
+def test_return_verb_excluded():
+    concepts, measures, _ = extract_terms("Return active invoices")
+    assert "return" not in concepts
+    assert "return" not in measures
+    assert "invoices" in concepts
+
+
+def test_on_file_idiom_excluded():
+    # "number" is already excluded by the pre-existing _STOPWORDS entry
+    # (unrelated to this fix — see its own "how many"/"number of" note);
+    # only "file" is new here.
+    concepts, _, _ = extract_terms("Clients with phone number on file")
+    assert "file" not in concepts
+    assert "clients" in concepts
+    assert "phone" in concepts
+
+
+def test_on_record_idiom_excluded():
+    concepts, _, _ = extract_terms("Clients with phone number on record")
+    assert "record" not in concepts
+    assert "clients" in concepts
+    assert "phone" in concepts
+
+
+def test_genuine_file_entity_question_preserves_file():
+    """"file" is only stripped as part of the literal "on file" idiom — a
+    real question about file/document entities must keep it as a usable
+    concept term."""
+    concepts, _, _ = extract_terms("Show client files")
+    assert "file" in concepts or "files" in concepts
+
+
+# ---------------------------------------------------------------------------
 # extract_terms() — "this" is filler and excluded, but bare calendar words
 # (year/month/quarter/week/day) are DELIBERATELY still allowed through: a
 # regression (test_composer_sql_routing.py::test_date_range_filter_end_to_end)
@@ -107,10 +177,16 @@ def test_distinct_unique_excluded():
 # since it always runs on the raw question string, never this term list.
 # ---------------------------------------------------------------------------
 
-def test_this_excluded_but_year_kept():
+def test_this_year_phrase_excludes_year_but_date_range_still_detected():
+    # Phase 2 fix: "year" in a MATCHED "this year"/"last year" phrase is
+    # dropped from concepts/measures (not just "this") — a bare "year" token
+    # was reproduced spuriously column-matching an unrelated table (e.g.
+    # "YearsExpValue") on real CCPP data, silently selecting the wrong table
+    # for the whole question. date_range detection is untouched (it parses
+    # the raw question independently), so "this_year" is still recognized.
     concepts, _, _ = extract_terms("Total revenue this year")
     assert "this" not in concepts
-    assert "year" in concepts
+    assert "year" not in concepts
     assert "revenue" in concepts
     assert extract_query_intent("Total revenue this year", today=_TODAY)["date_range"]["label"] == "this_year"
 
@@ -231,3 +307,101 @@ def test_wh_ranking_pattern_does_not_fire_without_distinct_entity():
     concepts, measures, dimensions = extract_terms("What is the highest invoice amount?")
     assert dimensions == []
     assert "invoice" in measures and "amount" in measures
+
+
+# ---------------------------------------------------------------------------
+# Enterprise Accuracy Program A2/Phase C —
+# generate_compound_phrase_candidates() — pure, no-DB phrase-generation rules
+# only. Whether a proposed phrase is a real business term is decided
+# elsewhere (data/query_planning_service.py, against real metadata); these
+# tests only cover which candidates are PROPOSED.
+# ---------------------------------------------------------------------------
+
+def test_compound_candidate_generated_for_adjacent_job_orders():
+    # (1) "job orders" is considered as one compound phrase.
+    concepts, _, _ = extract_terms("How many open job orders are there?")
+    assert concepts == ["job", "orders"]
+    candidates = generate_compound_phrase_candidates("How many open job orders are there?", concepts)
+    assert {"phrase": "job orders", "components": ("job", "orders")} in candidates
+
+
+def test_three_token_list_yields_only_adjacent_bigrams_not_a_trigram():
+    # Spec's own worked example: ["client","job","orders"] -> exactly the two
+    # adjacent bigrams, never the trigram "client job orders", and never a
+    # non-adjacent pair like "client orders".
+    tokens = ["client", "job", "orders"]
+    candidates = generate_compound_phrase_candidates("client job orders", tokens)
+    assert [c["phrase"] for c in candidates] == ["client job", "job orders"]
+    assert "client job orders" not in [c["phrase"] for c in candidates]
+    assert "client orders" not in [c["phrase"] for c in candidates]
+
+
+def test_compound_candidates_bounded_per_question():
+    # Maximum compound candidates per question is a small bounded limit.
+    tokens = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    question = " ".join(tokens)
+    candidates = generate_compound_phrase_candidates(question, tokens)
+    assert len(candidates) <= 5
+
+
+def test_revenue_by_department_not_combined_into_one_phrase():
+    # (8) "by" already splits measures/dimensions into separate lists before
+    # this stage ever runs, so the two halves are never in the same token
+    # list to be paired against each other.
+    concepts, measures, dimensions = extract_terms("Revenue by department")
+    assert measures == ["revenue"]
+    assert dimensions == ["department"]
+    assert generate_compound_phrase_candidates("Revenue by department", measures) == []
+    assert generate_compound_phrase_candidates("Revenue by department", dimensions) == []
+
+
+def test_time_phrase_last_quarter_not_treated_as_business_compound():
+    # (9) Matched time-phrase words are already removed by extract_terms()
+    # before the token list is built, so they never reach this stage.
+    concepts, _, _ = extract_terms("Placements last quarter")
+    assert concepts == ["placements"]
+    assert generate_compound_phrase_candidates("Placements last quarter", concepts) == []
+
+
+def test_clients_and_invoices_remains_two_distinct_concepts():
+    # (10) A conjunction between the two words means they are never literally
+    # adjacent in the original question text, so no compound merges them —
+    # regardless of what else in the sentence survives as its own term.
+    question = "How are clients and invoices related?"
+    concepts, _, _ = extract_terms(question)
+    assert "clients" in concepts and "invoices" in concepts
+    phrases = [c["phrase"] for c in generate_compound_phrase_candidates(question, concepts)]
+    assert "clients invoices" not in phrases
+
+
+def test_ranking_phrase_top_5_clients_remains_unchanged():
+    # (11) "top" is already a stopword; the bare numeral left behind is
+    # excluded from ever forming a compound (numerals are never half of a
+    # real business entity/measure name).
+    question = "Top 5 clients by revenue"
+    concepts, measures, dimensions = extract_terms(question)
+    assert generate_compound_phrase_candidates(question, measures) == []
+
+
+def test_filter_phrase_active_invoices_remains_compatible():
+    # (12) A single surviving token (the status adjective was already
+    # dropped upstream) cannot form a pair — no compound proposed, no
+    # change to the existing filter-phrase flow.
+    concepts, _, _ = extract_terms("Active invoices")
+    assert concepts == ["invoices"]
+    assert generate_compound_phrase_candidates("Active invoices", concepts) == []
+
+
+def test_no_ccpp_specific_phrase_mapping_in_production_source():
+    # (15) The generator must be generic/metadata-driven — no hardcoded
+    # phrase-to-table dictionary and no CCPP-specific vocabulary literal
+    # actually compiled into the function (comments/docstrings are excluded
+    # from co_consts, so illustrative examples in comments don't trip this;
+    # a real hardcoded whitelist would necessarily appear as a compiled
+    # string/collection constant).
+    code = generate_compound_phrase_candidates.__code__
+    doc = generate_compound_phrase_candidates.__doc__ or ""
+    literal_consts = [c for c in code.co_consts if c != doc]
+    flattened = " ".join(str(c).lower() for c in literal_consts)
+    for banned in ("ccpp", "job order", "student enrollment", "adf_", "bullhorn"):
+        assert banned not in flattened

@@ -60,6 +60,14 @@ class SchemaSnapshot:
     connector_version: str | None = None
     discovery_duration_ms: int | None = None
     warnings: list[str] = field(default_factory=list)
+    # Explicit success/failure evidence, independent of table_count. A
+    # connector sets this False whenever it could not actually reach/read
+    # the source's catalog (connection failure, auth failure, unimplemented
+    # connector, etc.) so callers can tell that apart from a genuinely
+    # empty database, where discovery succeeds and legitimately finds zero
+    # tables. Defaults True for backward compatibility with any caller
+    # constructing a SchemaSnapshot directly from real discovered schemas.
+    discovery_succeeded: bool = True
 
     @property
     def table_count(self) -> int:

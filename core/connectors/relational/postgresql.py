@@ -53,6 +53,15 @@ class _PostgreSQLProfilingQueryBuilder(ProfilingQueryBuilder):
     def build_distinct_count_query(self, table_fqn: str, column_name: str) -> str:
         raise NotImplementedError(self._MSG)
 
+    def build_referential_overlap_query(
+        self,
+        from_table_fqn: str,
+        from_column: str,
+        to_table_fqn: str,
+        to_column: str,
+    ) -> str:
+        raise NotImplementedError(self._MSG)
+
     def quote_identifier(self, identifier: str) -> str:
         raise NotImplementedError(self._MSG)
 
@@ -82,7 +91,7 @@ class PostgreSQLConnector(DataSourceConnector):
         database = params.get("database", "?")
         return f"postgresql://{host}:{port}/{database}"
 
-    def open_connection(self, config: DataSourceConfig):
+    def open_connection(self, config: DataSourceConfig, timeout_s: int | None = None):
         raise NotImplementedError(
             "PostgreSQL live connections are not implemented yet."
         )
@@ -96,4 +105,5 @@ class PostgreSQLConnector(DataSourceConnector):
             source_type=self.source_type,
             discovered_at=datetime.now(timezone.utc).isoformat(),
             warnings=["Schema discovery is not yet implemented for PostgreSQL."],
+            discovery_succeeded=False,
         )

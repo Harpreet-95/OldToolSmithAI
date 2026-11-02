@@ -2,7 +2,7 @@
 Enterprise Live Database Foundation — tests.
 
 Covers LiveConnectionResolver, ConnectionHealthService, LiveMetadataProvider,
-and their wiring into the Enterprise Orchestrator. No real SQL Server /
+without relying on the retired Enterprise Orchestrator. No real SQL Server /
 PostgreSQL / Oracle / MySQL instance is reachable in this environment, so
 every scenario is exercised via monkeypatched connector calls rather than
 a live network connection.
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 from cryptography.fernet import Fernet
 
 # Must be set before any import that transitively loads core.config.
@@ -36,8 +37,6 @@ from core.live.connection_resolver import LiveConnectionResolver
 from core.live.health_service import ConnectionHealthService
 from core.live.metadata_provider import LiveMetadataProvider
 from core.live.models import ConnectionContext, ConnectionState, ResolutionStatus
-from core.orchestrator import EnterpriseOrchestrator, IntentType, OrchestratorRequest
-from core.orchestrator.registry import ServiceRegistry
 import data.datasource_service as datasource_service
 
 
@@ -356,88 +355,3 @@ class TestCredentialSafety:
         ctx.config.params["password"] = "hunter2"
         result = LiveMetadataProvider().get_metadata(ctx)
         assert "hunter2" not in str(result)
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator integration
-# ---------------------------------------------------------------------------
-
-class TestOrchestratorIntegration:
-    def test_registry_has_at_least_the_live_metadata_service(self):
-        # Exact count is asserted in tests/test_live_query_engine.py, which
-        # tracks the current total (16, after Phase 7 added "live_query").
-        # This test only pins the Phase 6 addition so it doesn't need
-        # updating every time a later phase registers another service.
-        service_ids = [s.service_id for s in ServiceRegistry().get_all()]
-        assert "live_metadata" in service_ids
-
-    def test_live_metadata_service_selected_for_metadata_lookup(self, monkeypatch):
-        monkeypatch.setattr(
-            datasource_service, "get_connection_config",
-            lambda sid, uid: {
-                "source_type": "mssql", "source_category": "relational_db",
-                "display_name": "Prod SQL Server", "is_active": True, "source_status": "ACTIVE",
-                "capabilities": ["connection_test", "schema_discovery"],
-                "params": {"host": "db.internal", "database": "CCPP"},
-            },
-        )
-        monkeypatch.setattr(SQLServerConnector, "discover_schema", lambda self, config: _sample_snapshot())
-        monkeypatch.setattr(
-            SQLServerConnector, "test_connectivity",
-            lambda self, config: ConnectivityTestResult(success=True, message="Connection successful."),
-        )
-
-        req = OrchestratorRequest(query="what tables exist", source_id=1, user_id="user-1")
-        package = EnterpriseOrchestrator().process(req)
-
-        assert package.intent.intent_type == IntentType.METADATA_LOOKUP
-        service_ids = [c.service_id for c in package.service_calls]
-        assert "live_metadata" in service_ids
-
-        live_item = next(e for e in package.evidence if e.source_service == "live_metadata")
-        assert live_item.data["connection_state"] == "online"
-        assert len(live_item.data["tables"]) == 1
-
-    def test_no_source_id_behaves_as_before(self):
-        req = OrchestratorRequest(query="what tables exist", source_id=None, user_id="user-1")
-        package = EnterpriseOrchestrator().process(req)
-        live_items = [e for e in package.evidence if e.source_service == "live_metadata"]
-        assert len(live_items) == 1
-        assert live_items[0].data is None
-
-    def test_oracle_source_through_full_pipeline_never_raises(self, monkeypatch):
-        monkeypatch.setattr(
-            datasource_service, "get_connection_config",
-            lambda sid, uid: {
-                "source_type": "oracle", "source_category": "relational_db",
-                "display_name": "Legacy Oracle", "is_active": True, "source_status": "ACTIVE",
-                "capabilities": [],
-                "params": {"host": "oracle.internal"},
-            },
-        )
-        req = OrchestratorRequest(query="what tables exist", source_id=2, user_id="user-1")
-        package = EnterpriseOrchestrator().process(req)
-
-        live_item = next(e for e in package.evidence if e.source_service == "live_metadata")
-        assert live_item.data["connection_state"] == "error"
-        assert "oracle" in live_item.data["message"].lower()
-        # Failure is surfaced as evidence, not as a service-call error/exception.
-        live_call = next(c for c in package.service_calls if c.service_id == "live_metadata")
-        assert live_call.succeeded is True
-
-    def test_postgresql_source_through_full_pipeline_reports_not_implemented(self, monkeypatch):
-        monkeypatch.setattr(
-            datasource_service, "get_connection_config",
-            lambda sid, uid: {
-                "source_type": "postgresql", "source_category": "relational_db",
-                "display_name": "Analytics PG", "is_active": True, "source_status": "ACTIVE",
-                "capabilities": ["connection_test", "schema_discovery"],
-                "params": {"host": "pg.internal", "database": "analytics"},
-            },
-        )
-        req = OrchestratorRequest(query="what tables exist", source_id=3, user_id="user-1")
-        package = EnterpriseOrchestrator().process(req)
-
-        live_item = next(e for e in package.evidence if e.source_service == "live_metadata")
-        assert live_item.data["connection_state"] == "not_implemented"
-        assert live_item.data["tables"] == []

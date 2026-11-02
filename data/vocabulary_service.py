@@ -30,6 +30,7 @@ _MULTI_WORD_PHRASES: frozenset[str] = frozenset(
 )
 
 _PLURAL_IES_RE = re.compile(r"ies$")
+_PLURAL_ES_SIBILANT_RE = re.compile(r"(?:ss|x|z|ch|sh)es$")
 _PLURAL_S_RE = re.compile(r"(?<!s)s$")
 
 
@@ -39,6 +40,15 @@ def normalize_term(term: str) -> str:
     strip a common plural suffix. No stemming library, no NLP, no fuzzy
     matching — a fixed set of regex rules only, applied identically
     everywhere this module is used.
+
+    Handles the unambiguous English "-es" plural (a singular ending in a
+    sibilant — ss/x/z/ch/sh — takes "-es", not a bare "-s"): "classes" ->
+    "class", "boxes" -> "box", "churches" -> "church". This case is
+    unambiguous because the letters immediately before the stripped "-es"
+    are the sibilant itself (e.g. "class" -> double "s"), which can't be
+    confused with a singular that already ends in a silent "e" ("houses" ->
+    "house", "cases" -> "case" still fall through to the bare-"s" rule
+    below, unchanged).
 
     Known, accepted limitation: a bare trailing "s" not preceded by another
     "s" is always stripped (e.g. "clients" -> "client"), which also
@@ -56,6 +66,8 @@ def normalize_term(term: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     if _PLURAL_IES_RE.search(t):
         t = _PLURAL_IES_RE.sub("y", t)
+    elif _PLURAL_ES_SIBILANT_RE.search(t):
+        t = t[:-2]
     elif _PLURAL_S_RE.search(t) and not t.endswith("ss"):
         t = t[:-1]
     return t.strip()

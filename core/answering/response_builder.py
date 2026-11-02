@@ -50,8 +50,18 @@ def _build_follow_up_questions(answer_type: AnswerType) -> list[str]:
     return list(_FOLLOW_UPS.get(answer_type, []))
 
 
-def _build_next_actions(answer_type: AnswerType) -> list[str]:
+def _build_next_actions(answer_type: AnswerType, limitations: "list[str] | None" = None) -> list[str]:
     action = _NEXT_ACTIONS.get(answer_type)
+    # Fresh-Connection Q&A Reliability milestone, Part 8 — "page through the
+    # full result set" overpromises when the query itself was capped
+    # (core.answering.result_formatter's "Results were truncated." marker):
+    # paging only ever reaches the rows already fetched up to the row-limit
+    # cap, never rows beyond it. Say so plainly rather than implying every
+    # matching row is reachable.
+    if answer_type == AnswerType.LIVE_QUERY and any(
+        "truncated" in (item or "").lower() for item in (limitations or [])
+    ):
+        action = "Export or page through the returned rows (the query was capped at the configured row limit)."
     return [action] if action else []
 
 
@@ -100,7 +110,7 @@ def build_response(strategy, package, explanation: dict, citations, recommendati
         recommendations=recommendations,
         limitations=explanation["limitations"],
         follow_up_questions=_build_follow_up_questions(answer_type),
-        next_actions=_build_next_actions(answer_type),
+        next_actions=_build_next_actions(answer_type, explanation.get("limitations")),
         related_objects=_build_related_objects(package),
         execution_summary=_build_execution_summary(strategy),
         clarification=explanation.get("clarification"),
@@ -117,4 +127,6 @@ def build_response(strategy, package, explanation: dict, citations, recommendati
         truncation_notice=explanation.get("truncation_notice"),
         insight=explanation.get("insight"),
         chart=explanation.get("chart"),
+        data_quality_notes=explanation.get("data_quality_notes") or [],
+        technical_diagnostics=explanation.get("technical_diagnostics") or [],
     )

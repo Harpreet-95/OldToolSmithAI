@@ -21,7 +21,11 @@ os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("JWT_SECRET",      "test-jwt-review-tasks-long-enough-secret")
 os.environ.setdefault("USER_ID_SALT",    "test-salt-review-tasks")
 
-from data.profiling_service import _SEMANTIC_CONFIDENCE_THRESHOLD, get_profile_review_tasks
+from data.profiling_service import (
+    _SEMANTIC_CONFIDENCE_THRESHOLD,
+    _review_summary,
+    get_profile_review_tasks,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +180,12 @@ _SCHEMA = """
         pii_name_heuristic    INTEGER NOT NULL DEFAULT 0,
         pii_confirmed         INTEGER NOT NULL DEFAULT 0,
         pii_signals_json      TEXT,
+        pii_classification            TEXT,
+        pii_classification_confidence REAL,
+        pii_classification_evidence   TEXT,
+        pii_classification_source     TEXT,
+        pii_classified_at             TEXT,
+        pii_manual_override   INTEGER NOT NULL DEFAULT 0,
         top_values_coverage   REAL,
         profiling_depth       TEXT    NOT NULL DEFAULT 'STRUCTURAL_ONLY',
         profiling_duration_ms INTEGER,
@@ -279,12 +289,18 @@ class _NoClose:
 
 @pytest.fixture()
 def db():
+    """Fresh in-memory DB. Also patches data.profiling_snapshot_resolver.get_connection:
+    since Phase 1F.1, get_profile_review_tasks() delegates snapshot selection to
+    get_latest_profiling_snapshot_detail(), which holds its own get_connection
+    reference in that module's namespace — patching data.profiling_service alone
+    would leave it hitting the real on-disk DB."""
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     conn.commit()
     wrapper = _NoClose(conn)
-    with patch("data.profiling_service.get_connection", return_value=wrapper):
+    with patch("data.profiling_service.get_connection", return_value=wrapper), \
+         patch("data.profiling_snapshot_resolver.get_connection", return_value=wrapper):
         yield conn
     conn.close()
 
@@ -299,7 +315,8 @@ def _src(db, user: str = "u1") -> int:
     return cur.lastrowid
 
 
-def _snap(db, source_id: int) -> int:
+def _snap(db, source_id: int, *, snapshot_version: int = 1, status: str = "COMPLETE",
+          created_at: str | None = None) -> int:
     ss = db.execute(
         "INSERT INTO schema_snapshots (source_id, source_type, snapshot_json, "
         "discovered_at, created_at) VALUES (?, 'mssql', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
@@ -307,9 +324,9 @@ def _snap(db, source_id: int) -> int:
     ).lastrowid
     db.commit()
     cur = db.execute(
-        "INSERT INTO profiling_snapshots (source_id, schema_snapshot_id, created_at) "
-        "VALUES (?, ?, CURRENT_TIMESTAMP)",
-        (source_id, ss),
+        "INSERT INTO profiling_snapshots (source_id, schema_snapshot_id, snapshot_version, status, created_at) "
+        "VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+        (source_id, ss, snapshot_version, status, created_at),
     )
     db.commit()
     return cur.lastrowid
@@ -1085,3 +1102,126 @@ def test_good_quality_column_generates_no_quality_tasks(db):
     }
     quality_tasks = [t for t in result["tasks"] if t["task_type"] in quality_task_types]
     assert quality_tasks == [], f"Expected no quality tasks but got: {quality_tasks}"
+
+
+# ---------------------------------------------------------------------------
+# 16. Phase 1F.1 — snapshot selection delegated to
+#     get_latest_profiling_snapshot_detail(); these are regression guards
+#     proving the resolver-backed lookup reproduces the exact prior behavior.
+# ---------------------------------------------------------------------------
+
+def test_resolver_delegation_produces_tasks_from_correct_snapshot(db):
+    """Sanity check that delegation to the resolver still wires the resolved
+    snapshot id through to the per-task queries (a task is generated from it)."""
+    src = _src(db)
+    snap = _snap(db, src)
+    _table(db, snap, src, "dbo.Customers")
+    _col(db, snap, src, "dbo.Customers", "Email", pii_heuristic=1, pii_confirmed=0)
+
+    result = get_profile_review_tasks(src, "u1")
+    pii_tasks = [t for t in result["tasks"] if t["task_type"] == "Review PII Classification"]
+    assert len(pii_tasks) == 1
+
+
+def test_created_at_preserved_from_resolver_detail(db):
+    """created_at on generated tasks comes from detail.created_at exactly."""
+    src = _src(db)
+    snap = _snap(db, src, created_at="2026-03-01T12:00:00")
+    _table(db, snap, src, "dbo.Invoices")  # no domain -> MEDIUM task
+
+    result = get_profile_review_tasks(src, "u1")
+    dom_tasks = [t for t in result["tasks"] if t["task_type"] == "Assign Domain"]
+    assert len(dom_tasks) == 1
+    assert dom_tasks[0]["created_at"] == "2026-03-01T12:00:00"
+
+
+def test_snapshot_id_preserved_selects_rows_scoped_to_that_snapshot(db):
+    """detail.id must be the id actually used to scope the per-task queries:
+    an older snapshot's rows must not leak into the current result."""
+    src = _src(db)
+    old_snap = _snap(db, src, snapshot_version=1)
+    _table(db, old_snap, src, "dbo.Old")
+    _col(db, old_snap, src, "dbo.Old", "Email", pii_heuristic=1, pii_confirmed=0)
+
+    new_snap = _snap(db, src, snapshot_version=2)
+    _table(db, new_snap, src, "dbo.New")
+
+    result = get_profile_review_tasks(src, "u1")
+    fqns = {t["table_fqn"] for t in result["tasks"]}
+    assert "dbo.Old" not in fqns
+    assert any(t["table_fqn"] == "dbo.New" for t in result["tasks"])
+
+
+def test_no_snapshot_returns_empty_payload_exactly(db):
+    src = _src(db)
+    result = get_profile_review_tasks(src, "u1")
+    assert result == {"tasks": [], "summary": _review_summary([]), "total_count": 0}
+
+
+def test_latest_snapshot_version_still_wins(db):
+    src = _src(db)
+    older = _snap(db, src, snapshot_version=1)
+    _table(db, older, src, "dbo.Old")
+
+    newer = _snap(db, src, snapshot_version=2)
+    _table(db, newer, src, "dbo.New")
+
+    result = get_profile_review_tasks(src, "u1")
+    fqns = {t["table_fqn"] for t in result["tasks"]}
+    assert "dbo.New" in fqns
+    assert "dbo.Old" not in fqns
+
+
+def test_older_complete_snapshot_beats_newer_cancelled(db):
+    src = _src(db)
+    older = _snap(db, src, snapshot_version=1, status="COMPLETE")
+    _table(db, older, src, "dbo.Old")
+
+    newer = _snap(db, src, snapshot_version=2, status="CANCELLED")
+    _table(db, newer, src, "dbo.New")
+
+    result = get_profile_review_tasks(src, "u1")
+    # The older COMPLETE snapshot must win selection — a newer CANCELLED
+    # snapshot must never shadow older, usable COMPLETE evidence.
+    fqns = {t["table_fqn"] for t in result["tasks"]}
+    assert "dbo.Old" in fqns
+    assert "dbo.New" not in fqns
+
+
+def test_older_complete_snapshot_beats_newer_running(db):
+    src = _src(db)
+    older = _snap(db, src, snapshot_version=1, status="COMPLETE")
+    _table(db, older, src, "dbo.Old")
+
+    newer = _snap(db, src, snapshot_version=2, status="RUNNING")
+    _table(db, newer, src, "dbo.New")
+
+    result = get_profile_review_tasks(src, "u1")
+    # The older COMPLETE snapshot must win selection — a newer RUNNING
+    # snapshot must never shadow older, usable COMPLETE evidence.
+    fqns = {t["table_fqn"] for t in result["tasks"]}
+    assert "dbo.Old" in fqns
+    assert "dbo.New" not in fqns
+
+
+def test_migration_performs_no_writes(db):
+    src = _src(db)
+    snap = _snap(db, src)
+    _table(db, snap, src, "dbo.Orders")
+    _col(db, snap, src, "dbo.Orders", "Email", pii_heuristic=1, pii_confirmed=0)
+
+    before = {
+        table: [dict(r) for r in db.execute(f"SELECT * FROM {table}").fetchall()]
+        for table in (
+            "data_source_connections", "schema_snapshots", "profiling_snapshots",
+            "profiling_table_profiles", "profiling_column_profiles",
+        )
+    }
+    get_profile_review_tasks(src, "u1")
+    get_profile_review_tasks(9999, "u1")  # no-source path too
+    after = {
+        table: [dict(r) for r in db.execute(f"SELECT * FROM {table}").fetchall()]
+        for table in before
+    }
+
+    assert before == after

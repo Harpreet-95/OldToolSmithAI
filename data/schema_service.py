@@ -60,38 +60,78 @@ def run_discovery(source_id: int, user_id: str) -> dict | None:
 
     saved = _save_snapshot(source_id, snapshot)
 
-    try:
-        _rel_svc.extract_and_persist_relationships(saved["snapshot_id"], source_id)
-    except Exception:
-        logger.warning(
-            "Relationship extraction failed for snapshot_id=%s; discovery result unaffected",
-            saved["snapshot_id"],
-        )
+    # A source only earns is_ready_to_ask()'s 'ACTIVE' status when discovery
+    # actually reached and read the catalog. discovery_succeeded=False
+    # (connection/auth/TLS failure, unimplemented connector, ...) must never
+    # be indistinguishable from a genuinely empty database — see the "Remove
+    # does nothing" / false "Ready to ask" investigation. Relationship
+    # extraction is skipped on failure since there is nothing real to infer
+    # relationships from.
+    if snapshot.discovery_succeeded:
+        try:
+            _rel_svc.extract_and_persist_relationships(saved["snapshot_id"], source_id)
+        except Exception:
+            logger.warning(
+                "Relationship extraction failed for snapshot_id=%s; discovery result unaffected",
+                saved["snapshot_id"],
+            )
+
+        # View Semantic Discovery milestone — best-effort, mirrors the
+        # relationship-extraction call above. On a brand-new source's very
+        # first discovery this typically resolves zero views (dictionary/
+        # profiling metadata doesn't exist yet for inspect_targeted_values'
+        # ownership check) and is picked up by the connect-time bootstrap's
+        # own explicit call after structural profiling runs instead; on
+        # every later re-discovery (metadata already present) it runs here
+        # directly.
+        try:
+            import data.view_semantics_service as _view_semantics_svc
+            _view_semantics_svc.discover_and_persist_view_semantics(
+                saved["snapshot_id"], source_id, user_id,
+            )
+        except Exception:
+            logger.warning(
+                "View semantic discovery failed for snapshot_id=%s; discovery result unaffected",
+                saved["snapshot_id"],
+            )
 
     now = _now()
     conn = get_connection()
     try:
-        conn.execute(
-            "UPDATE data_source_connections "
-            "SET last_discovered_at = ?, last_snapshot_id = ?, "
-            "source_status = 'ACTIVE', updated_at = ? "
-            "WHERE id = ?",
-            (now, saved["snapshot_id"], now, source_id),
-        )
+        if snapshot.discovery_succeeded:
+            conn.execute(
+                "UPDATE data_source_connections "
+                "SET last_discovered_at = ?, last_snapshot_id = ?, "
+                "source_status = 'ACTIVE', last_test_status = 'success', "
+                "last_test_message = NULL, updated_at = ? "
+                "WHERE id = ?",
+                (now, saved["snapshot_id"], now, source_id),
+            )
+        else:
+            safe_message = "; ".join(w for w in snapshot.warnings if w) or "Schema discovery failed."
+            conn.execute(
+                "UPDATE data_source_connections "
+                "SET last_discovered_at = ?, last_snapshot_id = ?, "
+                "source_status = 'ERROR', last_test_status = 'failed', "
+                "last_test_message = ?, updated_at = ? "
+                "WHERE id = ?",
+                (now, saved["snapshot_id"], safe_message, now, source_id),
+            )
         conn.commit()
     finally:
         conn.close()
 
     return {
-        "snapshot_id":      saved["snapshot_id"],
-        "snapshot_version": saved["snapshot_version"],
-        "source_id":        source_id,
-        "source_type":      source_type,
-        "table_count":      snapshot.table_count,
-        "view_count":       snapshot.view_count,
-        "column_count":     snapshot.column_count,
-        "discovered_at":    snapshot.discovered_at,
-        "warnings":         snapshot.warnings,
+        "snapshot_id":         saved["snapshot_id"],
+        "snapshot_version":    saved["snapshot_version"],
+        "source_id":           source_id,
+        "source_type":         source_type,
+        "table_count":         snapshot.table_count,
+        "view_count":          snapshot.view_count,
+        "column_count":        snapshot.column_count,
+        "discovered_at":       snapshot.discovered_at,
+        "warnings":            snapshot.warnings,
+        "discovery_succeeded": snapshot.discovery_succeeded,
     }
 
 

@@ -537,3 +537,203 @@ class TestStaffingRecruitingEntities:
         signal is 'application'."""
         result = detect_table_entity(_profile("applications", "dbo"))
         assert result.entity == "Applicant"
+
+
+# ---------------------------------------------------------------------------
+# Entity Classification Parity Sprint (2026-07-19)
+#
+# Closes the boost-membership gap where Client/Candidate/Placement/Job only
+# ever scored a name-keyword hit, while legacy person entities (Student,
+# Applicant, User, Employee) additionally accumulated PII/contact/semantic-
+# type/deep-profiling evidence. On a real profiled table (contact columns,
+# confirmed PII), that accumulated non-name evidence let a legacy entity
+# (typically User) outscore or tie out a Client/Candidate table that had a
+# clean, unambiguous name-keyword match — reproduced against real CCPP
+# metadata (dbo.vw_Clients, dbo.thirty_days_ADF_Clients, etc. classified
+# Entity=User instead of Client).
+#
+# These tests are written BEFORE the rules.py fix and are expected to FAIL
+# against the pre-fix code (Client/Candidate/Placement lose to a legacy
+# entity in each mixed-evidence scenario below) and PASS once Client/
+# Candidate are added to the PII/contact/semantic-type boost lists and
+# Placement is added to the event-signal boost list.
+# ---------------------------------------------------------------------------
+
+class TestEntityClassificationParitySprint:
+
+    # -- Client ------------------------------------------------------------
+
+    def test_client_table_with_contact_columns_still_classifies_as_client(self):
+        """A cleanly-named Client table with contact/PII columns must not
+        lose to User just because User (pre-fix) is the only entity that
+        earns non-name evidence from those columns."""
+        p = _profile("clients", "dbo")
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        result = detect_table_entity(p, column_profiles=cols)
+        assert result.entity == "Client"
+        assert result.entity != "User"
+
+    def test_client_weak_name_signal_with_full_contact_evidence_beats_user(self):
+        """Reproduces the real CCPP defect directly: when the Client name
+        signal is weak (schema-level only, no name-level keyword hit) and
+        full contact/PII/email evidence is present, User's accumulated
+        non-name evidence (pre-fix) outscores Client's weak name-only
+        evidence outright — this is the actual defect seen in production,
+        where vw_Clients / thirty_days_ADF_Clients-shaped tables classified
+        as Entity=User. Must resolve to Client after the fix."""
+        p = _profile("records_v4", "clients")
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        result = detect_table_entity(p, semantic_types=["email"], column_profiles=cols)
+        assert result.entity == "Client"
+        assert result.entity != "User"
+
+    def test_client_table_with_confirmed_pii_count_classifies_as_client(self):
+        """Basic (non-deep-profiling) confirmed_pii_count evidence must also
+        reinforce Client, not only the legacy person entities."""
+        p = _profile("clients", "dbo")
+        p["confirmed_pii_count"] = 2
+        result = detect_table_entity(p)
+        assert result.entity == "Client"
+
+    def test_client_confidence_increases_with_contact_evidence(self):
+        """Adding contact-column evidence to a Client-named table should
+        raise confidence relative to the name-only classification, the same
+        way it already does for legacy person entities."""
+        p = _profile("clients", "dbo")
+        name_only = detect_table_entity(p)
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        with_contact = detect_table_entity(p, column_profiles=cols)
+        assert with_contact.entity == "Client"
+        assert with_contact.confidence > name_only.confidence
+
+    # -- Candidate -----------------------------------------------------------
+    # Uses a Candidate-only keyword ("consultant") rather than "candidate"
+    # itself, since "candidate" is an intentional shared keyword with
+    # Applicant (see TestStaffingRecruitingEntities above) — a bare
+    # "candidates" name ties 1.0-1.0 with Applicant regardless of this fix,
+    # by design. "consultant" isolates the Candidate-only signal so the
+    # contact/PII parity gap is tested in isolation.
+
+    def test_candidate_table_with_contact_columns_still_classifies_as_candidate(self):
+        p = _profile("consultants", "dbo")
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        result = detect_table_entity(p, column_profiles=cols)
+        assert result.entity == "Candidate"
+        assert result.entity != "User"
+
+    def test_candidate_weak_name_signal_with_full_contact_evidence_beats_user(self):
+        """Mirrors test_client_weak_name_signal_with_full_contact_evidence_beats_user
+        for Candidate — weak (schema-only) name signal plus full contact/
+        PII/email evidence must resolve to Candidate, not User."""
+        p = _profile("records_v4", "consultants")
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        result = detect_table_entity(p, semantic_types=["email"], column_profiles=cols)
+        assert result.entity == "Candidate"
+        assert result.entity != "User"
+
+    def test_candidate_table_with_confirmed_pii_count_classifies_as_candidate(self):
+        p = _profile("consultants", "dbo")
+        p["confirmed_pii_count"] = 2
+        result = detect_table_entity(p)
+        assert result.entity == "Candidate"
+
+    def test_candidate_confidence_increases_with_contact_evidence(self):
+        p = _profile("consultants", "dbo")
+        name_only = detect_table_entity(p)
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        with_contact = detect_table_entity(p, column_profiles=cols)
+        assert with_contact.entity == "Candidate"
+        assert with_contact.confidence > name_only.confidence
+
+    # -- Placement (timestamp/event-style evidence) -------------------------
+
+    def test_placement_schema_with_timestamp_columns_classifies_as_placement(self):
+        """A table with only a weak (schema-level) Placement signal plus
+        timestamp-heavy columns should resolve to Placement rather than the
+        generic Event/Campaign entities that (pre-fix) are the only ones
+        that benefit from timestamp evidence."""
+        p = _profile("records_v3", "placement")
+        cols = [_col(semantic_type="timestamp") for _ in range(3)]
+        result = detect_table_entity(p, column_profiles=cols)
+        assert result.entity == "Placement"
+
+    # -- Job (existing behaviour preserved — no boost membership change) ----
+
+    def test_job_named_table_still_classifies_as_job(self):
+        result = detect_table_entity(_profile("job_openings", "dbo"))
+        assert result.entity == "Job"
+
+    def test_job_table_with_contact_columns_does_not_gain_person_boost(self):
+        """Job is intentionally excluded from the person/contact boost
+        lists (a job posting is not a person-level record) — contact
+        columns on a Job-named table must not introduce person-entity
+        evidence or change the winning entity."""
+        p = _profile("job_openings", "dbo")
+        cols = [
+            _col(semantic_type="email", pii_confirmed=True),
+            _col(semantic_type="phone", pii_confirmed=True),
+            _col(semantic_type="name"),
+        ]
+        result = detect_table_entity(p, column_profiles=cols)
+        assert result.entity == "Job"
+        assert not any(
+            "contact" in e.lower() or "pii" in e.lower()
+            for e in result.evidence
+        )
+
+    # -- Legacy regression — Student/Applicant/User/Employee unaffected -----
+
+    def test_legacy_student_classification_unchanged(self):
+        result = detect_table_entity(_profile("students", "dbo"))
+        assert result.entity == "Student"
+
+    def test_legacy_applicant_classification_unchanged(self):
+        result = detect_table_entity(_profile("applications", "dbo"))
+        assert result.entity == "Applicant"
+
+    def test_legacy_user_classification_unchanged(self):
+        result = detect_table_entity(_profile("user_accounts", "dbo"))
+        assert result.entity == "User"
+
+    def test_legacy_employee_classification_unchanged(self):
+        result = detect_table_entity(_profile("employees", "dbo"))
+        assert result.entity == "Employee"
+
+    def test_legacy_person_entities_still_win_contact_evidence_on_neutral_name(self):
+        """A neutral-named table (no entity keyword at all) with contact
+        columns must still resolve to a legacy person entity exactly as
+        before — Client/Candidate must not siphon this case since they
+        earn no name-keyword evidence here to differentiate them."""
+        p = _profile("tbl_alpha", "dbo")
+        cols = [
+            _col(semantic_type="email"),
+            _col(semantic_type="phone"),
+            _col(semantic_type="name"),
+        ]
+        result = detect_table_entity(p, column_profiles=cols)
+        assert result.entity in _PERSON_SIGNAL_ENTITIES
+        assert result.entity not in ("Client", "Candidate")

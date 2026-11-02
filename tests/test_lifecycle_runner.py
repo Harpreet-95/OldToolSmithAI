@@ -510,7 +510,10 @@ def test_lifecycle_run_recorded_with_correct_counts(tmp_path, monkeypatch):
     assert run["source_id"] == 1
     assert run["id"] == result.run_id
     steps = json.loads(run["steps_executed_json"])
-    assert len(steps) == 10
+    # 11 original steps + CLASSIFY_PII + GOVERNANCE_AUTO_MATURATION (Parts
+    # 2-4, 7-9 — autonomous PII classification and dictionary/domain/entity
+    # governance auto-maturation).
+    assert len(steps) == 13
 
 
 # ---------------------------------------------------------------------------
@@ -561,9 +564,12 @@ def test_relationship_discovery_runs_and_is_idempotent_across_lifecycle_runs(tmp
     assert len(rels_after_first) == 1
     assert rels_after_first[0]["relationship_status"] == "PENDING"
 
+    # Same schema+profiling pair as `first` (no new evidence inserted) — the
+    # Part 16 duplicate-invocation guard now short-circuits this before
+    # relationship discovery re-runs at all, which is a strictly stronger
+    # idempotency guarantee than "candidates_skipped_existing catches it".
     second = _run()
-    assert second.relationship_summary["candidates_persisted"] == 0
-    assert second.relationship_summary["candidates_skipped_existing"] == 1
+    assert second.status == "SKIPPED_DUPLICATE"
 
     rels_after_second = _relationships(db)
     assert len(rels_after_second) == 1  # no duplicate row created
@@ -574,7 +580,13 @@ def test_relationship_discovery_runs_and_is_idempotent_across_lifecycle_runs(tmp
         "SELECT COUNT(*) AS c FROM audit_logs WHERE task_type = 'relationship_candidate_discovery'"
     ).fetchone()
     conn.close()
-    assert audit_rows["c"] == 2  # one per lifecycle run
+    # Two discovery passes run per REAL lifecycle run — name/domain-anchored
+    # discover_relationship_candidates() and the differently-named-key
+    # discover_semantic_key_candidates() — each audits independently. Only
+    # `first` was a real run; `second` was short-circuited by the Part 16
+    # duplicate-invocation guard before relationship discovery ever ran, so
+    # only one run's worth of audit rows exist.
+    assert audit_rows["c"] == 2  # two passes x one real lifecycle run
 
 
 def test_declared_fk_untouched_by_relationship_discovery(tmp_path, monkeypatch):

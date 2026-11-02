@@ -319,43 +319,195 @@ def _humanize_table_label(table_fqn: str) -> str:
     return " ".join(w.capitalize() for w in words if w)
 
 
+# Accuracy Program A4, Fix #2/#3 — entity/domain-assignment names carry these
+# two sentinel values (see data/entity_service.py) for tables that were never
+# meaningfully classified; neither is a real business name worth showing, for
+# a label OR as the standalone domain/entity metadata fields (Fix #3).
+_UNUSABLE_METADATA_NAMES = {"unknown", "generic"}
+
+
+def _clean_display_text(value) -> str | None:
+    """Trim/collapse whitespace for display; None/blank stays None so the
+    next precedence tier is tried. Never alters case — metadata is trusted
+    as-authored."""
+    if not value:
+        return None
+    cleaned = re.sub(r"\s+", " ", str(value)).strip()
+    return cleaned or None
+
+
+def _usable_metadata_name(value) -> str | None:
+    """_clean_display_text, plus dropping the Unknown/Generic sentinels a
+    never-classified table's domain/entity assignment carries."""
+    cleaned = _clean_display_text(value)
+    if cleaned and cleaned.lower() in _UNUSABLE_METADATA_NAMES:
+        return None
+    return cleaned
+
+
+def _clarification_label(table_fqn: str, candidate: dict) -> str:
+    """Display-only label precedence (does not affect score/order/selection):
+    1. dictionary business_name (table-level)
+    2. entity-assignment name, excluding Unknown/Generic
+    3. existing candidate business_label (column-level dictionary text)
+    4. humanized table/view name
+    5. raw table_fqn, as a final technical fallback
+    """
+    dictionary_name = _clean_display_text(candidate.get("table_business_name"))
+    if dictionary_name:
+        return dictionary_name
+
+    entity_name = _usable_metadata_name(candidate.get("entity_name"))
+    if entity_name:
+        return entity_name
+
+    business_label = _clean_display_text(candidate.get("business_label"))
+    if business_label:
+        return business_label
+
+    humanized = _clean_display_text(_humanize_table_label(table_fqn))
+    if humanized:
+        return humanized
+
+    return table_fqn
+
+
+def _term_tokens(text: str | None) -> set[str]:
+    if not text:
+        return set()
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _text_matches_term(term: str, text: str | None) -> bool:
+    term_tokens = _term_tokens(term)
+    if not term_tokens or not text:
+        return False
+    return bool(term_tokens & _term_tokens(text))
+
+
+def _clarification_why_relevant(term: str, table_fqn: str, candidate: dict) -> list[str]:
+    """Accuracy Program A4, Fix #3 — deterministic, capped-at-3 factual
+    reasons built only from evidence already on the candidate (never from
+    score/confidence/ranking internals, never invented). Fixed priority
+    order: business_name match -> table name match -> entity match ->
+    domain present -> matching column -> related-table connections. Pure
+    function of its inputs, so identical candidates always produce identical
+    reasons in the same order.
+    """
+    reasons: list[str] = []
+
+    business_name = _clean_display_text(candidate.get("table_business_name"))
+    if business_name and _text_matches_term(term, business_name):
+        reasons.append("Business name matches the requested term.")
+
+    if len(reasons) < 3:
+        table_name = table_fqn.split(".")[-1]
+        if _text_matches_term(term, table_name):
+            reasons.append(f"Name matches '{term}'.")
+
+    if len(reasons) < 3:
+        entity_name = _usable_metadata_name(candidate.get("entity_name"))
+        if entity_name and _text_matches_term(term, entity_name):
+            reasons.append(f"Entity assignment matches '{term}'.")
+
+    if len(reasons) < 3:
+        domain_name = _usable_metadata_name(candidate.get("domain_name"))
+        if domain_name:
+            reasons.append(f"Assigned to the {domain_name} domain.")
+
+    if len(reasons) < 3:
+        column_name = candidate.get("column_name")
+        if column_name and _text_matches_term(term, column_name):
+            reasons.append(f"Contains {term}-related columns.")
+
+    if len(reasons) < 3:
+        related = [t for t in (candidate.get("relationship_related_tables") or []) if t]
+        names = [n for n in (_humanize_table_label(t) for t in related[:2]) if n]
+        if names:
+            reasons.append(f"Connected to {' and '.join(names)} tables.")
+
+    return reasons[:3]
+
+
 def _clarification_option(index: int, term: str, candidate: dict) -> dict:
     table_fqn = candidate.get("table_fqn") or ""
-    label = candidate.get("business_label") or _humanize_table_label(table_fqn)
+    label = _clarification_label(table_fqn, candidate)
     score = candidate.get("score")
+    column_name = candidate.get("column_name")
+    description = (
+        f"Uses the '{column_name}' column for {term}." if column_name
+        else f"A business table matching '{term}'."
+    )
     return {
         "id": f"opt_{index}",
         "term": term,
         "table_fqn": table_fqn,
-        "column_name": candidate.get("column_name"),
+        "column_name": column_name,
         "label": label,
-        "description": f"{table_fqn} — confidence {score:.2f}" if isinstance(score, (int, float)) else table_fqn,
+        "description": description,
         "score": score,
+        # Accuracy Program A4, Fix #3 — additive, display/evidence-only.
+        "object_type": _clean_display_text(candidate.get("table_object_type")),
+        "business_name": _clean_display_text(candidate.get("table_business_name")),
+        "domain": _usable_metadata_name(candidate.get("domain_name")),
+        "entity": _usable_metadata_name(candidate.get("entity_name")),
+        "why_relevant": _clarification_why_relevant(term, table_fqn, candidate),
     }
 
 
 def _explain_clarification(data: dict) -> dict:
     ambiguous_terms = data.get("ambiguous_terms") or []
     terms = sorted({t.get("term") for t in ambiguous_terms if t.get("term")})
-    reason = (
-        f"I found multiple business concepts that match '{terms[0]}' with similar confidence."
-        if len(terms) == 1 else
-        "Multiple terms in this question have more than one possible business match: "
-        + ", ".join(f"'{t}'" for t in terms) + "."
-    )
+
+    # Phase 2 — a term with only one candidate (query_planning_service found
+    # a match but it didn't clear the auto-select confidence threshold on
+    # its own) is a single weak guess, not a tie, and must not be described
+    # as "multiple concepts match with similar confidence" — that phrasing
+    # is only true when a group actually has >=2 candidates (data["reason"]
+    # == "low_confidence_match" means every group here is untied; see
+    # context_builder._on_plan_resolved).
+    if data.get("reason") == "low_confidence_match":
+        reason = (
+            f"I couldn't confidently match '{terms[0]}' to a specific table or column."
+            if len(terms) == 1 else
+            "I couldn't confidently match some terms in this question to a specific table or column: "
+            + ", ".join(f"'{t}'" for t in terms) + "."
+        )
+    else:
+        reason = (
+            f"I found multiple business concepts that match '{terms[0]}' with similar confidence."
+            if len(terms) == 1 else
+            "Multiple terms in this question have more than one possible business match: "
+            + ", ".join(f"'{t}'" for t in terms) + "."
+        )
 
     options: list[dict] = []
     lines: list[str] = []
     idx = 1
+    # Rule C — the same database object (table, or table+column) must never
+    # be shown twice, even when it legitimately scores as a candidate for
+    # more than one ambiguous term (e.g. a well-connected junction table
+    # surfacing under two different bogus terms). Keyed on table_fqn +
+    # column_name (None for a table-level concept candidate) — the same
+    # "canonical entity id" the option itself is built from — never on the
+    # display label, which can coincidentally collide for unrelated objects.
+    seen_objects: set[tuple[str, str | None]] = set()
     for group in ambiguous_terms:
         term = group.get("term")
         candidates = group.get("candidates") or []
-        lines.append(f"For '{term}':")
+        group_lines: list[str] = []
         for candidate in candidates:
+            dedup_key = (candidate.get("table_fqn") or "", candidate.get("column_name"))
+            if dedup_key in seen_objects:
+                continue
+            seen_objects.add(dedup_key)
             option = _clarification_option(idx, term, candidate)
             options.append(option)
-            lines.append(f"{idx}. {option['label']}")
+            group_lines.append(f"{idx}. {option['label']}")
             idx += 1
+        if group_lines:
+            lines.append(f"For '{term}':" if group.get("tied", True) else f"Closest match for '{term}':")
+            lines.extend(group_lines)
 
     answer = reason + " " + " ".join(lines) + " Which would you like to use?"
     return {
@@ -375,6 +527,48 @@ def _explain_clarification(data: dict) -> dict:
     }
 
 
+def _explain_current_state_clarification(data: dict) -> dict:
+    """CURRENT-STATE MILESTONE, Part 6 — schema-grounded clarification for a
+    "currently X" question whose resolved plan has more than one materially
+    different current-state definition available in the source data (Part
+    5: GENUINE_BUSINESS_AMBIGUITY, never silently picked). Distinct wording
+    and option shape from _explain_clarification's table/column-ambiguity
+    phrasing — a current-state pick is a WHERE-filter choice, not a
+    table/column choice, and reuses that phrasing would misdescribe it as
+    "multiple business concepts match" when the table/column is not in
+    question at all."""
+    candidates = data.get("current_state_candidates") or []
+    lines = [f"{i}. {c.get('label')}" for i, c in enumerate(candidates, start=1)]
+    options = [
+        {
+            "id": c.get("id") or f"cs_{i}", "kind": "current_state",
+            "table_fqn": c.get("table_fqn"), "column_name": c.get("column_name"),
+            "operator": c.get("operator"), "value": c.get("value"), "label": c.get("label"),
+        }
+        for i, c in enumerate(candidates, start=1)
+    ]
+    reason = (
+        "This question asks for the current state, and the source data supports more than "
+        "one definition of that."
+    )
+    answer = reason + " Do you mean:\n" + "\n".join(lines) + "\nWhich would you like to use?"
+    return {
+        "answer": answer.strip(),
+        "summary": "Clarification needed: which current-state definition should be used?",
+        "answer_type": AnswerType.CLARIFICATION_NEEDED,
+        "confidence": 0,
+        "limitations": ["No SQL has been generated or executed pending your selection."],
+        "clarification": {
+            "reason": reason,
+            "options": options,
+            "expected_impact": (
+                "Selecting a different option changes which rows count as \"current\" and may "
+                "change the result."
+            ),
+        },
+    }
+
+
 def _explain_live_query(package) -> dict:
     item = _find(package, "live_query")
     data = item.data if item and isinstance(item.data, dict) else None
@@ -384,9 +578,73 @@ def _explain_live_query(package) -> dict:
     # Milestone Phase 6.6 — Enterprise Clarification Intelligence. Ambiguity
     # detected by query_planning_service's own ranking (context_builder's
     # _live_query short-circuit) is surfaced as a clarification question,
-    # never as a silent refusal or a best guess.
-    if data.get("reason") == "clarification_required":
+    # never as a silent refusal or a best guess. Phase 2 adds
+    # "low_confidence_match" (a lone below-threshold candidate rather than a
+    # genuine tie) — same CLARIFICATION_NEEDED answer type and resume
+    # machinery, distinct wording only (see _explain_clarification).
+    if data.get("reason") in ("clarification_required", "low_confidence_match"):
         return _explain_clarification(data)
+
+    # CURRENT-STATE MILESTONE, Part 3/6 — see _explain_current_state_
+    # clarification's own docstring for why this is a distinct branch from
+    # the table/column ambiguity handled above.
+    if data.get("reason") == "current_state_ambiguous":
+        return _explain_current_state_clarification(data)
+    if data.get("reason") == "source_data_unusable":
+        # CURRENT-STATE MILESTONE follow-up, Part 8 — deterministic,
+        # business-worded, table-free message; the physical table name
+        # (data["table_fqn"]) stays out of the answer, developer-diagnostics
+        # only (available via the raw evidence dict, never surfaced here).
+        return {
+            "answer": data.get("business_message") or (
+                "Reliable analysis is not available from the current source for this request."
+            ),
+            "summary": "This entity's source data is not populated.",
+            "answer_type": AnswerType.LIVE_QUERY, "confidence": 10,
+            "limitations": [data.get("business_message") or "Source data is not populated for this entity."],
+            "technical_diagnostics": [{
+                "issue_type": "ZERO_ROW_SOURCE_TABLE", "severity": "HIGH",
+                "table_fqn": data.get("table_fqn"), "column_name": None,
+                "business_concept": data.get("unusable_term"), "evidence": f"{data.get('table_fqn')} profiled at 0 rows",
+                "affected_rows": None, "message": data.get("business_message"),
+            }],
+        }
+    if data.get("reason") == "current_state_signal_not_found":
+        return {
+            "answer": (
+                "This question asks for the current state, but the source data has no column "
+                "that reliably indicates that state for this entity."
+            ),
+            "summary": "No current-state indicator is available in the source data.",
+            "answer_type": AnswerType.LIVE_QUERY, "confidence": 10,
+            "limitations": [
+                "No cancellation, end-date, or active-status column was found for this request.",
+            ],
+        }
+
+    # Day 2E, Task 5 — a confirmed-unsupported entity (data.query_planning_
+    # service._build_unsupported_entity_plan) gets its OWN business-worded,
+    # table-free answer text — never the generic "This question could not
+    # be translated..." branch below, whose `explanation`/`warnings`
+    # messages carry raw discovery evidence (candidate table names, scores)
+    # that must never reach a business user. `business_messages` is that
+    # answer text, one plain-English sentence per unsupported entity; the
+    # technical detail (entity name, original resolution_status, raw
+    # evidence) stays in `limitations` for developer diagnostics only —
+    # never physical table names shown as the primary answer.
+    if data.get("reason") == "unsupported_entity":
+        business_messages = list(data.get("business_messages") or [])
+        answer = " ".join(business_messages) or "I could not find a reliable, verified data source for this request."
+        diagnostics = [
+            w.get("message") for w in (data.get("warnings") or [])
+            if isinstance(w, dict) and w.get("message")
+        ]
+        return {
+            "answer": answer,
+            "summary": "No verified data source could answer this question.",
+            "answer_type": AnswerType.LIVE_QUERY, "confidence": 10,
+            "limitations": diagnostics or answer,
+        }
 
     # SQL generation was refused before any execution was attempted — a
     # distinct outcome from a QueryResult that executed and failed/blocked.
@@ -426,8 +684,47 @@ def _explain_live_query(package) -> dict:
     return {
         **business_answer,
         "answer_type": AnswerType.LIVE_QUERY,
-        "confidence": 95,
+        "confidence": _compute_live_query_confidence(package, data),
+        # NEXT MILESTONE, Part 9 — pass-through only. core.orchestrator.agent
+        # already computed these (bounded, question-scoped
+        # detect_data_quality_observations pass) and attached them to `data`
+        # before this function ever ran; never recomputed here.
+        "data_quality_notes": data.get("data_quality_notes") or [],
+        "technical_diagnostics": data.get("technical_diagnostics") or [],
     }
+
+
+def _compute_live_query_confidence(package, data: dict) -> int:
+    """
+    Rule G — final answer confidence must reflect critical stage confidence,
+    never a flat constant. Blends two independently-computed, real scores:
+      - intent_pct: how confident IntentResolver was that this question was
+        even a SQL_REQUEST in the first place (package.intent.confidence,
+        0-1 — see agent.build_live_query_package's intent_confidence param).
+      - plan_pct: how confident query_planning_service was in the specific
+        table/column resolution actually used to answer it — the bare-
+        concept entity_confidence when this was a list_entities/
+        joined_detail_list question (no measure/dimension score to average
+        otherwise), falling back to plan_confidence (query_plan["confidence"],
+        already a measure/dimension/join/warning blend) for every other
+        shape.
+    A weak intent match (e.g. 20%) can therefore never be dressed up as a
+    95%-confident answer just because the resulting SQL happened to execute
+    successfully — execution success alone was the old, sole signal.
+    """
+    business_plan = data.get("business_plan") or {}
+    intent_pct = round((package.intent.confidence or 0.0) * 100)
+
+    entity_confidence = business_plan.get("entity_confidence")
+    plan_confidence = business_plan.get("plan_confidence")
+    if entity_confidence is not None:
+        plan_pct = round(entity_confidence * 100)
+    elif plan_confidence is not None:
+        plan_pct = round(plan_confidence)
+    else:
+        plan_pct = intent_pct  # no plan-level signal at all — don't invent one
+
+    return max(0, min(100, round(intent_pct * 0.4 + plan_pct * 0.6)))
 
 
 def _explain_reports(package) -> dict:

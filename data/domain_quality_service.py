@@ -5,6 +5,7 @@ from collections import Counter
 
 from core.domains.rules import detect_table_domain
 from data.db import get_connection
+from data.profiling_snapshot_resolver import get_latest_profiling_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -59,24 +60,29 @@ def analyze_domain_quality(source_id: int, user_id: str) -> dict | None:
             "FROM domain_assignments WHERE source_id = ?",
             (source_id,),
         ).fetchall()
+    finally:
+        conn.close()
 
-        snap_row = conn.execute(
-            "SELECT id FROM profiling_snapshots "
-            "WHERE source_id = ? ORDER BY snapshot_version DESC LIMIT 1",
-            (source_id,),
-        ).fetchone()
+    # Phase 1D migration: snapshot selection now owned by
+    # data.profiling_snapshot_resolver.get_latest_profiling_snapshot, which
+    # reproduces the exact query this used to run inline (highest
+    # snapshot_version for source_id, status-independent) — no behavior
+    # change, just removing the duplicated SQL from this call site.
+    snap = get_latest_profiling_snapshot(source_id)
 
-        profile_map: dict[str, dict] = {}
-        if snap_row:
+    profile_map: dict[str, dict] = {}
+    if snap:
+        conn = get_connection()
+        try:
             for r in conn.execute(
                 "SELECT table_fqn, table_name, schema_name, table_class, "
                 "pii_column_count, confirmed_pii_count, fk_count, referenced_by_count "
                 "FROM profiling_table_profiles WHERE profiling_snapshot_id = ?",
-                (snap_row["id"],),
+                (snap.id,),
             ).fetchall():
                 profile_map[r["table_fqn"]] = dict(r)
-    finally:
-        conn.close()
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # Map each assignment back to the learned rule that produced it.
