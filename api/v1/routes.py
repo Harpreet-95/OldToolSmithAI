@@ -48,6 +48,7 @@ from core.interpreter.task_interpreter import interpret_task
 from data.workflow_service import create_workflow, list_workflows, delete_workflow, ALLOWED_MULTI_STEP_TYPES
 from core.config import (
     ALLOWED_DATASET_EXTENSIONS,
+    DATASET_UPLOAD_MAX_BYTES,
     DATASET_UPLOADS_DIR,
     ENABLE_REAL_EMAIL,
     FRONTEND_BASE_URL,
@@ -200,6 +201,14 @@ from data.domain_refinement_service import (
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+async def _read_dataset_upload(file: UploadFile) -> bytes:
+    """Read a bounded dataset upload without buffering an unlimited body."""
+    contents = await file.read(DATASET_UPLOAD_MAX_BYTES + 1)
+    if len(contents) > DATASET_UPLOAD_MAX_BYTES:
+        raise ValueError("dataset_upload_too_large")
+    return contents
 
 
 def _compute_histogram(series, n_bins: int = 10) -> list:
@@ -1802,20 +1811,28 @@ async def upload_dataset(
             content=build_error_response("Only CSV and Excel files (.csv, .xlsx, .xls) are supported"),
         )
     try:
-        contents = await file.read()
+        contents = await _read_dataset_upload(file)
         if fname_lower.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(contents))
         elif fname_lower.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(contents), engine="openpyxl")
         else:
             df = pd.read_excel(io.BytesIO(contents), engine="xlrd")
-    except Exception as e:
-        reason = str(e)[:300]
+    except ValueError as exc:
+        if str(exc) == "dataset_upload_too_large":
+            return JSONResponse(
+                status_code=413,
+                content=build_error_response(
+                    f"Dataset exceeds the {DATASET_UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit"
+                ),
+            )
+        logger.info("Dataset parsing rejected file type=%s error_type=%s", fname_lower.rsplit(".", 1)[-1], type(exc).__name__)
         fmt = "CSV" if fname_lower.endswith(".csv") else "Excel"
-        return JSONResponse(
-            status_code=400,
-            content=build_error_response(f"Could not parse {fmt} file: {reason}"),
-        )
+        return JSONResponse(status_code=400, content=build_error_response(f"Could not parse {fmt} file"))
+    except Exception as exc:
+        logger.info("Dataset parsing rejected file type=%s error_type=%s", fname_lower.rsplit(".", 1)[-1], type(exc).__name__)
+        fmt = "CSV" if fname_lower.endswith(".csv") else "Excel"
+        return JSONResponse(status_code=400, content=build_error_response(f"Could not parse {fmt} file"))
     os.makedirs(DATASET_UPLOADS_DIR, exist_ok=True)
     _ext = fname_lower.rsplit(".", 1)[-1]
     _raw_file_path: str | None = os.path.join(DATASET_UPLOADS_DIR, f"{uuid.uuid4().hex}.{_ext}")
@@ -2116,7 +2133,7 @@ async def replace_dataset_source_route(
             content=build_error_response("Only CSV and Excel files (.csv, .xlsx, .xls) are supported"),
         )
     try:
-        contents = await file.read()
+        contents = await _read_dataset_upload(file)
         updated = replace_dataset_source_file(dataset_id, str(user.user_id), contents, file.filename)
         if updated is None:
             return JSONResponse(status_code=404, content=build_error_response("Dataset not found"))
@@ -2130,8 +2147,19 @@ async def replace_dataset_source_route(
                 "uploaded_at":  updated.get("uploaded_at"),
             },
         }
-    except Exception as e:
-        return JSONResponse(status_code=500, content=build_error_response("Internal server error", str(e)))
+    except ValueError as exc:
+        if str(exc) == "dataset_upload_too_large":
+            return JSONResponse(
+                status_code=413,
+                content=build_error_response(
+                    f"Dataset exceeds the {DATASET_UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit"
+                ),
+            )
+        logger.info("Dataset replacement rejected error_type=%s", type(exc).__name__)
+        return JSONResponse(status_code=400, content=build_error_response("Could not process replacement dataset"))
+    except Exception as exc:
+        logger.error("Dataset replacement failed error_type=%s", type(exc).__name__)
+        return JSONResponse(status_code=500, content=build_error_response("Internal server error"))
 
 
 @router.post("/datasets/{dataset_id}/reprofile")

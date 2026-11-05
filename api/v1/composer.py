@@ -1087,8 +1087,7 @@ def composer_ask(
 
     business_answer = _answer_report_source_required()
     business_answer["answer"] = (
-        "Select a connected database or uploaded dataset, then ask your question. "
-        "Use Dictionary and Search from the navigation for catalog discovery."
+        "Select a connected SQL Server database or uploaded dataset, then ask your question."
     )
     business_answer["answer_type"] = "data_selection_required"
     logger.info(

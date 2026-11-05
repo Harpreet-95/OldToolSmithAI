@@ -26,7 +26,7 @@ A running process can still be writing to `toolsmith.db` in WAL mode — a copy 
 ## Step 2 — Take a verified backup (reuses `data/migrate_data_dir.py`)
 
 ```powershell
-$RepoRoot   = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI"
+$RepoRoot   = (Get-Location).Path  # run from the cloned repository root
 $Timestamp  = Get-Date -Format "yyyyMMddTHHmmssZ"
 $BackupDir  = Join-Path $RepoRoot "data\backups\pre_step6e3c_$Timestamp"
 
@@ -70,8 +70,8 @@ git -C $RepoRoot status --short | Out-File -FilePath (Join-Path $BackupDir "git_
 Phase 7, Step 6E3B4, Part 10's own explicit requirement: code rollback must be based on recorded per-file checksums/patches or a recoverable workspace snapshot — **never** `git checkout`/`git reset`/`git stash`, which would discard whatever other uncommitted work is sitting in this branch alongside this step's own changes (confirmed large and pre-existing — see `git_status_at_backup.txt` from Step 2c).
 
 ```powershell
-$RepoRoot    = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI"
-$BackupDir   = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI\data\backups\pre_step6e3c_<TIMESTAMP>"  # same dir as Step 2
+$RepoRoot    = (Get-Location).Path  # run from the cloned repository root
+$BackupDir   = Join-Path $RepoRoot "data\backups\pre_step6e3c_<TIMESTAMP>"  # same dir as Step 2
 $CodeSnapDir = Join-Path $BackupDir "code_snapshot"
 New-Item -ItemType Directory -Path $CodeSnapDir -Force | Out-Null
 
@@ -114,8 +114,8 @@ Whatever Step 6E3C's own deployment action turns out to be (a migration, a conne
 ## Step 4 — Restore procedure (if Step 6E3C needs to be rolled back)
 
 ```powershell
-$RepoRoot  = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI"
-$BackupDir = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI\data\backups\pre_step6e3c_<TIMESTAMP>"  # fill in the exact directory from Step 2
+$RepoRoot  = (Get-Location).Path  # run from the cloned repository root
+$BackupDir = Join-Path $RepoRoot "data\backups\pre_step6e3c_<TIMESTAMP>"  # fill in the exact directory from Step 2
 $LiveDb    = Join-Path $RepoRoot "data\toolsmith.db"
 $BackupDb  = Join-Path $BackupDir "toolsmith.db"
 
@@ -157,8 +157,8 @@ Nothing in this restore path uses `git checkout`/`reset`/`stash`, deletes the po
 ## Step 5 — Restore CODE from the per-file snapshot (if Step 6E3C's own code change needs rolling back)
 
 ```powershell
-$RepoRoot    = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI"
-$BackupDir   = "C:\Users\harpr\OneDrive\Desktop\ToolSmithAI\data\backups\pre_step6e3c_<TIMESTAMP>"  # same dir as Step 2d
+$RepoRoot    = (Get-Location).Path  # run from the cloned repository root
+$BackupDir   = Join-Path $RepoRoot "data\backups\pre_step6e3c_<TIMESTAMP>"  # same dir as Step 2d
 $CodeSnapDir = Join-Path $BackupDir "code_snapshot"
 $Manifest    = Get-Content (Join-Path $CodeSnapDir "manifest.json") | ConvertFrom-Json
 

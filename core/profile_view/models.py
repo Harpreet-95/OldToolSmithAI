@@ -56,13 +56,11 @@ class TableProfileView:
 class DatasetProfile:
     """Top-level unified profile for a data source or uploaded dataset.
 
-    Built exclusively by sql_adapter.build_profile_view_from_source() or
-    dataset_adapter.build_profile_view_from_dataset().  Never constructed
+    Built by sql_adapter.build_profile_view_from_source(). Never constructed
     directly by profiling engines, routes, or report generators.
 
     source_type values:
-        SQL   — 'mssql' | 'postgresql' | 'mysql'
-        File  — 'csv'   | 'excel'
+        SQL   — 'mssql'
 
     summary_metrics holds source-specific aggregate counts (snapshot_id,
     tables_profiled, pii_columns_found, etc.) and is intentionally untyped

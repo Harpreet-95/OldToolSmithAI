@@ -32,6 +32,12 @@ os.environ.setdefault("USER_ID_SALT", "test-user-id-salt-00000000000000000000000
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-000000000000000000000000000000000000000000000000")
 os.environ.setdefault("ADMIN_API_KEY", "test-admin-api-key-000000000000000000000000")
 os.environ.setdefault("USER_API_KEY", "test-user-api-key-0000000000000000000000000")
+# Keep optional background/AI/cache capabilities deterministic in tests without
+# making production configuration inspect whether pytest is imported.
+os.environ["AUTONOMOUS_METADATA_ON_CONNECT_ENABLED"] = "false"
+os.environ["AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_ENABLED"] = "false"
+os.environ["AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_ENABLED"] = "false"
+os.environ["BUSINESS_KNOWLEDGE_EVIDENCE_ENABLED"] = "false"
 
 import data.db as _db_module
 

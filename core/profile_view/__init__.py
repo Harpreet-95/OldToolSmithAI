@@ -12,10 +12,7 @@ Public types::
 Adapters::
 
     sql_adapter.build_profile_view_from_source(source_id, user_id)
-        → DatasetProfile | None   (MSSQL, PostgreSQL, MySQL)
-
-    dataset_adapter.build_profile_view_from_dataset(dataset_id, user_id)
-        → DatasetProfile | None   (CSV, Excel)
+        → DatasetProfile | None   (Microsoft SQL Server)
 """
 from core.profile_view.models import ColumnProfileView, DatasetProfile, TableProfileView
 

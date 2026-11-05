@@ -1,10 +1,10 @@
 # ToolSmithAI
 
-ToolSmithAI lets business users ask questions about connected SQL databases or uploaded CSV/Excel datasets in plain language. It discovers and profiles metadata, retrieves relevant schema evidence with embeddings, generates read-only SQL through the AI-first fast path, validates the SQL, executes it against current data, and returns tables, KPIs, grounded insights, and charts.
+ToolSmithAI lets business users ask questions about connected Microsoft SQL Server databases or uploaded CSV/Excel datasets in plain language. It discovers and profiles metadata, retrieves relevant schema evidence with embeddings, generates read-only SQL through the AI-first fast path, validates the SQL, executes it against current data, and returns tables, KPIs, grounded insights, and charts.
 
 ## What is included
 
-- SQL Server connection, discovery, profiling, dictionary, and search
+- SQL Server connection, discovery, structural profiling, and view intelligence
 - AI-first natural-language question answering for connected SQL sources
 - Vector/embedding retrieval for relevant schema and business evidence
 - Deterministic SQL safety validation before every execution
@@ -39,7 +39,7 @@ The retired keyword intent router and legacy multi-agent SQL execution path are 
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.12
 - Node.js 20 or newer
 - Microsoft ODBC Driver for SQL Server when connecting to SQL Server
 - An OpenAI API key for AI-first SQL question answering
@@ -56,6 +56,12 @@ Copy-Item .env.example .env
 ```
 
 Edit `.env` with your own secrets and feature configuration. Never commit `.env`.
+
+Before the first backend start, replace every `your-...` placeholder. At a
+minimum, configure `JWT_SECRET`, `ENCRYPTION_KEY`, `USER_ID_SALT`,
+`ADMIN_API_KEY`, and `USER_API_KEY`. `.env.example` includes safe generation
+commands. The backend intentionally refuses to start with a missing or weak
+JWT secret.
 
 For backend development and testing, install the additional test dependencies:
 
@@ -87,7 +93,53 @@ Open `http://localhost:5173`. Vite proxies `/v1` requests to the backend at `htt
 
 Use `.env.example` as the supported configuration template. At minimum, configure secure values for authentication/encryption and provide `OPENAI_API_KEY` when enabling AI functionality.
 
-The AI-first SQL fast path is controlled by feature flags and a source allow-list. Keep it disabled for a source until that source has completed metadata preparation and validation. Real email delivery is also disabled by default.
+### Enable database question answering
+
+The AI-first SQL path is deliberately disabled for newly cloned installations.
+Connect a SQL Server database first and wait for its automatic discovery and AI
+preparation to complete. Open the database summary on the **Data Sources** page
+to find its **Source ID**, then set:
+
+```dotenv
+OPENAI_API_KEY=your-key
+AI_FIRST_SQL_FAST_PATH_ENABLED=true
+AI_FIRST_SQL_FAST_PATH_SOURCE_IDS=123
+```
+
+Replace `123` with the displayed source ID. Multiple prepared sources use a
+comma-separated list, for example `123,124`. Restart the backend after editing
+`.env`. A source outside this allow-list receives a clear "not enabled" answer;
+the application never falls back to an older SQL planner.
+
+`OPENAI_MODEL` defaults to `gpt-4o-mini`. Optional fast-path model overrides in
+`.env.example` are blank by default so a fresh clone does not assume access to a
+model unavailable to the reviewer's OpenAI account. The private CCPP demo used
+an explicitly configured reasoning model; that local configuration is not
+committed.
+
+### Optional validated-plan caches
+
+```dotenv
+AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_ENABLED=true
+AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_ENABLED=true
+```
+
+The memory cache is cleared when the backend stops. The durable SQLite cache
+survives backend and computer restarts. Both caches store validated structural
+plans and SQL, not returned result rows or database credentials. SQL can contain
+filter literals, so protect the metadata database like other application data.
+Every hit is revalidated and executed against the live source, which keeps
+business results current.
+
+Real email delivery is optional and disabled by default.
+
+### Private CCPP demonstration
+
+The public repository does not include CCPP credentials, its SQL Server data,
+or Harpreet's local metadata database. The CCPP demo therefore requires private
+network/database access and a separately configured `.env`. A reviewer can run
+the application without CCPP, connect their own SQL Server source, or use the
+CSV/Excel upload workflow.
 
 ## Tests
 
@@ -137,4 +189,27 @@ docker build -t toolsmithai .
 docker run --rm -p 8000:8000 --env-file .env -v ${PWD}/data:/app/data toolsmithai
 ```
 
-For production, use a dedicated persistent data directory and a proper secret-management system rather than storing credentials in the image or repository.
+The current Dockerfile packages the backend only. SQL Server connectivity also
+uses Microsoft ODBC Driver 18 in the image. The React frontend is run separately
+with Vite and is not bundled into this backend image. Local Windows setup remains
+the verified demonstration path; do not describe this image as a complete
+production deployment.
+
+For defense in depth, create a dedicated SQL Server login that has permission to
+read only the schemas/views needed by ToolSmithAI. The application validates every
+generated statement, but database permissions should independently prevent writes.
+
+## Known limitations
+
+- Live database question answering currently supports Microsoft SQL Server.
+- The AI-first path requires an OpenAI API key and explicit source allow-list.
+- Fresh questions depend on model-provider latency; validated cache hits are faster.
+- Docker, public cloud deployment, and two-computer knowledge portability need additional production validation.
+- Historical validation material under `docs/validation/` records development work and is not the supported setup path.
+
+## Authorship and case-study use
+
+ToolSmithAI was **built by Harpreet Kaur** as an AI and data-engineering
+portfolio project. The repository is shared for instructor review and
+educational case-study documentation only. All rights remain reserved; no
+permission to copy, redistribute, or reuse the source code is granted.

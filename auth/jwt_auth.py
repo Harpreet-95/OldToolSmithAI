@@ -1,8 +1,9 @@
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import jwt
 from fastapi import Depends, Header, HTTPException
-from jose import JWTError, jwt
+from jwt import InvalidTokenError
 
 from auth.api_key import AuthenticatedUser, _derive_user_id
 from core.config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_ALGORITHM, JWT_SECRET, KEY_ROLE_MAP
@@ -18,7 +19,7 @@ def create_access_token(data: dict) -> str:
 def decode_access_token(token: str) -> dict | None:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except JWTError:
+    except InvalidTokenError:
         return None
 
 

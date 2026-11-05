@@ -4,7 +4,7 @@ Use this guide to verify a fresh clone or a release candidate. Automated tests u
 
 ## Prerequisites
 
-- Python 3.11 or newer
+- Python 3.12
 - Node.js 20 or newer
 - Microsoft ODBC Driver for SQL Server when testing SQL Server connections
 - A local `.env` created from `.env.example`
@@ -44,7 +44,17 @@ npm run build
 npm run lint
 ```
 
-Do not describe a release as fully green unless all four commands complete successfully. Record any accepted baseline failures in the handoff notes.
+Run dependency security checks:
+
+```powershell
+python -m pip_audit -r requirements.txt
+Set-Location frontend
+npm audit
+```
+
+Do not describe a release as fully green unless the backend tests, frontend tests,
+frontend build, frontend lint, and dependency audits complete successfully. Record
+any intentionally skipped tests and remaining limitations in the handoff notes.
 
 ## Start the application
 

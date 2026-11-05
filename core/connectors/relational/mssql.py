@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -29,7 +30,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
+_ODBC_DRIVER = os.getenv("MSSQL_ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
 
 
 class MssqlProfilingQueryBuilder(ProfilingQueryBuilder):

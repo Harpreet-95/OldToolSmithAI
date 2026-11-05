@@ -63,11 +63,14 @@ ignored by the caller and the message is answered as a fresh question.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from core.config import SQL_ANSWER_MAX_QUESTION_CHARACTERS
+from core.config import JWT_SECRET, SQL_ANSWER_MAX_QUESTION_CHARACTERS
 
 __all__ = [
     "STATE_TYPE",
@@ -82,6 +85,7 @@ __all__ = [
     "parse_new_pipeline_state",
     "build_answered_state",
     "build_clarification_state",
+    "sign_conversation_state",
 ]
 
 STATE_TYPE = "sql_pipeline_conversation"
@@ -96,7 +100,8 @@ STATE_TYPE = "sql_pipeline_conversation"
 # never a crash, never a silent downgrade). This state is short-lived and
 # client-round-tripped only (never persisted server-side), so no migration
 # path is needed -- the user is simply asked to restate the question once.
-STATE_VERSION = 2
+STATE_VERSION = 3
+_SIGNATURE_FIELD = "signature"
 
 # Requirement 6 — a strict maximum of two clarification turns per chain.
 MAX_CLARIFICATION_TURNS = 2
@@ -173,7 +178,7 @@ class NewPipelineConversationState:
     secret_policy_version: Optional[int] = None
 
     def to_dict(self) -> dict:
-        return {
+        return sign_conversation_state({
             "state_type": STATE_TYPE,
             "version": STATE_VERSION,
             "source_id": self.source_id,
@@ -196,7 +201,23 @@ class NewPipelineConversationState:
             "business_knowledge_package_version": self.business_knowledge_package_version,
             "view_profile_state": list(self.view_profile_state),
             "secret_policy_version": self.secret_policy_version,
-        }
+        })
+
+
+def sign_conversation_state(payload: dict) -> dict:
+    """Return a copy with an HMAC signature over its canonical JSON shape."""
+    unsigned = {key: value for key, value in payload.items() if key != _SIGNATURE_FIELD}
+    canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    signature = hmac.new(JWT_SECRET.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    return {**unsigned, _SIGNATURE_FIELD: signature}
+
+
+def _has_valid_signature(raw: dict) -> bool:
+    supplied = raw.get(_SIGNATURE_FIELD)
+    if not isinstance(supplied, str) or len(supplied) != 64:
+        return False
+    expected = sign_conversation_state(raw)[_SIGNATURE_FIELD]
+    return hmac.compare_digest(supplied, expected)
 
 
 def _is_expired(created_at: str, *, now: Optional[datetime] = None) -> bool:
@@ -330,6 +351,8 @@ def parse_new_pipeline_state(
     if raw.get("state_type") != STATE_TYPE:
         return None
     if raw.get("version") != STATE_VERSION:
+        return None
+    if not _has_valid_signature(raw):
         return None
 
     raw_source_id = raw.get("source_id")

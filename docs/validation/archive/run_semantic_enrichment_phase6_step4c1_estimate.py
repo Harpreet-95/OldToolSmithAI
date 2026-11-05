@@ -172,7 +172,8 @@ def main() -> None:
     }
     print(json.dumps(report, indent=2, default=str))
 
-    out_path = Path(r"C:\Users\harpr\OneDrive\Desktop\ToolSmithAI_db_backups\step4C1_estimate_report.json")
+    out_path = Path("docs/validation/results/step4C1_estimate_report.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(f"\nWrote report to {out_path}")
 

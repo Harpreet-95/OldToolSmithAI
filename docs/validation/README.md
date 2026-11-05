@@ -27,3 +27,6 @@ repository tests use fixtures and do not require the live CCPP database.
 Generated outputs, temporary diagnostics, local logs, and result files are not
 version controlled. Never place credentials, database files, sensitive result
 rows, or screenshots containing private data in this directory.
+
+Older Phase 6/7 experimental runners are isolated under `archive/`. They are
+historical evidence only and are not supported commands for a fresh clone.

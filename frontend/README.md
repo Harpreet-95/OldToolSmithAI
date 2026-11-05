@@ -1,16 +1,32 @@
-# React + Vite
+# ToolSmithAI frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The ToolSmithAI web interface is a React 19 application built with Vite. It
+provides the AI Workspace, unified database and uploaded-dataset management,
+history, reports, scheduling, exports, clarification flows, and visual answers.
 
-Currently, two official plugins are available:
+## Requirements
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Node.js 20 or newer
+- The ToolSmithAI FastAPI backend running at `http://127.0.0.1:8000`
 
-## React Compiler
+## Install and run
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```powershell
+npm ci
+npm run dev
+```
 
-## Expanding the ESLint configuration
+Open `http://localhost:5173`. The Vite development server proxies `/v1` API
+requests to the local backend.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Quality checks
+
+```powershell
+npm test
+npm run lint
+npm run build
+```
+
+The frontend never contains production passwords or API keys. Authentication
+uses the backend's JWT login flow, and runtime configuration belongs in the
+repository-root `.env` file rather than frontend source code.

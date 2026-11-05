@@ -154,6 +154,7 @@ export default function DataSourceManager({ C = {}, token, onBack }) {
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(185px, 1fr))', gap: 10 }}>
               {[
+                ['Source ID', source.id],
                 ['Database', source.display_name],
                 ['Database type', TYPES.find(type => type.value === source.source_type)?.label ?? source.source_type],
                 ['Server / database', source.config_summary ?? 'Not available'],

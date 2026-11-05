@@ -45,6 +45,11 @@ if not USER_ID_SALT:
 # ---------------------------------------------------------------------------
 DATASET_UPLOADS_DIR: str = os.getenv("DATASET_UPLOADS_DIR", os.path.join("data", "uploads"))
 ALLOWED_DATASET_EXTENSIONS: tuple[str, ...] = (".csv", ".xlsx", ".xls")
+# Read at most one byte beyond the configured limit so oversized uploads are
+# rejected before pandas can allocate memory for them. Default: 25 MiB.
+DATASET_UPLOAD_MAX_BYTES: int = int(os.getenv("DATASET_UPLOAD_MAX_BYTES", str(25 * 1024 * 1024)))
+if DATASET_UPLOAD_MAX_BYTES <= 0:
+    raise ValueError("DATASET_UPLOAD_MAX_BYTES must be greater than zero")
 
 RETENTION_DAYS: int = int(os.getenv("RETENTION_DAYS", "90"))
 MAX_STEP_RETRIES: int = int(os.getenv("MAX_STEP_RETRIES", "2"))
@@ -156,24 +161,8 @@ PROFILING_AUTO_CONTINUE_TIME_BUDGET_SECONDS: float = float(os.getenv("PROFILING_
 # AUTONOMOUS_FULL_ENRICHMENT_ON_CONNECT_ENABLED below for that legacy
 # behavior, now opt-in only.
 #
-# Defaults to false when running under pytest — dozens of existing tests
-# call create_data_source() as setup for unrelated things and use per-test
-# temp SQLite files via monkeypatched data.db.DB_PATH; an unawaited
-# background thread can still be mid-run when monkeypatch reverts DB_PATH at
-# test teardown, and then reconnects (SQLite auto-creates the file) against
-# a stale/default path with none of the schema tables — observed as
-# spurious "no such table" errors across many unrelated test files. Checked
-# via "pytest" in sys.modules rather than the PYTEST_CURRENT_TEST env var,
-# since this module is typically imported once at collection time, before
-# PYTEST_CURRENT_TEST is set for the first test. Tests that specifically
-# exercise this auto-start behavior set the env var explicitly rather than
-# relying on this default.
-import sys as _sys
 AUTONOMOUS_METADATA_ON_CONNECT_ENABLED: bool = (
-    os.getenv(
-        "AUTONOMOUS_METADATA_ON_CONNECT_ENABLED",
-        "false" if "pytest" in _sys.modules else "true",
-    ).lower() == "true"
+    os.getenv("AUTONOMOUS_METADATA_ON_CONNECT_ENABLED", "true").lower() == "true"
 )
 
 # AUTONOMOUS_FULL_ENRICHMENT_ON_CONNECT_ENABLED — Autonomous Live-SQL
@@ -562,8 +551,7 @@ AI_FIRST_SQL_FAST_PATH_SIMPLE_MAX_COLUMNS: int = int(
 # call are skipped on a repeat question; it can never change which SQL is
 # considered safe to run.
 AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_ENABLED: bool = (
-    False if "pytest" in _sys.modules
-    else os.getenv("AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_ENABLED", "false").lower() == "true"
+    os.getenv("AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_ENABLED", "false").lower() == "true"
 )
 AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_TTL_SECONDS: int = int(
     os.getenv("AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_TTL_SECONDS", "600")
@@ -584,8 +572,7 @@ AI_FIRST_SQL_FAST_PATH_PLAN_CACHE_MAX_ENTRIES: int = int(
 # minutes of repeat traffic); MAX_ROWS_PER_IDENTITY bounds one noisy
 # datasource's row growth, mirroring the in-memory tier's MAX_ENTRIES.
 AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_ENABLED: bool = (
-    False if "pytest" in _sys.modules
-    else os.getenv("AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_ENABLED", "false").lower() == "true"
+    os.getenv("AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_ENABLED", "false").lower() == "true"
 )
 AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_TTL_SECONDS: int = int(
     os.getenv("AI_FIRST_SQL_FAST_PATH_DURABLE_PLAN_CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60))
@@ -650,19 +637,12 @@ BUSINESS_KNOWLEDGE_MAPPING_MIN_VERIFIED_CONFIDENCE: float = float(
 # once can be read at question time even on a deployment that disables
 # further on-connect (re)mapping, and vice versa.
 #
-# Forced false when running under pytest, unconditionally -- unlike
-# AUTONOMOUS_METADATA_ON_CONNECT_ENABLED's pytest-only *default* above, this
-# must override even an explicitly-set .env value, since a real local .env
-# legitimately sets this true for actual source-10004 manual/live testing.
-# Every test that wants evidence-consumption behavior already monkeypatches
-# this constant (and/or the module-local import of it, e.g. in
-# core.sqlservice.ambiguity_guard / schema_frontier) to True explicitly. Not
-# forcing this under pytest caused unrelated unit tests with no business-
-# knowledge fixtures at all to trip the real-DB test guard (Phase 7 Step 5
-# audit finding) whenever a developer's .env happened to have this on.
+# Tests set this environment variable to false in the root conftest before
+# importing application configuration. Production configuration therefore
+# remains independent of the test runner, while individual evidence tests can
+# still monkeypatch the setting explicitly.
 BUSINESS_KNOWLEDGE_EVIDENCE_ENABLED: bool = (
-    False if "pytest" in _sys.modules
-    else os.getenv("BUSINESS_KNOWLEDGE_EVIDENCE_ENABLED", "false").lower() == "true"
+    os.getenv("BUSINESS_KNOWLEDGE_EVIDENCE_ENABLED", "false").lower() == "true"
 )
 
 # ---------------------------------------------------------------------------
