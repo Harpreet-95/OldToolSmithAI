@@ -2,6 +2,65 @@
 
 ToolSmithAI lets business users ask questions about connected Microsoft SQL Server databases or uploaded CSV/Excel datasets in plain language. It discovers and profiles metadata, retrieves relevant schema evidence with embeddings, generates read-only SQL through the AI-first fast path, validates the SQL, executes it against current data, and returns tables, KPIs, grounded insights, and charts.
 
+## Why this exists
+
+Important business information is often locked behind database schemas, SQL
+knowledge, and analyst availability. A basic text-to-SQL demo can make that
+information easier to reach, but it can also select the wrong tables, invent a
+join, or generate an unsafe statement. ToolSmithAI was created to give
+non-technical decision-makers a simpler way to explore organizational data
+without treating model-generated SQL as trusted code.
+
+## Who it is for
+
+- Business and operations leaders who need answers but do not write SQL.
+- Analysts who want a faster, reviewable starting point for recurring questions.
+- Data teams that need natural-language access with deterministic safety checks.
+- Organizations working with SQL Server databases and ordinary CSV/Excel files.
+
+## Positive impact
+
+ToolSmithAI reduces the distance between a business question and a useful,
+current answer. It combines plain-language access with safeguards that make the
+result easier to trust:
+
+- Users receive understandable tables, KPIs, grounded insights, and appropriate
+  charts instead of raw SQL alone.
+- Relevant schema evidence is retrieved with embeddings, reducing the amount of
+  irrelevant database structure sent to the model.
+- Generated SQL is parsed and checked against known tables, columns, joins, and
+  safety rules before execution.
+- Ambiguous questions produce clarification instead of a confident guess.
+- Repeated questions can skip model calls, while validation and live SQL
+  execution still run so the returned business data remains current.
+- Database sources and uploaded files share one consistent workspace, reducing
+  the need for separate technical tools.
+
+## What I built
+
+Harpreet Kaur designed and implemented the consolidated product experience and
+its AI-first data-question pipeline: connection-time metadata preparation,
+embedding retrieval, guarded SQL generation, deterministic validation, live
+execution, clarification and follow-up handling, persistent validated-plan
+caching, answer/insight/chart formatting, exports, testing, and the React user
+experience. Historical experiments remain archived for engineering traceability;
+they are not presented as active product routes.
+
+## Demonstrated engineering results
+
+| Evidence | Verified result |
+| --- | --- |
+| Full backend regression suite | 6,632 passed, 9 intentionally skipped, 0 failed |
+| Frontend component suite | 175 passed, 0 failed |
+| Frontend lint and production build | Passed |
+| Python dependency audit | No known vulnerabilities |
+| npm dependency audit | 0 vulnerabilities |
+| Clean exported-repository smoke suite | 156 passed |
+
+These figures describe engineering verification, not business accuracy. Live
+answer quality and latency depend on the connected database, its metadata, the
+configured model, and network conditions.
+
 ## What is included
 
 - SQL Server connection, discovery, structural profiling, and view intelligence
@@ -43,6 +102,20 @@ The retired keyword intent router and legacy multi-agent SQL execution path are 
 - Node.js 20 or newer
 - Microsoft ODBC Driver for SQL Server when connecting to SQL Server
 - An OpenAI API key for AI-first SQL question answering
+
+## Try it in five minutes without CCPP
+
+1. Complete the backend and frontend setup below.
+2. Generate the five local secrets using the commands documented in
+   `.env.example`; keep them only in your untracked `.env` file.
+3. Start both services and register a local test user.
+4. Open **Data Sources**, upload a non-sensitive CSV or Excel file, and select it
+   from the AI Workspace.
+5. Use the SQL Server flow only when you have an authorized, non-production test
+   connection and an OpenAI key.
+
+The private demonstration database is not required to review the interface,
+uploaded-dataset workflow, repository structure, or automated tests.
 
 ## Local setup
 
@@ -206,6 +279,27 @@ generated statement, but database permissions should independently prevent write
 - Fresh questions depend on model-provider latency; validated cache hits are faster.
 - Docker, public cloud deployment, and two-computer knowledge portability need additional production validation.
 - Historical validation material under `docs/validation/` records development work and is not the supported setup path.
+
+## Production status and expansion path
+
+ToolSmithAI is a **production-oriented prototype validated for a controlled
+pilot**. It is not represented as a turnkey production deployment. Its modular
+FastAPI, React, connector, retrieval, validation, and persistence boundaries
+provide a practical foundation for expansion, but an organization should add
+the following before serving critical or regulated workloads:
+
+- managed secrets and key rotation;
+- organization SSO, role design, and formal tenant-isolation review;
+- managed application metadata storage, backups, and disaster recovery;
+- centralized monitoring, alerting, tracing, and operational runbooks;
+- load, concurrency, failure-recovery, and model-quality evaluation at the
+  intended production scale;
+- deployment automation for both backend and frontend;
+- security, privacy, and data-governance approval for each connected source.
+
+This distinction keeps the case study honest: the current system demonstrates
+the architecture and safety controls needed for a pilot, while clearly naming
+the operational work required for enterprise production.
 
 ## Authorship and case-study use
 

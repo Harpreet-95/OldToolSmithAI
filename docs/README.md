@@ -9,3 +9,8 @@ are documented in the repository-root `README.md`.
   development history. They do not describe the consolidated runtime.
 
 Start with the root README. Do not use archived documents as setup guidance.
+
+Some validation artifacts preserve schema-only identifiers from the private
+demonstration environment for engineering traceability. They contain no
+credentials or business-row exports, but publication of those identifiers must
+be approved by the database owner before a public release.

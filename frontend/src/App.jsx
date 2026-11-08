@@ -304,7 +304,7 @@ const NAV_ITEMS = [
 const USER_HIDDEN_TABS = new Set(['sched-activity', 'operations', 'usage', 'workspaces'])
 
 const FEATURES = [
-  { title: 'AI-Powered',       sub: 'Smart intent interpretation', icon: 'brain'   },
+  { title: 'AI-Powered',       sub: 'Grounded answers from your data', icon: 'brain'   },
   { title: 'Dynamic Tool',     sub: 'Generation',                  icon: 'tools'   },
   { title: 'Smart Workflow',   sub: 'Execution',                   icon: 'network' },
   { title: 'Secure & Reliable', sub: 'Enterprise-grade security',  icon: 'shield'  },

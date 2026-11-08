@@ -79,7 +79,9 @@ Open `http://localhost:5173` and sign in with a test account.
 
 - [ ] Register or sign in with a test account.
 - [ ] Refresh the browser and confirm the session remains usable.
-- [ ] Confirm the sidebar exposes only the supported pages.
+- [ ] For a standard user, confirm the sidebar shows AI Workspace, Overview,
+      Workflows, Data Sources, Scheduled, History, Reports, and Settings.
+- [ ] Confirm administrator-only operational pages do not appear for a standard user.
 - [ ] Confirm Data Sources opens the combined dataset/database landing page.
 - [ ] Confirm History loads and shows no records older than seven days.
 - [ ] Sign out and confirm protected pages are no longer accessible.
@@ -154,3 +156,12 @@ For a handoff or demo, save:
 - any known limitations that remain.
 
 Do not commit credentials, database files, screenshots containing sensitive rows, or live result exports.
+
+### Response-time record
+
+Record measurements from the actual demonstration environment rather than
+copying development-session timings:
+
+| Question | Source | Cold time | Warm time | Cache status | SQL executed live |
+| --- | --- | ---: | ---: | --- | --- |
+| Example question | Test source | ___ s | ___ s | MISS / HIT | Yes / No |
