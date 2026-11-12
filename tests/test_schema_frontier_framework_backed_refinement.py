@@ -257,4 +257,3 @@ def test_selection_service_gate_still_rejects_raw_unsafe_dependency():
         _validate_authority_facts(
             (_selection_reason(),), candidates_by_lower={_VIEW_FQN.lower(): candidate}, intent_summary=_intent(),
         )
-

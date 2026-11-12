@@ -742,4 +742,3 @@ increase across repeats — **met, triggering NO-GO** (1→8, every repeat).
 CCPP (`source_id=1`) was never touched, reconnected, or altered by any part
 of this milestone's work, and `ENABLE_PORTABLE_KNOWLEDGE_LAYER` remains
 `false` by default in `core/config.py` (Part 8, unchanged).
-

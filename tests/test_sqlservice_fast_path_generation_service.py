@@ -138,7 +138,7 @@ def test_non_data_parses_correctly():
         "request_kind": REQUEST_KIND_NON_DATA, "intent": {**_intent(), "operation": "NONE", "entities": []},
         "selected_object_fqns": [], "object_reasons": [], "confirmed_relationships_used": [], "sql": None,
         "clarification_question": None, "response_text": "Hi there!", "decision_evidence": [], "confidence": 0.9,
-   
+
         "follow_up_resolution": _none_resolution(),
     }
     provider = FakeFastPathProvider(fixed_raw=raw)
@@ -157,7 +157,7 @@ def test_unsupported_parses_correctly():
         "request_kind": REQUEST_KIND_UNSUPPORTED, "intent": {**_intent(), "operation": "NONE", "entities": []},
         "selected_object_fqns": [], "object_reasons": [], "confirmed_relationships_used": [], "sql": None,
         "clarification_question": None, "response_text": "Cannot delete data.", "decision_evidence": [], "confidence": 0.9,
-   
+
         "follow_up_resolution": _none_resolution(),
     }
     provider = FakeFastPathProvider(fixed_raw=raw)
@@ -175,7 +175,7 @@ def test_clarification_required_parses_correctly():
         "request_kind": REQUEST_KIND_CLARIFICATION_REQUIRED, "intent": {**_intent(), "entities": []},
         "selected_object_fqns": [], "object_reasons": [], "confirmed_relationships_used": [], "sql": None,
         "clarification_question": "Which fee?", "response_text": None, "decision_evidence": [], "confidence": 0.3,
-   
+
         "follow_up_resolution": _none_resolution(),
     }
     provider = FakeFastPathProvider(fixed_raw=raw)
