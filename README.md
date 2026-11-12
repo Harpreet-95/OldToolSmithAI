@@ -4,6 +4,10 @@
 
 ToolSmithAI lets business users ask questions about connected Microsoft SQL Server databases or uploaded CSV/Excel datasets in plain language. It discovers and profiles metadata, retrieves relevant schema evidence with embeddings, generates read-only SQL through the AI-first fast path, validates the SQL, executes it against current data, and returns tables, KPIs, grounded insights, and charts.
 
+## Product preview
+
+![ToolSmithAI login page with product overview and sign-in panel](docs/images/toolsmithai-login.png)
+
 ## Why this exists
 
 Important business information is often locked behind database schemas, SQL
