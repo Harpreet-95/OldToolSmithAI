@@ -20,7 +20,6 @@ from core.config import (
 )
 from api.v1.routes import router as v1_router
 from api.v1.composer import composer_router
-from api.v1.lifecycle_routes import lifecycle_router
 from data.models import init_db
 from data.profiling_service import continue_all_active_profiling_batches
 from data.scheduled_workflow_service import run_due_workflows
@@ -133,4 +132,3 @@ app.add_exception_handler(Exception, global_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.include_router(v1_router, prefix="/v1")
 app.include_router(composer_router, prefix="/v1")
-app.include_router(lifecycle_router, prefix="/v1")

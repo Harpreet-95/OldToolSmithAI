@@ -33,7 +33,6 @@ def _make_db(tmp_path: pathlib.Path, monkeypatch) -> pathlib.Path:
         "data.knowledge_graph_service",
         "data.semantic_layer_service",
         "data.relationship_service",
-        "data.lineage_service",
         "data.profiling_service",
         "data.domain_service",
         "data.entity_service",

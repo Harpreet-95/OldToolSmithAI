@@ -303,8 +303,10 @@ def execute_governed_query(
     ai_planning_trace: "dict | None" = None,
 ):
     """The one governed entry point for executing SQL derived from a
-    business question (chat, execute-query REST route, and every
-    context_builder._live_query branch).
+    business question (executive-report generation, insight generation, and
+    every context_builder._live_query branch). Database questions asked
+    through POST /v1/composer/ask use the AI-first fast path's own validated
+    execution instead (core.sqlservice.sql_execution).
 
     user_role — the requester's role, threaded through to
     _write_pii_access_audit for the audit trail only (2026-08-24 "remove
@@ -1227,11 +1229,11 @@ def execute_generated_query(
     # refuses execution via LiveConnectionResolver.resolve(required_capability
     # ="sql_query") when the connection's live_query_enabled flag is off —
     # the same flag metadata_preparation_service.prepare_selected_tables
-    # already respects for its own probe. This function (the POST
-    # /v1/sources/{id}/execute-query path, via execute_query_route) is the
-    # only other place that opens a live connection to run generated SQL and
-    # had no equivalent check, so a connection explicitly configured with
-    # live_query_enabled=False could still be queried through this route.
+    # already respects for its own probe. This function (used by report and
+    # insight generation via execute_governed_query) is the only other place
+    # that opens a live connection to run generated SQL and had no equivalent
+    # check, so a connection explicitly configured with live_query_enabled=
+    # False could still be queried through those callers.
     if not _check_live_query_authorized(source_id, user_id):
         _dur = _elapsed_ms(started_at)
         log_query_execution(

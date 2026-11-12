@@ -488,7 +488,7 @@ AI_FIRST_SCHEMA_SELECTION_REASONING_EFFORT: str | None = _raw_ai_first_schema_se
 # ---------------------------------------------------------------------------
 # Phase 8A — the AI-first fast path (core.sqlservice.ai_first_fast_path_
 # service) is the ONE question-answering architecture for a connected SQL
-# datasource (POST /v1/composer/ask and POST /v1/sources/{id}/execute-query).
+# datasource (POST /v1/composer/ask).
 # This pair is the single enablement gate: the global flag AND an explicit
 # per-source allow-list an operator sets in THEIR OWN local .env (never a
 # literal source id in shared code). A source that is not enabled gets a

@@ -49,7 +49,6 @@ from core.sqlservice.fast_path_generation_providers import OpenAIFastPathGenerat
 from core.sqlservice.fast_path_prior_turn import FastPathPriorTurnContext, build_prior_turn_context
 
 from api.v1.ai_first_composer_adapter import FIXED_RESOLVED_INTENT, build_ai_first_composer_response
-from api.v1.query_response_adapter import build_execute_query_error_response, build_execute_query_response
 from api.v1.sql_pipeline_composer_state import (
     KIND_ANSWERED,
     KIND_CLARIFICATION_PENDING,
@@ -66,7 +65,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "answer_with_fast_path",
-    "run_fast_path_execute_query",
     "is_fast_path_enabled_for_source",
     "run_ai_first_fast_path_composer_ask",
     "run_ai_first_fast_path_composer_continue",
@@ -491,33 +489,3 @@ def answer_with_fast_path(
         source_id, user_id, message,
         session_id=session_id, request_id=request_id, start_time=start_time,
     )
-
-
-def run_fast_path_execute_query(source_id: int, user_id: str, question: str) -> dict:
-    """
-    POST /v1/sources/{id}/execute-query -- the Data Source Manager's "ask a
-    question" box -- answered through the SAME fast path as the composer
-    (no second architecture), adapted to that route's response envelope.
-    Never raises; a failure is a fixed, sanitized envelope (never an
-    exception's own text).
-    """
-    if not is_fast_path_enabled_for_source(source_id):
-        return build_execute_query_error_response(
-            source_id, agent_status="not_enabled", message=_SOURCE_NOT_ENABLED_MESSAGE,
-            error_code="source_not_enabled",
-        )
-    stage = "provider_construction"
-    try:
-        stage = "answer_question_ai_first_fast_path_call"
-        result = _run_ai_first_fast_path_pipeline(question, source_id, user_id)
-    except Exception as exc:
-        logger.error(
-            "run_fast_path_execute_query: unexpected failure "
-            "[source_id=%s] [stage=%s] [exception_type=%s]",
-            source_id, stage, type(exc).__name__,
-        )
-        return build_execute_query_error_response(
-            source_id, agent_status="execution_failed", message=_UNEXPECTED_ERROR_MESSAGE,
-            error_code="query_pipeline_unavailable",
-        )
-    return build_execute_query_response(result)

@@ -1,16 +1,15 @@
 """
 Query response adapter -- Phase 8A.
 
-Shared, pure response helpers for the AI-first fast path, plus the adapter
-for POST /v1/sources/{id}/execute-query (the Data Source Manager's "ask a
-question" box), which now answers through the SAME fast path as
-POST /v1/composer/ask:
+Shared, pure response helpers for the AI-first fast path used by
+POST /v1/composer/ask, plus a standalone query-response envelope builder
+that has no active HTTP route (retained, with its tests, as a pure adapter):
 
-  - _display_row_keys / _json_safe_cell / _insight_to_dict: used by both
-    the composer adapter and the execute-query adapter below.
+  - _display_row_keys / _json_safe_cell / _insight_to_dict: used by the
+    composer adapter (api/v1/ai_first_composer_adapter.py).
   - build_execute_query_response(result): AiFirstOrchestrationResult ->
     {"status", "agent_status", "stop_reason", "data": {...}, "warnings",
-    "trace"}, the shape DataSourceManager.jsx renders.
+    "trace"}.
 
 Row/column shape (Step 3A/3B contract with the frontend renderer):
 "rows" is list[dict] keyed by a synthesized, globally-unique DISPLAY key per
@@ -332,8 +331,8 @@ def _stop_reason(result: AiFirstOrchestrationResult) -> Optional[str]:
 
 def build_execute_query_response(result: AiFirstOrchestrationResult) -> dict:
     """
-    Adapts one fast-path AiFirstOrchestrationResult into the JSON body
-    POST /v1/sources/{id}/execute-query's existing consumers expect:
+    Adapts one fast-path AiFirstOrchestrationResult into a standalone
+    query-response envelope (no active HTTP route returns it today):
     {"status": "success", "agent_status", "stop_reason", "data": {...},
     "warnings": [...], "trace": [...]}.
 
@@ -381,7 +380,7 @@ def build_execute_query_response(result: AiFirstOrchestrationResult) -> dict:
 def build_execute_query_error_response(
     source_id: int, *, agent_status: str, message: str, error_code: str,
 ) -> dict:
-    """The execute-query envelope for a failure that happens before any
+    """The query-response envelope for a failure that happens before any
     AiFirstOrchestrationResult exists (source not enabled, or a genuinely
     unexpected provider/construction failure). Built directly -- there is
     no result to adapt. `message` must already be a fixed, sanitized

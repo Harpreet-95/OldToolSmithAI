@@ -1,5 +1,7 @@
 # ToolSmithAI
 
+**Built by Harpreet Kaur.**
+
 ToolSmithAI lets business users ask questions about connected Microsoft SQL Server databases or uploaded CSV/Excel datasets in plain language. It discovers and profiles metadata, retrieves relevant schema evidence with embeddings, generates read-only SQL through the AI-first fast path, validates the SQL, executes it against current data, and returns tables, KPIs, grounded insights, and charts.
 
 ## Why this exists
@@ -50,12 +52,12 @@ they are not presented as active product routes.
 
 | Evidence | Verified result |
 | --- | --- |
-| Full backend regression suite | 6,632 passed, 9 intentionally skipped, 0 failed |
+| Full backend regression suite | 6,520 passed, 9 intentionally skipped, 0 failed |
 | Frontend component suite | 175 passed, 0 failed |
 | Frontend lint and production build | Passed |
 | Python dependency audit | No known vulnerabilities |
 | npm dependency audit | 0 vulnerabilities |
-| Clean exported-repository smoke suite | 156 passed |
+| CI backend smoke subset | 154 passed |
 
 These figures describe engineering verification, not business accuracy. Live
 answer quality and latency depend on the connected database, its metadata, the
@@ -300,10 +302,3 @@ the following before serving critical or regulated workloads:
 This distinction keeps the case study honest: the current system demonstrates
 the architecture and safety controls needed for a pilot, while clearly naming
 the operational work required for enterprise production.
-
-## Authorship and case-study use
-
-ToolSmithAI was **built by Harpreet Kaur** as an AI and data-engineering
-portfolio project. The repository is shared for instructor review and
-educational case-study documentation only. All rights remain reserved; no
-permission to copy, redistribute, or reuse the source code is granted.

@@ -1810,9 +1810,8 @@ def test_explain_table_connection_count_preserved(tmp_path, monkeypatch):
 # get_latest_profiling_snapshot() directly. This phase deletes the dead
 # wrapper's definition outright. Mirrors the Phase 2B.8 precedent in
 # tests/test_phase6_semantic.py, the Phase 2C.3 precedent in
-# tests/test_phase3_business_knowledge.py, and the Phase 2D.6 precedent in
-# tests/test_phase5_lineage.py for the identically-named (but separately
-# scoped) wrappers in those modules.
+# tests/test_phase3_business_knowledge.py for the identically-named (but
+# separately scoped) wrappers in those modules.
 # ---------------------------------------------------------------------------
 
 # 1 — knowledge_graph_service_has_no_legacy_snapshot_helper

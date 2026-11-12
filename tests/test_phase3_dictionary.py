@@ -329,11 +329,9 @@ def test_dictionary_service_imports_successfully():
     ])
 
 
-# ── 12. API routes import ─────────────────────────────────────────────────────
+# ── 12. Internal-only boundary ────────────────────────────────────────────────
 
-def test_api_dictionary_routes_registered():
+def test_dictionary_services_are_not_exposed_as_manual_routes():
     from api.v1.routes import router
     paths = [r.path for r in router.routes]
-    assert any('dictionary/generate' in p for p in paths)
-    assert any('/dictionary' in p for p in paths)
-    assert any('dictionary/tables' in p for p in paths)
+    assert not any('/dictionary' in p for p in paths)

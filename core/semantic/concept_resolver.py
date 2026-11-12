@@ -7,10 +7,9 @@ from core.dictionary.rule_classifier import _tokenize
 
 # Small, deterministic stopword set for splitting a raw business question into
 # candidate concept/measure/dimension terms. Deliberately mirrors the same
-# "split on 'by', drop stopwords" heuristic already used by the existing
-# api/v1/routes.py::_extract_query_terms for the /execute-query route — that
-# function lives in the API routing layer and core/ must not import from
-# api/, so this is a small, faithful reimplementation rather than a
+# "split on 'by', drop stopwords" heuristic formerly used in the API routing
+# layer. core/ must not import from api/, so this is a small, faithful
+# reimplementation rather than a
 # cross-layer import. No AI/ML — deterministic token heuristic only.
 _STOPWORDS = frozenset({
     "show", "me", "the", "a", "an", "of", "for", "how", "many", "what",
@@ -25,8 +24,7 @@ _STOPWORDS = frozenset({
     # every real term's own column scoring — reproduced against real CCPP
     # metadata via this exact function, since it is what
     # core/orchestrator/context_builder.py's live SQL_REQUEST path actually
-    # calls (not the routes.py copy, which only serves the standalone
-    # /execute-query REST endpoint). Every word below already has its own
+    # calls (the former routes.py copy has been removed). Every word below already has its own
     # independent handler further down in this same file (status_value,
     # order, aggregation, date_range all run their own regex over the raw
     # question string, never over this term list).

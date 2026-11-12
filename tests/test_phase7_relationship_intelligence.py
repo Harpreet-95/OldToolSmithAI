@@ -39,7 +39,6 @@ from data.governance_service import (
     bulk_reject,
     get_governance_profile,
 )
-from data.lineage_service import get_upstream_lineage
 from data.semantic_layer_service import discover_join_paths
 from data.knowledge_graph_service import get_related_tables
 from data.business_knowledge_service import get_table_business_context
@@ -56,7 +55,6 @@ _NOW = "2026-06-30T00:00:00+00:00"
 _PATCHED_MODULES = (
     "data.relationship_service",
     "data.governance_service",
-    "data.lineage_service",
     "data.semantic_layer_service",
     "data.knowledge_graph_service",
     "data.business_knowledge_service",
@@ -581,13 +579,10 @@ def test_individual_approve_relationship_still_works_after_bulk_block(tmp_path, 
 
 # ---------------------------------------------------------------------------
 # 14-17. Trust filter — PENDING/REJECTED excluded, APPROVED/AUTO included,
-# across lineage, semantic, knowledge graph, and business context.
+# across the active semantic, knowledge-graph, and business-context consumers.
 # ---------------------------------------------------------------------------
 
 def _visibility_snapshot(db):
-    lineage = get_upstream_lineage(1, "u1", "dbo.orders")
-    lineage_tables = {n["table_fqn"] for n in lineage["upstream"]}
-
     paths = discover_join_paths(1, "u1", "dbo.orders", "dbo.customers")
     semantic_visible = paths["total_paths_found"] > 0
 
@@ -597,7 +592,7 @@ def _visibility_snapshot(db):
     biz = get_table_business_context(1, "u1", "dbo.customers")
     biz_inbound = {r["from_table_fqn"] for r in biz["relationships"]["inbound"]}
 
-    return lineage_tables, semantic_visible, kg_tables, biz_inbound
+    return semantic_visible, kg_tables, biz_inbound
 
 
 def test_pending_excluded_from_all_consumers(tmp_path, monkeypatch):
@@ -606,12 +601,9 @@ def test_pending_excluded_from_all_consumers(tmp_path, monkeypatch):
     _insert_declared_fk(db, 50, "dbo.orders", "product_id", "dbo.products", "id")
     discover_relationship_candidates(1, "u1")  # creates a PENDING orders->customers row
 
-    lineage_tables, semantic_visible, kg_tables, biz_inbound = _visibility_snapshot(db)
+    semantic_visible, kg_tables, biz_inbound = _visibility_snapshot(db)
 
-    # AUTO foreign key still visible (requirement 17)
-    assert "dbo.products" in lineage_tables
     # PENDING inferred relationship invisible everywhere (requirement 14)
-    assert "dbo.customers" not in lineage_tables
     assert semantic_visible is False
     assert "dbo.orders" not in kg_tables
     assert "dbo.orders" not in biz_inbound
@@ -625,10 +617,8 @@ def test_approved_included_in_all_consumers(tmp_path, monkeypatch):
     rel_id = _pending_id(db)
     approve_relationship(rel_id, "u1")
 
-    lineage_tables, semantic_visible, kg_tables, biz_inbound = _visibility_snapshot(db)
+    semantic_visible, kg_tables, biz_inbound = _visibility_snapshot(db)
 
-    assert "dbo.products" in lineage_tables       # AUTO still visible
-    assert "dbo.customers" in lineage_tables      # requirement 15
     assert semantic_visible is True
     assert "dbo.orders" in kg_tables
     assert "dbo.orders" in biz_inbound
@@ -642,10 +632,8 @@ def test_rejected_excluded_from_all_consumers(tmp_path, monkeypatch):
     rel_id = _pending_id(db)
     reject_relationship(rel_id, "u1")
 
-    lineage_tables, semantic_visible, kg_tables, biz_inbound = _visibility_snapshot(db)
+    semantic_visible, kg_tables, biz_inbound = _visibility_snapshot(db)
 
-    assert "dbo.products" in lineage_tables       # AUTO still visible (requirement 17)
-    assert "dbo.customers" not in lineage_tables  # requirement 16
     assert semantic_visible is False
     assert "dbo.orders" not in kg_tables
     assert "dbo.orders" not in biz_inbound

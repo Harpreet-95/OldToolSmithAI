@@ -12,25 +12,35 @@ not as a complete production deployment.
 
 ## Verification evidence
 
-Verified on November 5, 2026 using Python 3.12 and Node.js 20:
+Verified on November 9, 2026 using Python 3.12 and Node.js 20, after the API-surface consolidation described below. Both dependency audits and the CI smoke subset were re-run on this date.
 
 | Check | Result |
 | --- | --- |
-| Full backend suite | 6,632 passed, 9 skipped, 0 failed |
+| Full backend suite | 6,520 passed, 9 skipped, 0 failed |
 | Frontend suite | 175 passed, 0 failed |
 | Frontend production build | Passed |
 | Frontend lint | Passed |
 | Python dependency audit | No known vulnerabilities |
 | npm dependency audit | 0 vulnerabilities |
-| Clean exported-repository smoke suite | 156 passed |
+| CI backend smoke subset | 154 passed |
 
-Eight of the nine backend skips cover assertions for the retired direct query-planner architecture. The live product route uses the AI-first composer and never calls that planner. Those tests remain in place, clearly marked as historical behavior, instead of being rewritten to create a false success. The remaining skip is an environment-dependent integration check.
+Eight of the nine backend skips cover assertions for the retired direct query-planner architecture. The live product route uses the AI-first composer and never calls that planner. Those tests remain in place, clearly marked as historical behavior, instead of being rewritten to create a false success. The remaining skip is an environment-dependent check that needs symlink-creation permission on Windows.
 
-GitHub Actions intentionally runs a fast 156-test backend smoke gate on every
+GitHub Actions intentionally runs a fast 154-test backend smoke gate on every
 push and pull request, plus the complete frontend test, lint, build, and both
-dependency-audit checks. The 6,632-test backend result was produced locally
+dependency-audit checks. The 6,520-test backend result was produced locally
 because running that entire suite on every portfolio commit would be
 disproportionately slow. The workflow does not claim otherwise.
+
+## API-surface consolidation
+
+The backend exposes 76 routes, each called by the current frontend or required
+for health monitoring. Manual Search, Dictionary, Governance, Lineage,
+knowledge-graph, relationship-administration and direct query-planning endpoints
+were removed; their internal services remain because connection-time discovery,
+profiling and the Composer still use them. Database questions have one route,
+`POST /v1/composer/ask`. Of the 9 skipped tests, 8 cover the retired direct
+query planner as a library and 1 needs Windows symlink permission.
 
 ## Positive impact
 

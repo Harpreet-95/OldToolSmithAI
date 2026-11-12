@@ -739,7 +739,7 @@ def build_sql_plan(
             # "bail out if anything else resolved" early return) and offers
             # it as a clarification question BEFORE this function ever
             # runs, for every caller that wires clarification; the one
-            # caller that doesn't (execute_query_route, per its own
+            # caller that does not provide an explicit source context
             # documented no-clarification-handling) keeps this soft warning
             # as its existing, unchanged fallback.
             #

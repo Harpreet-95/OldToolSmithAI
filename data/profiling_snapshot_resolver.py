@@ -6,7 +6,7 @@ This module is the single shared boundary every profiling consumer uses to
 find "the snapshot to read" — see the ~30 call sites across business_
 knowledge_service, dictionary_service, domain_service/domain_quality_service/
 domain_refinement_service, entity_service, governance_service,
-knowledge_graph_service, lineage_service, metadata_preparation_service,
+knowledge_graph_service, metadata_preparation_service,
 relationship_service, semantic_contract_service, semantic_layer_service, and
 core/profile_view/sql_adapter.py. Fixing selection HERE fixes all of them
 with no call-site changes.
